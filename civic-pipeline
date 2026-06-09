@@ -1,0 +1,164 @@
+#!/bin/bash
+# Civic monitoring pipeline — three modes:
+#
+#   civic-pipeline full    — Claude API (Opus/Sonnet) + Whisper API. Bulk processing.
+#   civic-pipeline hybrid  — claude -p (subscription) + Whisper API. Daily use.
+#   civic-pipeline local   — claude -p (subscription) + faster-whisper. Zero API cost.
+#
+# Pipeline order: GATHER everything, THEN process.
+#   Gather: fetch docs → discover videos → transcribe audio
+#   Process: extract JSONL (docs + transcripts) → monthly rollup → prose summaries
+#
+# Options:
+#   --deep          Download staff reports (not just agendas/minutes)
+#   --force         Re-process already summarized/extracted documents
+#   --years N       How many years back to fetch (default: 1)
+#   --transcribe    Also transcribe meeting videos
+#
+# Cron:
+#   0 3 * * * cd ~/repos/civics && ./civic-pipeline local --deep --transcribe
+
+set -euo pipefail
+cd "$(dirname "$0")"
+export PATH="$HOME/.local/bin:$PATH"
+source .venv/bin/activate
+
+MODE="${1:-hybrid}"
+shift 2>/dev/null || true
+
+DEEP=""
+FORCE=""
+YEARS="1"
+TRANSCRIBE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --deep)       DEEP="--deep"; shift ;;
+        --force)      FORCE="--force"; shift ;;
+        --years)      YEARS="$2"; shift 2 ;;
+        --transcribe) TRANSCRIBE="1"; shift ;;
+        *)            echo "Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$MODE] $*"
+}
+
+case "$MODE" in
+    full|hybrid|local) ;;
+    *) echo "Usage: civic-pipeline <full|hybrid|local> [--deep] [--force] [--years N] [--transcribe]"
+       echo ""
+       echo "Modes:"
+       echo "  full    — Claude API + Whisper API (bulk, ~\$44/full-run)"
+       echo "  hybrid  — claude -p + Whisper API (daily, ~\$0.90/meeting transcription only)"
+       echo "  local   — claude -p + faster-whisper (zero API cost)"
+       exit 1 ;;
+esac
+
+case "$MODE" in
+    full)          SUMMARIZER="api" ;;
+    hybrid|local)  SUMMARIZER="local" ;;
+esac
+
+log "Starting civic pipeline"
+log "  Summarizer: $SUMMARIZER"
+log "  Transcriber: $([ "$MODE" = "local" ] && echo "faster-whisper" || echo "Whisper API")"
+
+# ═══════════════════════════════════════════
+# PHASE 1: GATHER — collect all raw sources
+# ═══════════════════════════════════════════
+
+# ── 1a: Fetch meeting documents (Oceanside + NCTD) ──
+log "Fetching Oceanside meetings..."
+python oceanside.py fetch $DEEP --years "$YEARS" >> data/watch.log 2>&1
+log "Oceanside fetch done."
+
+log "Fetching NCTD meetings..."
+python nctd.py fetch >> data/nctd-watch.log 2>&1
+log "NCTD fetch done."
+
+# ── 1b: Intel feed — check RSS/web for Oceanside-relevant items ──
+log "Checking intel feeds..."
+python intel_feed.py >> data/intel/feed.log 2>&1
+log "Intel feed done."
+python update_skill_intel.py >> data/intel/feed.log 2>&1
+
+# ── 1c: Discover new meeting videos ──
+log "Discovering new meeting videos..."
+python discover_videos.py >> data/video-discovery.log 2>&1
+log "Video discovery done."
+
+# ── 1d: Transcribe audio (if enabled) ──
+if [ -n "$TRANSCRIBE" ]; then
+    if [ ! -f data/transcribe-batch.json ]; then
+        log "  No data/transcribe-batch.json found. Skipping transcription."
+    else
+        BATCH_COUNT=$(python -c "import json; b=json.loads(open('data/transcribe-batch.json').read()); print(len(b))" 2>/dev/null || echo 0)
+        log "  Batch file has $BATCH_COUNT entries"
+        TRANSCRIBE_OK=true
+        case "$MODE" in
+            full|hybrid)
+                log "  Transcribing with Whisper API..."
+                python transcribe.py --batch data/transcribe-batch.json \
+                    >> data/transcribe.log 2>&1 || TRANSCRIBE_OK=false
+                ;;
+            local)
+                log "  Transcribing with faster-whisper (local)..."
+                python transcribe_local.py batch data/transcribe-batch.json \
+                    >> data/transcribe.log 2>&1 || TRANSCRIBE_OK=false
+                ;;
+        esac
+        if [ "$TRANSCRIBE_OK" = true ]; then
+            log "Transcription done."
+        else
+            log "Transcription failed — continuing with extraction."
+        fi
+    fi
+fi
+
+# ═══════════════════════════════════════════
+# PHASE 2: PROCESS — extract, merge, summarize
+# ═══════════════════════════════════════════
+
+# ── 2a: Extract structured JSONL from ALL raw sources (docs + transcripts) ──
+# Stops at 7am to free machine for daytime use. Resumes next night.
+STOP_HOUR=7
+log "Extracting structured records (will stop at ${STOP_HOUR}:00)..."
+python extract_structured.py --stop-at "$STOP_HOUR" $FORCE >> data/structured-extraction.log 2>&1
+log "Structured extraction done."
+
+# ── 2b: Merge per-document records into per-meeting records ──
+log "Merging per-meeting records..."
+python meeting_merge.py >> data/meeting-merge.log 2>&1
+log "Meeting merge done."
+
+# ── 2c: Monthly rollups ──
+log "Checking monthly digests..."
+MISSING=$(python monthly_rollup.py --check 2>&1)
+if echo "$MISSING" | grep -q "need rebuild"; then
+    log "  $MISSING"
+    CURRENT_MONTH=$(date '+%Y-%m')
+    python monthly_rollup.py --month "$CURRENT_MONTH" >> data/monthly-rollup.log 2>&1
+    python monthly_rollup.py >> data/monthly-rollup.log 2>&1
+    log "Monthly rollups updated."
+else
+    log "  All months up to date."
+fi
+
+# Prose summaries removed — structured JSONL + monthly rollups are the
+# canonical data layer. Agents read JSONL directly.
+
+# ═══════════════════════════════════════════
+# PHASE 3: EXECUTIVE (full mode only)
+# ═══════════════════════════════════════════
+
+if [ "$MODE" = "full" ]; then
+    log "Running executive summaries (API, Opus)..."
+    python executive_summaries.py --mode api >> data/pipeline.log 2>&1
+    log "Running council member profiles (API, Opus)..."
+    python council_member_summaries.py --mode api >> data/pipeline.log 2>&1
+    log "Executive pipeline done."
+fi
+
+log "Pipeline complete."
