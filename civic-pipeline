@@ -16,7 +16,7 @@
 #   --transcribe    Also transcribe meeting videos
 #
 # Cron:
-#   0 3 * * * cd ~/repos/civics && ./civic-pipeline local --deep --transcribe
+#   0 1 * * * cd ~/repos/civics && ./civic-pipeline local --deep
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -118,22 +118,15 @@ if [ -n "$TRANSCRIBE" ]; then
 fi
 
 # ═══════════════════════════════════════════
-# PHASE 2: PROCESS — extract, merge, summarize
+# PHASE 2: PROCESS — merge and roll up existing records
 # ═══════════════════════════════════════════
 
-# ── 2a: Extract structured JSONL from ALL raw sources (docs + transcripts) ──
-# Stops at 7am to free machine for daytime use. Resumes next night.
-STOP_HOUR=7
-log "Extracting structured records (will stop at ${STOP_HOUR}:00)..."
-python extract_structured.py --stop-at "$STOP_HOUR" $FORCE >> data/structured-extraction.log 2>&1
-log "Structured extraction done."
-
-# ── 2b: Merge per-document records into per-meeting records ──
+# ── 2a: Merge per-document records into per-meeting records ──
 log "Merging per-meeting records..."
 python meeting_merge.py >> data/meeting-merge.log 2>&1
 log "Meeting merge done."
 
-# ── 2c: Monthly rollups ──
+# ── 2b: Monthly rollups ──
 log "Checking monthly digests..."
 MISSING=$(python monthly_rollup.py --check 2>&1)
 if echo "$MISSING" | grep -q "need rebuild"; then
@@ -146,11 +139,26 @@ else
     log "  All months up to date."
 fi
 
+# ═══════════════════════════════════════════
+# PHASE 3: EXTRACT — use remaining time for structured extraction
+# ═══════════════════════════════════════════
+# Processes unextracted docs (new and backfill) until hard cutoff.
+# Newest docs sort first so recent meetings get priority.
+
+EXTRACT_CUTOFF=3
+if [ "$(date '+%H')" -lt "$EXTRACT_CUTOFF" ]; then
+    log "Structured extraction until ${EXTRACT_CUTOFF}:00..."
+    python extract_structured.py --stop-at "$EXTRACT_CUTOFF" $FORCE >> data/structured-extraction.log 2>&1
+    log "Extraction done."
+else
+    log "No time left for extraction (past ${EXTRACT_CUTOFF}:00)."
+fi
+
 # Prose summaries removed — structured JSONL + monthly rollups are the
 # canonical data layer. Agents read JSONL directly.
 
 # ═══════════════════════════════════════════
-# PHASE 3: EXECUTIVE (full mode only)
+# PHASE 4: EXECUTIVE (full mode only)
 # ═══════════════════════════════════════════
 
 if [ "$MODE" = "full" ]; then

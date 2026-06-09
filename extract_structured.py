@@ -156,15 +156,15 @@ def collect_all_sources():
     """Collect all raw source files: documents + transcripts."""
     sources = []
 
-    # Raw document text (PDFs → pdftotext)
+    # Raw document text (PDFs → pdftotext) — newest first so recent meetings get priority
     for ddir in [DOCS_DIR, NCTD_DOCS_DIR]:
         if ddir.exists():
-            for f in sorted(ddir.glob("*.txt")):
+            for f in sorted(ddir.glob("*.txt"), reverse=True):
                 sources.append(("doc", f))
 
     # Transcripts (audio → whisper)
     if TRANSCRIPTS_DIR.exists():
-        for f in sorted(TRANSCRIPTS_DIR.glob("*-transcript.txt")):
+        for f in sorted(TRANSCRIPTS_DIR.glob("*-transcript.txt"), reverse=True):
             sources.append(("transcript", f))
 
     return sources

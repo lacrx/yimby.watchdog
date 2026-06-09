@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Generate executive summaries by year from meeting summaries or structured JSONL.
+"""Generate executive summaries by year from monthly digest JSONL.
 
 Usage:
-    python executive_summaries.py                        # API mode, prose summaries (original)
-    python executive_summaries.py --mode local           # claude -p, prose summaries ($0)
-    python executive_summaries.py --source jsonl         # API mode, JSONL input (cheaper)
-    python executive_summaries.py --mode local --source jsonl  # claude -p + JSONL ($0, fastest)
+    python executive_summaries.py                              # claude -p + monthly digests ($0)
+    python executive_summaries.py --mode api                   # Claude API + monthly digests ($)
+    python executive_summaries.py --source jsonl               # per-record JSONL (more detail, more tokens)
 """
 
 import argparse
@@ -327,10 +326,10 @@ def main():
     global MODE, client
 
     parser = argparse.ArgumentParser(description="Generate executive summaries")
-    parser.add_argument("--mode", choices=["api", "local"], default="api",
+    parser.add_argument("--mode", choices=["api", "local"], default="local",
                         help="api=Claude API ($), local=claude -p (subscription, $0)")
-    parser.add_argument("--source", choices=["monthly", "jsonl", "prose"], default="monthly",
-                        help="monthly=monthly digests (default), jsonl=individual records, prose=summaries (deprecated)")
+    parser.add_argument("--source", choices=["monthly", "jsonl"], default="monthly",
+                        help="monthly=monthly digests (default, 7x smaller), jsonl=individual records")
     args = parser.parse_args()
 
     MODE = args.mode

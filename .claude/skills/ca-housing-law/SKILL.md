@@ -138,12 +138,12 @@ See `recent-developments.md` alongside this skill — auto-generated nightly fro
 ## Deep Reference
 
 For full statute text, case analysis, and enforcement details beyond this summary, see:
-- `/home/thomas/repos/civics/reference/` — 20 files, ~95K words of CA housing law
-- `/home/thomas/repos/civics/reference/ca-housing-sources.md` — all major sources: state agencies, enforcement orgs, academics, legal practitioners, journalism, data
-- `/home/thomas/repos/civics/reference/YIMBY_PLAYBOOK.md` — violation pattern detection
-- `/home/thomas/repos/civics/reference/sb79-legal-analysis.md` — Holland & Knight SB 79 deep dive
-- `/home/thomas/repos/civics/reference/ag-builders-remedy-opinion.md` — BR case law and penalties
-- `/home/thomas/repos/civics/reference/hcd-enforcement-framework.md` — HCD enforcement pipeline
-- `/home/thomas/repos/civics/reference/coastal-act-housing-paper.md` — Coastal Act conflict analysis
+- `/home/thomas/repos/civics/legal-reference/` — 20 files, ~95K words of CA housing law
+- `/home/thomas/repos/civics/legal-reference/ca-housing-sources.md` — all major sources: state agencies, enforcement orgs, academics, legal practitioners, journalism, data
+- `/home/thomas/repos/civics/legal-reference/YIMBY_PLAYBOOK.md` — violation pattern detection
+- `/home/thomas/repos/civics/legal-reference/sb79-legal-analysis.md` — Holland & Knight SB 79 deep dive
+- `/home/thomas/repos/civics/legal-reference/ag-builders-remedy-opinion.md` — BR case law and penalties
+- `/home/thomas/repos/civics/legal-reference/hcd-enforcement-framework.md` — HCD enforcement pipeline
+- `/home/thomas/repos/civics/legal-reference/coastal-act-housing-paper.md` — Coastal Act conflict analysis
 - `/home/thomas/repos/civics/data/documents/YIMBY Dems + CalHDF joint SANDAG Letter re SB79.pdf` — Six-org coalition letter on bus lane qualification, Sprinter Tier 2, OTC Tier 1, SANDAG map obligations (May 29, 2026)
 - `/home/thomas/repos/civics/data/documents/1351606-8032142-CalHDF_CFH_SB79_Letter.pdf` — CalHDF/CFH letter identifying 6 SB 79 violations by City of Oceanside (May 20, 2026)

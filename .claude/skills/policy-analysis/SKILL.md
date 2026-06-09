@@ -107,5 +107,5 @@ When the stated rationale doesn't match the evidence, say so directly. Not "ther
 ## Reference Materials
 
 - Fiscal literature review: `/home/thomas/repos/civics/research/density-fiscal-literature-review.md`
-- Policy reference library: `/home/thomas/repos/civics/reference/`
-- YIMBY Playbook: `/home/thomas/repos/civics/reference/YIMBY_PLAYBOOK.md`
+- Policy reference library: `/home/thomas/repos/civics/legal-reference/`
+- YIMBY Playbook: `/home/thomas/repos/civics/legal-reference/YIMBY_PLAYBOOK.md`
