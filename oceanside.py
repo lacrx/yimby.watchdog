@@ -57,6 +57,18 @@ WATCH_KEYWORDS = [
     "eminent domain", "CEQA", "environmental",
 ]
 
+PRA_WATCH_KEYWORDS = [
+    "SB 79", "SB79", "transit-oriented", "tier classification",
+    "train count", "density bonus", "65915",
+    "coastal", "LCP", "Coastal Commission", "Coastal Act",
+    "SB 330", "Housing Crisis Act", "Housing Accountability",
+    "inclusionary", "phasing ordinance",
+    "walking distance", "walking path",
+    "NCTD", "OTC", "Oceanside Transit Center",
+    "HCD", "CalHDF", "YIMBY",
+    "Builder's Remedy", "RHNA",
+]
+
 BODIES = {
     "City Council": None,
     "Planning Commission": None,
@@ -734,6 +746,69 @@ def cmd_analyze(args):
         print(recent[0].read_text())
 
 
+def cmd_pra_watch(args):
+    """Lightweight fetch + PRA-relevant keyword scan. Outputs JSONL."""
+    ensure_dirs()
+    ALERTS_DIR = DATA_DIR / "pra-alerts"
+    ALERTS_DIR.mkdir(exist_ok=True)
+
+    args.deep = True
+    args.years = 1
+    cmd_fetch(args)
+
+    state = load_state()
+    last_pra_scan = state.get("last_pra_scan", "1970-01-01T00:00:00")
+    days_limit = getattr(args, "days", None)
+    if days_limit:
+        cutoff = datetime.now() - timedelta(days=days_limit)
+    hits = []
+
+    for txt_path in sorted(DOCS_DIR.glob("*.txt")):
+        mid = txt_path.stem.split("-")[0]
+        meeting_meta = state.get("meetings", {}).get(mid, {})
+
+        if days_limit:
+            meeting_date = meeting_meta.get("date", "")
+            if meeting_date:
+                try:
+                    md = datetime.strptime(meeting_date.strip(), "%m/%d/%Y")
+                except ValueError:
+                    md = None
+                if md and md < cutoff:
+                    continue
+
+        fetched = meeting_meta.get("fetched", "")
+        if fetched <= last_pra_scan and not getattr(args, "force", False):
+            continue
+
+        text = txt_path.read_text()
+        matches = keyword_scan(text, PRA_WATCH_KEYWORDS)
+        if matches:
+            hits.append({
+                "file": txt_path.name,
+                "meeting_id": mid,
+                "body": meeting_meta.get("body", "unknown"),
+                "date": meeting_meta.get("date", "unknown"),
+                "keywords": list({kw for kw, _ in matches}),
+                "contexts": {kw: ctx for kw, ctx in matches},
+                "scanned": datetime.now().isoformat(),
+            })
+
+    state["last_pra_scan"] = datetime.now().isoformat()
+    save_state(state)
+
+    if hits:
+        out_file = ALERTS_DIR / f"pra-scan-{datetime.now().strftime('%Y%m%d')}.jsonl"
+        with open(out_file, "a") as f:
+            for h in hits:
+                f.write(json.dumps(h) + "\n")
+        print(f"{len(hits)} PRA-relevant hits written to {out_file}")
+        for h in hits:
+            print(f"  {h['body']} {h['date']}: {', '.join(h['keywords'])}")
+    else:
+        print("No PRA-relevant hits in new documents.")
+
+
 def cmd_list(args):
     """List all tracked meetings."""
     ensure_dirs()
@@ -790,6 +865,10 @@ def main():
     p_analyze.add_argument("--quiet", action="store_true", help="Don't print latest analysis")
     p_analyze.add_argument("--summarizer", choices=["api", "local"], default="api", help="api=Claude API, local=claude -p (subscription)")
 
+    p_pra = sub.add_parser("pra-watch", help="Fetch + scan for PRA/SB79/coastal keywords, output JSONL")
+    p_pra.add_argument("--force", action="store_true", help="Re-scan all documents, not just new ones")
+    p_pra.add_argument("--days", type=int, default=None, help="Only scan meetings from the last N days")
+
     sub.add_parser("list", help="List tracked meetings")
 
     args = parser.parse_args()
@@ -803,6 +882,7 @@ def main():
         "search": cmd_search,
         "watch": cmd_watch,
         "analyze": cmd_analyze,
+        "pra-watch": cmd_pra_watch,
         "list": cmd_list,
     }
     commands[args.command](args)
