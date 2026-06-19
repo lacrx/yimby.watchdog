@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "apt-get install -y -qq poppler-utils 2>/dev/null || true",
+            "timeout": 60,
+            "statusMessage": "Installing system deps..."
+          }
+        ]
+      }
+    ]
+  }
+}
