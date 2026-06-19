@@ -105,11 +105,18 @@ def extract_structured(text, meeting_meta):
             capture_output=True, text=True, timeout=300,
         )
         if result.returncode != 0:
+            print(f"  claude -p exit code {result.returncode}")
             if result.stderr:
-                print(f"  claude -p error: {result.stderr[:200]}")
+                print(f"  stderr: {result.stderr[:300]}")
+            if result.stdout:
+                print(f"  stdout: {result.stdout[:300]}")
             return None
 
         output = result.stdout.strip()
+        if not output:
+            print(f"  claude -p returned empty output")
+            return None
+
         if output.startswith("```"):
             output = output.split("\n", 1)[1] if "\n" in output else output
             if output.endswith("```"):
@@ -119,7 +126,7 @@ def extract_structured(text, meeting_meta):
         return record
     except json.JSONDecodeError as e:
         print(f"  JSON parse error: {e}")
-        print(f"  Raw output: {result.stdout[:300]}")
+        print(f"  Raw output ({len(result.stdout)} chars): {result.stdout[:500]}")
         return None
     except FileNotFoundError:
         print("  claude CLI not found.")

@@ -1,0 +1,9 @@
+station,tier,trains,total_parcels,wp_parcels,wp_pct,sfr,res_non_sfr,commercial,vacant,institutional,other,non_sfr_total
+OTC,1,130,4572,2,0.04,542,3732,130,64,32,72,4030
+Coast Highway,1,130,5297,53,1.0,529,4504,109,59,33,63,4768
+Crouch Street,2,68,1334,511,38.31,927,246,32,87,31,11,407
+Civic Center,2,68,974,89,9.14,566,268,6,53,44,37,408
+El Camino Real,2,68,562,40,7.12,414,84,11,3,49,1,148
+Rancho Del Oro,2,68,2220,3,0.14,1813,276,3,3,48,77,407
+College Blvd,2,68,1813,11,0.61,1532,62,1,115,84,19,281
+Melrose,2,68,2031,2,0.1,721,900,53,260,39,58,1310

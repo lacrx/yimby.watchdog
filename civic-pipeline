@@ -145,7 +145,7 @@ fi
 # Processes unextracted docs (new and backfill) until hard cutoff.
 # Newest docs sort first so recent meetings get priority.
 
-EXTRACT_CUTOFF=3
+EXTRACT_CUTOFF=4
 if [ "$(date '+%H')" -lt "$EXTRACT_CUTOFF" ]; then
     log "Structured extraction until ${EXTRACT_CUTOFF}:00..."
     python extract_structured.py --stop-at "$EXTRACT_CUTOFF" $FORCE >> data/structured-extraction.log 2>&1

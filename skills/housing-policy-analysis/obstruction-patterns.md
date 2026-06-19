@@ -24,10 +24,11 @@ Most cities use 2-4 of these simultaneously. The patterns compound — a city us
 - Compare city's sidewalk network with pedestrian usage data (people walk there even without sidewalks)
 - Check state definition of "walking distance" — it's distance-based, not path-quality-based
 - Cross-reference with the city's own capital improvement plans — if they've planned sidewalks, they know pedestrians walk there
+- **Request shapefiles via PRA.** Oceanside's PRA production (June 2026) revealed: pathoftravel.shp (710 polygons, ALL scored Walkability = 0) vs. OceansideSB79_sidewalks.shp (1,726 segments in study area, 71% have sidewalks). The city's own data contradicts its own conclusion. **Critical context:** SANDAG parcel data shows ~18,800 total parcels within 0.5 mi of all 8 stations. The walking path covers 710 — just 3.8% of the SB 79 universe. It concentrates around Crouch Street (~511) and Civic Center (~89); OTC (130+ trains, 4,572 parcels in zone) has 2 parcels in the shapefile. The city claims deferment/Good Cause/habitat cover the rest but has produced no parcel-level data. Follow up with PRA for deferment parcel list.
 
-**Legal vulnerability:** Infrastructure neglect is not a basis for exemption from state law. HCD defines walking distance by measurement, not by sidewalk quality. The city's choice not to build infrastructure cannot shield it from mandates that apply based on proximity.
+**Legal vulnerability:** Infrastructure neglect is not a basis for exemption from state law. HCD defines walking distance by measurement, not by sidewalk quality. The city's choice not to build infrastructure cannot shield it from mandates that apply based on proximity. AB 2147 (jaywalking reform) author statement: "People who need to walk in their neighborhoods should not be penalized for decades of infrastructure neglect and auto-first street design." Vehicle Code § 21954 permits pedestrians on roadways where sidewalks don't exist.
 
-**Breaks when:** HCD rejects the implementing ordinance; private litigants cite actual pedestrian usage; court finds the exclusion pretextual.
+**Breaks when:** HCD rejects the implementing ordinance; private litigants cite actual pedestrian usage; court finds the exclusion pretextual. CalHDF May 20, 2026 letter already identifies specific wrongly-exempted parcels: Moon Valley nurseries (Rancho Del Oro), parcels abutting El Camino Real Station, neighborhoods accessible via Crouch/Downs/Grandview Streets, parcels along S. Nevada Street north of Coast Highway Station.
 
 ### 2. Tier Manipulation
 
@@ -60,15 +61,17 @@ Most cities use 2-4 of these simultaneously. The patterns compound — a city us
 **Mechanism:** City redefines statutory terms narrowly to exclude parcels or projects from state mandates.
 
 **Examples:**
-- Classifying Good Cause eviction protection (AB 1482) as "rent control" to trigger SB 79 exemption → Good Cause ≠ rent stabilization under Costa-Hawkins
-- Defining "walking path" as "continuous paved sidewalk" rather than the statutory walking distance → no statutory basis for path quality requirement
+- Classifying Good Cause eviction protection (AB 1482) as "rent control" to trigger SB 79 exemption → Good Cause ≠ rent stabilization under Costa-Hawkins. Costa-Hawkins § 1954.52 (rent control) and Good Cause (Civ. Code § 1947.12) are in different Civil Code chapters. *Briggs v. Eden Council for Hope & Opportunity* (1999) 19 Cal.4th 1106: different statutory terms = different legislative intent.
+- Defining "walking path" as "a publicly accessible, continuous, and unobstructed path of travel with continuous paved or improved sidewalk" (Oceanside ordinance, June 2026) rather than the statutory "walking path" (§ 65912.160(e)(1)). The statute requires no sidewalk quality standard. Planning Commission staff admitted: "there is no definition of walking path in the statute, so the city created our own definition" (PC transcript, May 18, 2026, line 172).
 - Defining "dedicated bus lane" as requiring physical separation → SB 79 conspicuously omits physical exclusivity for bus lanes while requiring it for heavy rail
+- Classifying all sites subject to Tenant Protection Act of 2019 (Civ. Code § 1947.12) as "rent or price control" under Gov. Code § 65912.157(h). The TPA is Good Cause eviction, not rent stabilization. City also swept in mobile home parks under Chapter 16B and deed-restricted affordable housing, which are provided via subsidy, not police power.
 
 **Detection:**
 - Compare city's definitions against statutory language
 - Check HCD guidance documents
 - Look for legislative intent in committee analyses
 - Apply *expressio unius est exclusio alterius* — if the statute defines the term one way for one mode and differently for another, the difference is intentional
+- **Request the implementing ordinance text.** Oceanside's ordinance defines "walking path" in its WHEREAS clauses but refers to Exhibits A-F by letter while the staff report numbers its attachments 1-12. CalHDF flagged this mismatch.
 
 **Legal vulnerability:** HAA penalties for project denials based on fabricated definitions. HCD can reject implementing ordinances that narrow statutory terms. Courts apply plain statutory language, not city-invented glossaries.
 
@@ -113,8 +116,9 @@ Most cities use 2-4 of these simultaneously. The patterns compound — a city us
 - Map exempted parcels vs. total parcels within ½ mile of TOD stops
 - Check whether exemption categories existed before SB 79 or were created after
 - Compare exempted acreage to the city's stated SB 79 compliance plan
+- **Oceanside case study (June 3, 2026 ordinance, File #26-1529):** Three-prong strategy: (1) permanent walking path exemptions for parcels without "continuous paved sidewalk" within 1 mile of TOD stop, (2) deferment on all remaining sites until one year after 7th Housing Element revision (max June 15, 2032), (3) planned Alternative Plan to shift capacity. Staff recommended exempting/deferring ALL sites that could potentially be exempted or deferred. Quote: "exempting and deferring as many sites as possible would potentially reduce SB 79's impact to the greatest extent possible." Deferment categories: existing density ≥50% of SB 79, low-resource areas with ≥40% aggregate density, historic resources, fire hazard zones, sea level rise zones. CalHDF/CFH identified that the low-resource exemption fails at Tier 1 because local zoning (7-43 du/ac) is well below 40% of Tier 1 standards (100-120 du/ac).
 
-**Legal vulnerability:** HCD must approve implementing ordinances. Exemptions exceeding statutory basis face litigation. Alternative plans must maintain same total zoned capacity as SB 79 default.
+**Legal vulnerability:** HCD must approve implementing ordinances. Exemptions exceeding statutory basis face litigation. Alternative plans must maintain same total zoned capacity as SB 79 default. HCD received draft ordinance May 19, 2026; confirmed receipt May 26. City must submit final ordinance within 60 days of enactment. If HCD objects and city fails to amend, HCD must notify AG.
 
 ### 9. Revenue Misdirection
 

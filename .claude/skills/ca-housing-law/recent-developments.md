@@ -1,5 +1,5 @@
 # CA Housing Law — Recent Developments
-*Auto-generated from intel feed. 342 relevant items in last 90 days. Updated 2026-06-09.*
+*Auto-generated from intel feed. 350 relevant items in last 90 days. Updated 2026-06-18.*
 
 ## Oceanside Direct Mentions
 
@@ -465,6 +465,10 @@ Why it matters: Direct mention: oceanside
 Source: Voice of San Diego — Housing | Detection: direct | Relevance: 10/10
 URL: https://voiceofsandiego.org/2022/11/22/the-north-county-transit-district-is-becoming-a-developer/
 Why it matters: Direct mention: north county transit
+
+**[2026-06-16] Late financier, philanthropist’s Bel Air estate hits market at $65M**
+Source: The Real Deal — LA | Detection: direct | Relevance: 10/10
+URL: https://therealdeal.com/la/2026/06/15/john-and-joan-hotchkins-bel-air-home-hits-market/
 
 ## Enforcement Actions & Litigation
 
@@ -2277,3 +2281,61 @@ Why it matters: AG Housing Strike Force page updated — any new enforcement act
 - Compare current page against last cached version to isolate the delta
 - If new enforcement action against any city using Coastal Act shield, habitat exclusions, or transit misclassification, draft parallel complaint letter referencing Oceanside's identical tactics
 - If AG issued new guidance on SB 79 compliance or RHNA enforcement, evaluate whether it strengthens the CalHDF/CFH violation letter or coalition SANDAG letter arguments
+
+**[2026-06-10] [Page updated] AG Housing Enforcement**
+Source: AG Housing Enforcement | Detection: pattern | Relevance: 7/10
+URL: https://oag.ca.gov/housing
+Why it matters: AG Housing Strike Force page updated — any new enforcement actions, letters, or investigations posted here could directly target Oceanside given its 6 identified violations, 11% lower-income RHNA progress, and SB 79 misclassification, especially as AG has been escalating enforcement statewide.
+- Scrape full page content at oag.ca.gov/housing to identify what specifically changed — new enforcement letters, lawsuits, or city targets
+- Cross-reference any newly listed enforcement actions against Oceanside's specific violation patterns (transit tier misclassification, Coastal Act shield, habitat exclusions)
+- If new AG enforcement precedent established against similar city, add to legal exposure memo as evidence of escalating state enforcement posture
+- Monitor for Oceanside appearing directly in any new AG action or referenced city list
+
+**[2026-06-11] [Page updated] AG Housing Enforcement**
+Source: AG Housing Enforcement | Detection: pattern | Relevance: 7/10
+URL: https://oag.ca.gov/housing
+Why it matters: AG Housing Strike Force page updated — any new enforcement actions, letters, or investigations posted here could directly apply to Oceanside given its 6 identified violations and 11% lower-income RHNA progress, but the scraped content is just page metadata with no specific new action visible.
+- Scrape full page content from https://oag.ca.gov/housing to check for new enforcement letters, lawsuits, or settlements added since last check
+- Cross-reference any newly listed cities against Oceanside's obstruction tactics (Coastal Act shield, habitat exclusions, walking path fabrication, SB 79 misclassification)
+- If new AG enforcement action targets a city using similar tactics, cite it in coalition communications as precedent for Oceanside exposure
+
+**[2026-06-13] [Page updated] AG Housing Enforcement**
+Source: AG Housing Enforcement | Detection: pattern | Relevance: 7/10
+URL: https://oag.ca.gov/housing
+Why it matters: AG Housing Strike Force page update signals potential new enforcement actions or case additions; Oceanside faces 6 identified violations and $55M-$249M legal exposure, making any AG enforcement expansion directly relevant to whether state action escalates beyond HCD letters to AG referral.
+- Scrape full page content at oag.ca.gov/housing to identify what changed — new cases, new cities targeted, or policy updates
+- Compare current enforcement targets against Oceanside's violation pattern (SB 79 noncompliance, RHNA obstruction, fabricated infrastructure claims)
+- If new AG actions target similar obstruction tactics, cite in next coalition letter as evidence of escalating enforcement risk
+- Monitor for Oceanside-specific AG referral from HCD given May 20 CalHDF/CFH letter timeline
+
+**[2026-06-14] [Page updated] AG Housing Enforcement**
+Source: AG Housing Enforcement | Detection: pattern | Relevance: 7/10
+URL: https://oag.ca.gov/housing
+Why it matters: AG Housing Strike Force page updated — any new enforcement actions, letters, or investigations posted here could directly apply to Oceanside given its 6 identified violations, 11% lower-income RHNA progress, and SB 79 misclassification; the AG has escalated from letters to lawsuits against similarly non-compliant cities.
+- Scrape full page content to check for new enforcement actions, settlement agreements, or letters targeting San Diego County cities
+- Compare any newly listed actions against Oceanside's specific violation patterns (walking path fabrication, Coastal Act shield, habitat exclusions)
+- If new AG action targets a city using similar obstruction tactics, draft memo to coalition showing precedent applicability to Oceanside
+
+**[2026-06-16] [Page updated] AG Housing Enforcement**
+Source: AG Housing Enforcement | Detection: pattern | Relevance: 7/10
+URL: https://oag.ca.gov/housing
+Why it matters: AG Housing Strike Force page updated — any new enforcement actions, letters, or investigations posted here could directly apply to Oceanside given its 6 identified violations, 11% lower-income RHNA progress, and SB 79 noncompliance; page content was truncated so specific update unknown but AG enforcement escalation is the highest-stakes threat vector.
+- Scrape full page at oag.ca.gov/housing to identify what changed — look for new enforcement letters, lawsuits, or cities targeted
+- Compare any newly listed enforcement actions against Oceanside's obstruction tactics (Coastal Act shield, habitat exclusions, walking path fabrication)
+- If new AG action targets similar violations, cite in next coalition letter as evidence of escalating enforcement pattern
+
+**[2026-06-17] [Page updated] AG Housing Enforcement**
+Source: AG Housing Enforcement | Detection: pattern | Relevance: 7/10
+URL: https://oag.ca.gov/housing
+Why it matters: AG Housing Strike Force page updated — any new enforcement actions, letters, or settlements posted here could directly apply to Oceanside given its 6 identified violations and SB 79 noncompliance, though the page content itself is just the shell/metadata without specifics of what changed.
+- Scrape full page content at oag.ca.gov/housing to identify what specifically changed — new enforcement action, settlement, or guidance letter
+- Compare any newly listed cities/actions against Oceanside's obstruction tactics (Coastal Act shield, habitat exclusions, transit misclassification)
+- If new AG enforcement action targets similar violations, cite in next coalition letter as evidence of escalating state enforcement posture
+
+**[2026-06-18] [Page updated] AG Housing Enforcement**
+Source: AG Housing Enforcement | Detection: pattern | Relevance: 7/10
+URL: https://oag.ca.gov/housing
+Why it matters: AG Housing Strike Force page updated — any new enforcement actions, letters, or investigations posted here could directly apply to Oceanside given its 6 identified violations, 11% lower-income RHNA progress, and active SB 79 noncompliance; the page content was truncated so the specific update is unknown but the source demands monitoring.
+- Scrape full page at oag.ca.gov/housing to identify what changed — compare against last cached version
+- Check if any new enforcement letters, lawsuits, or settlements were added that name San Diego County cities or involve SB 79/RHNA/Coastal Act shield tactics
+- If new enforcement action found against a city using similar obstruction patterns, document as precedent for Oceanside complaint
