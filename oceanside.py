@@ -746,6 +746,157 @@ def cmd_analyze(args):
         print(recent[0].read_text())
 
 
+ETRAKIT_BASE = "https://etrakit.cityofoceanside.com/etrakit3"
+ETRAKIT_UA = "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0"
+
+PERMIT_HOUSING_TYPES = [
+    "BLD ACCESSORY DWELLING", "BLD RESIDENTIAL", "BLD NEW RESIDENTIAL",
+    "BLD DWELLING", "BLD SFR", "BLD MULTI", "BLD DUPLEX",
+]
+
+
+def fetch_etrakit_permit(session, permit_no):
+    """Fetch a single permit by direct URL. Returns dict or None."""
+    url = f"{ETRAKIT_BASE}/Search/permit.aspx?activityNo={permit_no}"
+    resp = session.get(url, timeout=30)
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    def label(suffix):
+        el = soup.find("span", id=lambda x: x and x.endswith(suffix) and "Lbl" not in x)
+        return el.get_text(strip=True) if el else ""
+
+    ptype = label("lblPermitType")
+    if not ptype:
+        return None
+
+    addr = ""
+    for span in soup.find_all("span"):
+        sid = span.get("id", "")
+        if "Addr" in sid and "Lbl" not in sid and "City" not in sid:
+            txt = span.get_text(strip=True)
+            if txt and txt != "Address:":
+                addr = txt
+                break
+
+    return {
+        "permit_no": permit_no,
+        "type": ptype,
+        "subtype": label("lblPermitSubtype"),
+        "description": label("lblPermitDesc"),
+        "status": label("lblPermitStatus"),
+        "applied": label("lblPermitAppliedDate"),
+        "approved": label("lblPermitApprovedDate"),
+        "issued": label("lblPermitIssuedDate"),
+        "address": addr,
+        "apn": label("lblPermitAPN"),
+        "owner": label("lblPermitOwner"),
+    }
+
+
+def cmd_permits(args):
+    """Fetch building permits from eTRAKiT by enumerating permit numbers."""
+    ensure_dirs()
+    PERMITS_DIR = DATA_DIR / "permits"
+    PERMITS_DIR.mkdir(exist_ok=True)
+
+    year = getattr(args, "year", datetime.now().year)
+    yy = year % 100
+    prefix = f"BLDG{yy:02d}-"
+    max_seq = getattr(args, "max_seq", 5000)
+    max_misses = getattr(args, "max_misses", 50)
+    housing_only = getattr(args, "housing_only", False)
+
+    out_file = PERMITS_DIR / f"etrakit-permits-{year}.jsonl"
+
+    existing = []
+    start_seq = 1
+    if out_file.exists() and not getattr(args, "full", False):
+        with open(out_file) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    existing.append(json.loads(line))
+        if existing:
+            max_existing = max(
+                int(p["permit_no"].split("-")[1]) for p in existing
+            )
+            start_seq = max_existing + 1
+            print(f"Resuming from {prefix}{start_seq:04d} ({len(existing)} existing permits)", flush=True)
+
+    session = requests.Session()
+    session.headers["User-Agent"] = ETRAKIT_UA
+    retry_adapter = requests.adapters.HTTPAdapter(
+        max_retries=requests.packages.urllib3.util.retry.Retry(
+            total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503]
+        )
+    )
+    session.mount("https://", retry_adapter)
+
+    new_results = []
+    misses = 0
+
+    if start_seq > max_seq:
+        print(f"Already scanned up to {prefix}{start_seq - 1:04d}, checking for new permits...")
+        max_seq = start_seq + 200
+
+    delay = getattr(args, "delay", 1.0)
+    print(f"Scanning eTRAKiT permits {prefix}{start_seq:04d} through {prefix}{max_seq:04d} (delay={delay}s)...", flush=True)
+
+    consecutive_failures = 0
+    for i in range(start_seq, max_seq + 1):
+        permit_no = f"{prefix}{i:04d}"
+        try:
+            p = fetch_etrakit_permit(session, permit_no)
+        except Exception as e:
+            consecutive_failures += 1
+            if consecutive_failures <= 3:
+                print(f"  Error on {permit_no}: {e}", flush=True)
+            elif consecutive_failures == 4:
+                print(f"  (suppressing further errors...)", flush=True)
+            if consecutive_failures > max_misses and i > start_seq + 50:
+                print(f"  Stopping at {permit_no} after {consecutive_failures} consecutive failures", flush=True)
+                break
+            time.sleep(10)
+            continue
+
+        if p:
+            new_results.append(p)
+            misses = 0
+            consecutive_failures = 0
+        else:
+            misses += 1
+            consecutive_failures += 1
+            if misses > max_misses and i > start_seq + 50:
+                print(f"  Stopping at {permit_no} after {max_misses} consecutive misses", flush=True)
+                break
+
+        time.sleep(delay)
+
+        if i % 100 == 0:
+            print(f"  ...{i}: {len(new_results)} new permits found", flush=True)
+            time.sleep(3)
+
+    all_results = existing + new_results
+    with open(out_file, "w") as f:
+        for p in all_results:
+            f.write(json.dumps(p) + "\n")
+
+    from collections import Counter
+
+    housing = [p for p in all_results if
+               any(h in p["type"].upper() for h in ["DWELLING", "RESIDENTIAL", "SFR", "MULTI", "DUPLEX"])]
+
+    print(f"\n{len(new_results)} new permits, {len(all_results)} total for {year}")
+    print(f"{len(housing)} housing-related permits")
+
+    type_counts = Counter(p["type"] for p in all_results)
+    print("\nBy type:")
+    for t, c in type_counts.most_common(15):
+        print(f"  {t}: {c}")
+
+    print(f"\nSaved to {out_file}")
+
+
 def cmd_pra_watch(args):
     """Lightweight fetch + PRA-relevant keyword scan. Outputs JSONL."""
     ensure_dirs()
@@ -869,6 +1020,14 @@ def main():
     p_pra.add_argument("--force", action="store_true", help="Re-scan all documents, not just new ones")
     p_pra.add_argument("--days", type=int, default=None, help="Only scan meetings from the last N days")
 
+    p_permits = sub.add_parser("permits", help="Fetch building permits from eTRAKiT")
+    p_permits.add_argument("--year", type=int, default=datetime.now().year, help="Year to scan (default: current)")
+    p_permits.add_argument("--max-seq", type=int, default=5000, help="Max permit sequence number to try")
+    p_permits.add_argument("--max-misses", type=int, default=50, help="Stop after N consecutive misses")
+    p_permits.add_argument("--housing-only", action="store_true", help="Only output housing-related permits")
+    p_permits.add_argument("--full", action="store_true", help="Full rescan (ignore existing data)")
+    p_permits.add_argument("--delay", type=float, default=1.0, help="Seconds between requests (default: 1.0)")
+
     sub.add_parser("list", help="List tracked meetings")
 
     args = parser.parse_args()
@@ -883,6 +1042,7 @@ def main():
         "watch": cmd_watch,
         "analyze": cmd_analyze,
         "pra-watch": cmd_pra_watch,
+        "permits": cmd_permits,
         "list": cmd_list,
     }
     commands[args.command](args)

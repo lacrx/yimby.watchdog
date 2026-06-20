@@ -75,6 +75,10 @@ Rules:
 Document text:
 """
 
+SKIP_MARKER = ".skip"  # written next to source file to permanently skip un-extractable docs
+CHUNK_SIZE = 60000     # chars per chunk (leaves room for prompt + schema in context)
+CHUNK_OVERLAP = 2000   # overlap between chunks to avoid splitting mid-sentence
+
 
 def get_meeting_meta(doc_path):
     """Try to find meeting metadata for a document."""
@@ -89,51 +93,150 @@ def get_meeting_meta(doc_path):
     return {}
 
 
+class RateLimitHit(Exception):
+    """Raised when claude -p hits session limit — caller should stop the run."""
+    pass
+
+
+def _call_claude(prompt, max_retries=2):
+    """Call claude -p with retries. Returns parsed JSON or None. Raises RateLimitHit."""
+    for attempt in range(max_retries + 1):
+        try:
+            result = subprocess.run(
+                ["claude", "-p", "--output-format", "text"],
+                input=prompt,
+                capture_output=True, text=True, timeout=300,
+            )
+
+            combined = (result.stdout + result.stderr).lower()
+            if "session limit" in combined or "rate limit" in combined:
+                raise RateLimitHit(result.stdout.strip()[:200])
+
+            if result.returncode != 0:
+                if attempt < max_retries:
+                    print(f"  claude -p exit code {result.returncode}, retrying ({attempt+1}/{max_retries})...")
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                print(f"  claude -p exit code {result.returncode}")
+                if result.stderr:
+                    print(f"  stderr: {result.stderr[:300]}")
+                if result.stdout:
+                    print(f"  stdout: {result.stdout[:300]}")
+                return None
+
+            output = result.stdout.strip()
+            if not output:
+                if attempt < max_retries:
+                    print(f"  empty output, retrying ({attempt+1}/{max_retries})...")
+                    time.sleep(5)
+                    continue
+                print(f"  claude -p returned empty output")
+                return None
+
+            if output.startswith("```"):
+                output = output.split("\n", 1)[1] if "\n" in output else output
+                if output.endswith("```"):
+                    output = output[:-3].strip()
+
+            try:
+                record = json.loads(output)
+                return record
+            except json.JSONDecodeError as e:
+                if attempt < max_retries:
+                    print(f"  JSON parse error, retrying ({attempt+1}/{max_retries})...")
+                    time.sleep(5)
+                    continue
+                print(f"  JSON parse error: {e}")
+                print(f"  Raw output ({len(result.stdout)} chars): {result.stdout[:500]}")
+                return None
+
+        except FileNotFoundError:
+            print("  claude CLI not found.")
+            return None
+        except subprocess.TimeoutExpired:
+            if attempt < max_retries:
+                print(f"  timed out, retrying ({attempt+1}/{max_retries})...")
+                time.sleep(10)
+                continue
+            print("  claude -p timed out (300s)")
+            return None
+
+    return None
+
+
+def _merge_records(records):
+    """Merge multiple chunk records into one, deduplicating arrays."""
+    if not records:
+        return None
+    if len(records) == 1:
+        return records[0]
+
+    merged = records[0].copy()
+    for r in records[1:]:
+        for key in ["votes", "housing_items", "fiscal_items", "legal_flags",
+                     "council_positions", "public_comments", "key_quotes"]:
+            existing = merged.get(key, [])
+            new_items = r.get(key, [])
+            for item in new_items:
+                item_str = json.dumps(item, sort_keys=True) if not isinstance(item, str) else item.lower().strip()
+                is_dup = False
+                for e in existing:
+                    e_str = json.dumps(e, sort_keys=True) if not isinstance(e, str) else e.lower().strip()
+                    if e_str == item_str:
+                        is_dup = True
+                        break
+                if not is_dup:
+                    existing.append(item)
+            merged[key] = existing
+
+        if r.get("advocacy_score") == "red":
+            merged["advocacy_score"] = "red"
+            merged["advocacy_reason"] = r.get("advocacy_reason", merged.get("advocacy_reason", ""))
+        elif r.get("advocacy_score") == "yellow" and merged.get("advocacy_score") not in ("red",):
+            merged["advocacy_score"] = "yellow"
+        if not merged.get("date") and r.get("date"):
+            merged["date"] = r["date"]
+        if not merged.get("body") and r.get("body"):
+            merged["body"] = r["body"]
+        if r.get("procedural_only") is False:
+            merged["procedural_only"] = False
+
+    return merged
+
+
 def extract_structured(text, meeting_meta):
-    """Extract structured JSON from raw document text using claude -p."""
+    """Extract structured JSON from document text, chunking if large."""
     meta_context = ""
     if meeting_meta:
         meta_context = f"\nMeeting metadata: {json.dumps(meeting_meta, default=str)}\n"
 
-    # Truncate very large docs
-    prompt = EXTRACTION_PROMPT + meta_context + text[:80000]
+    if len(text) <= CHUNK_SIZE:
+        prompt = EXTRACTION_PROMPT + meta_context + text
+        return _call_claude(prompt)
 
-    try:
-        result = subprocess.run(
-            ["claude", "-p", "--output-format", "text"],
-            input=prompt,
-            capture_output=True, text=True, timeout=300,
-        )
-        if result.returncode != 0:
-            print(f"  claude -p exit code {result.returncode}")
-            if result.stderr:
-                print(f"  stderr: {result.stderr[:300]}")
-            if result.stdout:
-                print(f"  stdout: {result.stdout[:300]}")
-            return None
+    chunks = []
+    pos = 0
+    while pos < len(text):
+        end = pos + CHUNK_SIZE
+        if end < len(text):
+            newline = text.rfind("\n", pos + CHUNK_SIZE - CHUNK_OVERLAP, end)
+            if newline > pos:
+                end = newline + 1
+        chunks.append(text[pos:end])
+        pos = end - CHUNK_OVERLAP if end < len(text) else end
 
-        output = result.stdout.strip()
-        if not output:
-            print(f"  claude -p returned empty output")
-            return None
+    print(f"  Chunking: {len(text):,} chars → {len(chunks)} chunks", flush=True)
 
-        if output.startswith("```"):
-            output = output.split("\n", 1)[1] if "\n" in output else output
-            if output.endswith("```"):
-                output = output[:-3].strip()
+    records = []
+    for ci, chunk in enumerate(chunks):
+        chunk_label = f"[chunk {ci+1}/{len(chunks)}] " if len(chunks) > 1 else ""
+        prompt = EXTRACTION_PROMPT + meta_context + f"\n{chunk_label}(chars {ci*CHUNK_SIZE+1}-{min((ci+1)*CHUNK_SIZE, len(text))} of {len(text)})\n\n" + chunk
+        record = _call_claude(prompt)
+        if record:
+            records.append(record)
+        time.sleep(1)
 
-        record = json.loads(output)
-        return record
-    except json.JSONDecodeError as e:
-        print(f"  JSON parse error: {e}")
-        print(f"  Raw output ({len(result.stdout)} chars): {result.stdout[:500]}")
-        return None
-    except FileNotFoundError:
-        print("  claude CLI not found.")
-        return None
-    except subprocess.TimeoutExpired:
-        print("  claude -p timed out (300s)")
-        return None
+    return _merge_records(records)
 
 
 def rebuild_combined(structured_dir):
@@ -184,6 +287,44 @@ def needs_reextraction(source_path, out_path):
     return source_path.stat().st_mtime > out_path.stat().st_mtime
 
 
+def is_skippable(text):
+    """Check if text is un-extractable garbage from PDF rendering."""
+    stripped = text.strip()
+    if len(stripped) < 100:
+        return "too_short"
+
+    sample = stripped[:5000]
+    alpha_ratio = sum(c.isalpha() or c.isspace() for c in sample) / max(len(sample), 1)
+    if alpha_ratio < 0.2:
+        return "garbled_pdf"
+
+    lines = stripped.split("\n")
+    non_empty = [l for l in lines[:200] if l.strip()]
+    if non_empty:
+        avg_len = sum(len(l.strip()) for l in non_empty) / len(non_empty)
+        if avg_len < 3 and len(non_empty) > 50:
+            return "garbled_pdf"
+
+    lower = stripped[:2000].lower()
+    skip_keywords = ["salary schedule", "revised architectural plans", "plan set\n"]
+    for kw in skip_keywords:
+        if kw in lower and len(stripped) > 200000:
+            return "non_meeting_content"
+
+    return None
+
+
+def write_skip_marker(source_path, reason):
+    """Write a .skip file so this source is never retried."""
+    skip_path = source_path.with_suffix(source_path.suffix + SKIP_MARKER)
+    skip_path.write_text(json.dumps({"reason": reason, "skipped_at": datetime.now().isoformat()}))
+
+
+def has_skip_marker(source_path):
+    """Check if source has been permanently marked as skip."""
+    return source_path.with_suffix(source_path.suffix + SKIP_MARKER).exists()
+
+
 def cmd_extract(args):
     """Extract structured records from all raw sources (documents + transcripts)."""
     STRUCTURED_DIR.mkdir(parents=True, exist_ok=True)
@@ -195,7 +336,12 @@ def cmd_extract(args):
         return
 
     to_process = []
+    skipped_markers = 0
     for source_type, sf in all_sources:
+        if has_skip_marker(sf):
+            skipped_markers += 1
+            continue
+
         stem = sf.stem.replace("-transcript", "") if source_type == "transcript" else sf.stem
         suffix = "-transcript" if source_type == "transcript" else ""
         out_path = STRUCTURED_DIR / f"{stem}{suffix}.json"
@@ -207,8 +353,11 @@ def cmd_extract(args):
         elif needs_reextraction(sf, out_path):
             to_process.append((source_type, sf, out_path))
 
+    if skipped_markers:
+        print(f"  {skipped_markers} sources permanently skipped (.skip marker)")
+
     if args.dry_run:
-        already = len(all_sources) - len(to_process)
+        already = len(all_sources) - len(to_process) - skipped_markers
         print(f"{len(to_process)} sources to process ({len(all_sources)} total, {already} already extracted)")
         docs = sum(1 for t, _, _ in to_process if t == "doc")
         transcripts = sum(1 for t, _, _ in to_process if t == "transcript")
@@ -225,25 +374,59 @@ def cmd_extract(args):
         print(f"  Will stop at {stop_hour}:00")
     success = 0
     failed = 0
-    stopped_early = False
+    skipped = 0
 
     for i, (source_type, sf, out_path) in enumerate(to_process):
         if stop_hour and datetime.now().hour >= stop_hour:
             remaining = len(to_process) - i
             print(f"\nStopping at {datetime.now().strftime('%H:%M')} ({remaining} remaining, will resume next run)")
-            stopped_early = True
             break
 
         label = f"[{source_type}]" if source_type == "transcript" else ""
         print(f"[{i+1}/{len(to_process)}] {sf.name} {label}")
 
         text = sf.read_text()
-        if len(text.strip()) < 100:
-            print(f"  Skipping: too short ({len(text.strip())} chars)")
+
+        skip_reason = is_skippable(text)
+        if skip_reason:
+            write_skip_marker(sf, skip_reason)
+            skipped += 1
+            print(f"  Skipping permanently: {skip_reason} ({len(text.strip())} chars)")
             continue
 
         meta = get_meeting_meta(sf)
-        record = extract_structured(text, meta)
+        try:
+            record = extract_structured(text, meta)
+        except RateLimitHit as e:
+            remaining = len(to_process) - i
+            msg = str(e).lower()
+            # Parse reset time from "resets 6am" style messages
+            reset_hour = None
+            if "resets" in msg:
+                import re
+                m = re.search(r"resets\s+(\d+)(am|pm)", msg)
+                if m:
+                    h = int(m.group(1))
+                    if m.group(2) == "pm" and h != 12:
+                        h += 12
+                    reset_hour = h
+
+            now = datetime.now()
+            if reset_hour is not None and stop_hour is not None:
+                if reset_hour < stop_hour:
+                    wait_minutes = (reset_hour * 60 - now.hour * 60 - now.minute)
+                    if wait_minutes < 0:
+                        wait_minutes += 24 * 60
+                    if wait_minutes <= 120:
+                        print(f"\n  Rate limit hit — resets at {reset_hour}:00 ({wait_minutes} min). Waiting...", flush=True)
+                        time.sleep(wait_minutes * 60 + 30)
+                        print(f"  Resuming after rate limit reset.", flush=True)
+                        continue
+
+            print(f"\n  Rate limit hit: {e}")
+            print(f"  Stopping — {remaining} sources remaining, will resume next run.")
+            print(f"  ({success} extracted, {failed} failed, {skipped} skipped this run)")
+            break
 
         if record:
             if not record.get("meeting_id"):
@@ -261,7 +444,7 @@ def cmd_extract(args):
 
         time.sleep(1)
 
-    print(f"\nDone. {success} extracted, {failed} failed.")
+    print(f"\nDone. {success} extracted, {failed} failed, {skipped} permanently skipped.")
 
     if success > 0:
         rebuild_combined(STRUCTURED_DIR)

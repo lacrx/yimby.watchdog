@@ -169,8 +169,10 @@ def cmd_rollup(args):
     for month in target_months:
         out_path = MONTHLY_DIR / f"{month}.json"
         if out_path.exists() and not args.force and not args.month:
-            skipped += 1
-            continue
+            existing = json.loads(out_path.read_text())
+            if existing.get("record_count", 0) == len(by_month[month]):
+                skipped += 1
+                continue
 
         month_records = by_month[month]
         digest = merge_month(month, month_records)

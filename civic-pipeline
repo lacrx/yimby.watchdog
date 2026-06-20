@@ -84,12 +84,21 @@ python intel_feed.py >> data/intel/feed.log 2>&1
 log "Intel feed done."
 python update_skill_intel.py >> data/intel/feed.log 2>&1
 
-# ── 1c: Discover new meeting videos ──
+# ── 1c: Fetch new building permits (incremental) ──
+CURRENT_YEAR=$(date '+%Y')
+log "Fetching building permits ($CURRENT_YEAR, incremental)..."
+if python oceanside.py permits --year "$CURRENT_YEAR" >> data/permits/fetch.log 2>&1; then
+    log "Permits fetch done."
+else
+    log "Permits fetch failed — continuing pipeline."
+fi
+
+# ── 1d: Discover new meeting videos ──
 log "Discovering new meeting videos..."
 python discover_videos.py >> data/video-discovery.log 2>&1
 log "Video discovery done."
 
-# ── 1d: Transcribe audio (if enabled) ──
+# ── 1e: Transcribe audio (if enabled) ──
 if [ -n "$TRANSCRIBE" ]; then
     if [ ! -f data/transcribe-batch.json ]; then
         log "  No data/transcribe-batch.json found. Skipping transcription."
@@ -126,18 +135,10 @@ log "Merging per-meeting records..."
 python meeting_merge.py >> data/meeting-merge.log 2>&1
 log "Meeting merge done."
 
-# ── 2b: Monthly rollups ──
-log "Checking monthly digests..."
-MISSING=$(python monthly_rollup.py --check 2>&1)
-if echo "$MISSING" | grep -q "need rebuild"; then
-    log "  $MISSING"
-    CURRENT_MONTH=$(date '+%Y-%m')
-    python monthly_rollup.py --month "$CURRENT_MONTH" >> data/monthly-rollup.log 2>&1
-    python monthly_rollup.py >> data/monthly-rollup.log 2>&1
-    log "Monthly rollups updated."
-else
-    log "  All months up to date."
-fi
+# ── 2b: Monthly rollups (auto-detects stale months) ──
+log "Building monthly digests..."
+python monthly_rollup.py >> data/monthly-rollup.log 2>&1
+log "Monthly rollups done."
 
 # ═══════════════════════════════════════════
 # PHASE 3: EXTRACT — use remaining time for structured extraction
