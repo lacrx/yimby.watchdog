@@ -503,7 +503,7 @@ def cmd_stats(args):
     STRUCTURED_DIR.mkdir(parents=True, exist_ok=True)
 
     json_files = list(STRUCTURED_DIR.glob("*.json"))
-    json_files = [f for f in json_files if f.name != "extraction-state.json"]
+    json_files = [f for f in json_files if f.name not in ("extraction-state.json", "meetings-state.json")]
 
     if not json_files:
         print("No structured records found. Run extract first.")
