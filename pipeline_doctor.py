@@ -15,6 +15,7 @@ Called automatically at end of civic-pipeline. Can also run standalone.
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -196,11 +197,13 @@ def find_oversized_files():
 
 def check_auth_health():
     """Check if claude -p is currently authenticated."""
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     try:
         result = subprocess.run(
             ["claude", "-p", "--output-format", "text"],
             input="Reply with exactly: OK",
             capture_output=True, text=True, timeout=30,
+            env=env,
         )
         combined = (result.stdout + result.stderr).lower()
         if "invalid authentication" in combined or "401" in combined or "403" in combined:

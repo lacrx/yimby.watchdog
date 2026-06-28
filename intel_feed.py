@@ -178,11 +178,13 @@ def check_relevance_claude(title, summary, source):
     text = f"Source: {source}\nTitle: {title}\nContent: {summary[:3000]}"
     prompt = RELEVANCE_PROMPT + text
 
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     try:
         result = subprocess.run(
             ["claude", "-p", "--output-format", "text"],
             input=prompt,
             capture_output=True, text=True, timeout=120,
+            env=env,
         )
         if result.returncode != 0:
             return None

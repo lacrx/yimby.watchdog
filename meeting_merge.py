@@ -76,10 +76,10 @@ def merge_records(meeting_id, records):
     all_comments = []
     all_quotes = []
     bodies = set()
-    agencies = set()
+    agencies = []
     doc_types = set()
     sources = []
-    dates = set()
+    dates = []
     scores = []
 
     for r in records:
@@ -89,9 +89,9 @@ def merge_records(meeting_id, records):
         if r.get("body"):
             bodies.add(r["body"])
         if r.get("agency"):
-            agencies.add(r["agency"])
+            agencies.append(r["agency"])
         if r.get("date"):
-            dates.add(r["date"])
+            dates.append(r["date"])
         if r.get("doc_type"):
             doc_types.add(r["doc_type"])
         if r.get("advocacy_score"):
@@ -126,8 +126,10 @@ def merge_records(meeting_id, records):
         elif not key:
             deduped_votes.append(v)
 
-    # Pick best date (prefer YYYY-MM-DD format)
-    date = sorted(dates)[0] if dates else ""
+    # Pick most common date and agency (majority vote, not alphabetical/earliest)
+    from collections import Counter
+    date = Counter(dates).most_common(1)[0][0] if dates else ""
+    agency = Counter(agencies).most_common(1)[0][0] if agencies else "Unknown"
 
     # Aggregate score: worst score wins (red > yellow > neutral > green)
     score_priority = {"red": 0, "yellow": 1, "neutral": 2, "green": 3}
@@ -137,7 +139,7 @@ def merge_records(meeting_id, records):
         "meeting_id": meeting_id,
         "date": date,
         "body": sorted(bodies)[0] if bodies else "Unknown",
-        "agency": sorted(agencies)[0] if agencies else "Unknown",
+        "agency": agency,
         "doc_types": sorted(doc_types),
         "source_count": len(records),
         "sources": sources,

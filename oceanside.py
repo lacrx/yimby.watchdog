@@ -72,6 +72,15 @@ PRA_WATCH_KEYWORDS = [
 BODIES = {
     "City Council": None,
     "Planning Commission": None,
+    "Housing Commission": None,
+    "Manufactured Home Fair Practices Commission": None,
+    "Downtown Advisory Committee": None,
+    "Historic Preservation Advisory Commission": None,
+    "Economic Development Commission": None,
+    "Utilities Commission": None,
+    "Harbor and Beaches Advisory Committee": None,
+    "Citizen Investment Oversight Committee": None,
+    "Measure X Citizen Oversight Committee": None,
 }
 
 
@@ -386,10 +395,12 @@ def analyze_advocacy_local(text, meeting_info):
     import subprocess
     prompt = _build_advocacy_prompt(text, meeting_info)
 
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     try:
         result = subprocess.run(
             ["claude", "-p", prompt, "--output-format", "text"],
             capture_output=True, text=True, timeout=300,
+            env=env,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()

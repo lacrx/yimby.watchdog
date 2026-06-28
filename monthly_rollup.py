@@ -1,68 +1,143 @@
 #!/usr/bin/env python3
 """
-Roll up per-document structured JSONL records into monthly digests.
+Roll up all data sources into independent monthly digests.
 
-Pure data operation — no LLM, no information loss. Concatenates and deduplicates
-structured arrays from individual records into one record per month.
+Each month is self-contained — rebuilds only when its inputs change.
+Content-hashes all source data per month; any change (new record, updated
+extraction, new permit, new intel item) triggers a rebuild for that month only.
+
+Data sources:
+  1. Meeting records  — data/structured/meetings/*.json (merged per-meeting)
+  2. Building permits — data/permits/etrakit-permits-*.jsonl
+  3. Intel feed       — data/intel/intel-*.json
 
 Usage:
-    python monthly_rollup.py                # build missing monthly digests
+    python monthly_rollup.py                # build stale months
     python monthly_rollup.py --force        # rebuild all months
     python monthly_rollup.py --month 2026-03  # rebuild specific month
     python monthly_rollup.py --stats        # show monthly digest stats
 
-Input:  data/structured/all-records.jsonl
 Output: data/structured/monthly/{YYYY-MM}.json + monthly-digests.jsonl
 """
 
 import argparse
+import hashlib
 import json
+import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
+from datetime import datetime
 from pathlib import Path
 
 DATA_DIR = Path(__file__).parent / "data"
 STRUCTURED_DIR = DATA_DIR / "structured"
 MERGED_DIR = STRUCTURED_DIR / "meetings"
 MONTHLY_DIR = STRUCTURED_DIR / "monthly"
-MERGED_JSONL = STRUCTURED_DIR / "meetings-combined.jsonl"
-INDIVIDUAL_JSONL = STRUCTURED_DIR / "all-records.jsonl"
 MONTHLY_JSONL = STRUCTURED_DIR / "monthly-digests.jsonl"
+PERMITS_DIR = DATA_DIR / "permits"
+INTEL_DIR = DATA_DIR / "intel"
+
+HOUSING_PERMIT_TYPES = {
+    "BLD SFD OR DUPLEX", "BLD MULTI FAMILY", "BLD ACCESSORY DWELLING",
+}
 
 
-def load_records():
-    """Load per-meeting merged records (preferred) or individual records (fallback)."""
-    if MERGED_JSONL.exists():
-        source = MERGED_JSONL
-    elif INDIVIDUAL_JSONL.exists():
-        source = INDIVIDUAL_JSONL
-    else:
-        print(f"No records found. Run extract_structured.py + meeting_merge.py first.")
-        sys.exit(1)
-
-    records = []
-    with open(source) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                records.append(json.loads(line))
-    print(f"Loaded {len(records)} records from {source.name}")
-    return records
+def parse_date_to_month(date_str):
+    """Parse M/D/YYYY or YYYY-MM-DD to YYYY-MM. Returns None on failure."""
+    if not date_str:
+        return None
+    if "/" in date_str:
+        parts = date_str.split("/")
+        if len(parts) == 3:
+            try:
+                return f"{int(parts[2]):04d}-{int(parts[0]):02d}"
+            except ValueError:
+                return None
+    elif "-" in date_str and len(date_str) >= 7:
+        return date_str[:7]
+    return None
 
 
-def group_by_month(records):
-    """Group records by YYYY-MM."""
+def content_hash(data):
+    """Stable hash of serialized data for change detection."""
+    return hashlib.sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+# ── Source loaders ──
+
+def load_meetings_by_month():
+    """Load merged per-meeting records, grouped by month."""
     by_month = defaultdict(list)
-    for r in records:
-        date = r.get("date", "")
-        if len(date) >= 7:
-            month = date[:7]
-            by_month[month].append(r)
-    return dict(sorted(by_month.items()))
+    if not MERGED_DIR.exists():
+        return by_month
+    for jf in sorted(MERGED_DIR.glob("*.json")):
+        try:
+            r = json.loads(jf.read_text())
+            month = parse_date_to_month(r.get("date", ""))
+            if month:
+                by_month[month].append(r)
+        except (json.JSONDecodeError, Exception):
+            continue
+    return by_month
 
+
+def load_permits_by_month():
+    """Load building permits, grouped by month. Only housing-relevant types."""
+    by_month = defaultdict(list)
+    for pf in sorted(PERMITS_DIR.glob("etrakit-permits-*.jsonl")):
+        try:
+            with open(pf) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    r = json.loads(line)
+                    ptype = r.get("type", "")
+                    if ptype not in HOUSING_PERMIT_TYPES:
+                        continue
+                    month = parse_date_to_month(r.get("applied", ""))
+                    if month:
+                        by_month[month].append(r)
+        except (json.JSONDecodeError, Exception):
+            continue
+    return by_month
+
+
+def load_intel_by_month():
+    """Load intel feed items, grouped by month."""
+    by_month = defaultdict(list)
+    for inf in sorted(INTEL_DIR.glob("intel-*.json")):
+        try:
+            items = json.loads(inf.read_text())
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                pub = item.get("published", "")
+                month = None
+                # Try parsing RFC 2822 date
+                for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%Y-%m-%d"):
+                    try:
+                        dt = datetime.strptime(pub.strip(), fmt)
+                        month = dt.strftime("%Y-%m")
+                        break
+                    except ValueError:
+                        continue
+                if not month:
+                    # Fall back to filename date: intel-YYYY-MM-DD.json
+                    match = re.search(r"intel-(\d{4}-\d{2})", inf.name)
+                    if match:
+                        month = match.group(1)
+                if month:
+                    by_month[month].append(item)
+        except (json.JSONDecodeError, Exception):
+            continue
+    return by_month
+
+
+# ── Merge logic ──
 
 def deduplicate(items):
-    """Deduplicate a list of strings."""
+    """Deduplicate a list of strings or dicts."""
     seen = set()
     result = []
     for item in items:
@@ -73,8 +148,30 @@ def deduplicate(items):
     return result
 
 
-def merge_month(month, records):
-    """Merge all records for a month into one digest."""
+def summarize_permits(permits):
+    """Summarize permits into counts by type and status."""
+    by_type = Counter()
+    by_status = Counter()
+    total_units = 0
+    for p in permits:
+        by_type[p.get("type", "unknown")] += 1
+        by_status[p.get("status", "unknown")] += 1
+        desc = p.get("description", "").upper()
+        units = 1
+        match = re.search(r"(\d+)\s*(?:UNIT|DU|DWELLING)", desc)
+        if match:
+            units = int(match.group(1))
+        total_units += units
+    return {
+        "total": len(permits),
+        "estimated_units": total_units,
+        "by_type": dict(by_type.most_common()),
+        "by_status": dict(by_status.most_common()),
+    }
+
+
+def merge_month(month, meetings, permits, intel):
+    """Merge all data sources for a month into one digest."""
     bodies = set()
     agencies = set()
     all_votes = []
@@ -87,7 +184,7 @@ def merge_month(month, records):
     scores = {"green": 0, "yellow": 0, "red": 0, "neutral": 0}
     substantive_count = 0
 
-    for r in records:
+    for r in meetings:
         if r.get("procedural_only"):
             continue
         substantive_count += 1
@@ -111,9 +208,9 @@ def merge_month(month, records):
     dominant_score = max(scores, key=scores.get) if substantive_count > 0 else "neutral"
     red_pct = scores["red"] / substantive_count * 100 if substantive_count > 0 else 0
 
-    return {
+    digest = {
         "month": month,
-        "record_count": len(records),
+        "meeting_count": len(meetings),
         "substantive_count": substantive_count,
         "bodies": sorted(bodies),
         "agencies": sorted(agencies),
@@ -131,6 +228,32 @@ def merge_month(month, records):
         "key_quotes": deduplicate(all_quotes),
     }
 
+    if permits:
+        digest["permits"] = summarize_permits(permits)
+
+    if intel:
+        digest["intel"] = [
+            {
+                "source": i.get("source", ""),
+                "title": i.get("title", ""),
+                "url": i.get("url", ""),
+                "relevance_score": i.get("relevance_score", 0),
+            }
+            for i in intel
+        ]
+
+    # Source fingerprint for change detection
+    digest["_source_hash"] = content_hash({
+        "meetings": [(r.get("meeting_id"), r.get("source_count")) for r in meetings],
+        "permits": len(permits),
+        "intel": len(intel),
+        "meeting_content": content_hash(meetings),
+    })
+
+    return digest
+
+
+# ── Commands ──
 
 def rebuild_combined():
     """Rebuild the combined monthly digests JSONL."""
@@ -150,32 +273,47 @@ def rebuild_combined():
 
 
 def cmd_rollup(args):
-    """Build monthly digests."""
+    """Build monthly digests from all data sources."""
     MONTHLY_DIR.mkdir(parents=True, exist_ok=True)
 
-    records = load_records()
-    by_month = group_by_month(records)
+    meetings_by_month = load_meetings_by_month()
+    permits_by_month = load_permits_by_month()
+    intel_by_month = load_intel_by_month()
 
-    target_months = sorted(by_month.keys())
+    all_months = sorted(set(
+        list(meetings_by_month.keys()) +
+        list(permits_by_month.keys()) +
+        list(intel_by_month.keys())
+    ))
+
+    m_count = sum(len(v) for v in meetings_by_month.values())
+    p_count = sum(len(v) for v in permits_by_month.values())
+    i_count = sum(len(v) for v in intel_by_month.values())
+    print(f"Loaded {m_count} meetings, {p_count} permits, {i_count} intel items across {len(all_months)} months")
+
     if args.month:
-        if args.month not in by_month:
-            print(f"No records for {args.month}")
+        if args.month not in all_months:
+            print(f"No data for {args.month}")
             return
-        target_months = [args.month]
+        all_months = [args.month]
 
     built = 0
     skipped = 0
 
-    for month in target_months:
+    for month in all_months:
+        meetings = meetings_by_month.get(month, [])
+        permits = permits_by_month.get(month, [])
+        intel = intel_by_month.get(month, [])
+
+        digest = merge_month(month, meetings, permits, intel)
+
         out_path = MONTHLY_DIR / f"{month}.json"
         if out_path.exists() and not args.force and not args.month:
             existing = json.loads(out_path.read_text())
-            if existing.get("record_count", 0) == len(by_month[month]):
+            if existing.get("_source_hash") == digest["_source_hash"]:
                 skipped += 1
                 continue
 
-        month_records = by_month[month]
-        digest = merge_month(month, month_records)
         out_path.write_text(json.dumps(digest, indent=2, default=str))
         built += 1
 
@@ -188,9 +326,15 @@ def cmd_rollup(args):
         if breakdown["green"]:
             score_bar += f" 🟢{breakdown['green']}"
 
-        print(f"  {month}: {digest['substantive_count']} substantive / {digest['record_count']} total{score_bar}")
+        parts = [f"{digest['substantive_count']} meetings"]
+        if permits:
+            parts.append(f"{digest['permits']['total']} permits")
+        if intel:
+            parts.append(f"{len(intel)} intel")
 
-    print(f"\nBuilt {built}, skipped {skipped} (already exist)")
+        print(f"  {month}: {' + '.join(parts)}{score_bar}")
+
+    print(f"\nBuilt {built}, skipped {skipped} (unchanged)")
 
     if built > 0:
         rebuild_combined()
@@ -208,56 +352,37 @@ def cmd_stats(args):
     total_votes = 0
     total_housing = 0
     total_legal = 0
-    total_records = 0
+    total_meetings = 0
+    total_permits = 0
 
-    print(f"{'Month':8s} {'Records':>8s} {'Subst':>6s} {'Votes':>6s} {'Housing':>8s} {'Legal':>6s} {'Score':>8s}")
-    print("-" * 60)
+    print(f"{'Month':8s} {'Mtgs':>5s} {'Subst':>6s} {'Votes':>6s} {'Housing':>8s} {'Legal':>6s} {'Permits':>8s} {'Score':>8s}")
+    print("-" * 68)
 
     for df in digests:
         d = json.loads(df.read_text())
         votes = len(d.get("votes", []))
         housing = len(d.get("housing_items", []))
         legal = len(d.get("legal_flags", []))
-        records = d.get("record_count", 0)
+        meetings = d.get("meeting_count", d.get("record_count", 0))
         subst = d.get("substantive_count", 0)
         score = d.get("advocacy_summary", {}).get("dominant_score", "?")
+        permits = d.get("permits", {}).get("total", 0)
 
         total_votes += votes
         total_housing += housing
         total_legal += legal
-        total_records += records
+        total_meetings += meetings
+        total_permits += permits
 
-        print(f"{d['month']:8s} {records:8d} {subst:6d} {votes:6d} {housing:8d} {legal:6d} {score:>8s}")
+        print(f"{d['month']:8s} {meetings:5d} {subst:6d} {votes:6d} {housing:8d} {legal:6d} {permits:8d} {score:>8s}")
 
-    print("-" * 60)
-    print(f"{'TOTAL':8s} {total_records:8d} {'':6s} {total_votes:6d} {total_housing:8d} {total_legal:6d}")
+    print("-" * 68)
+    print(f"{'TOTAL':8s} {total_meetings:5d} {'':6s} {total_votes:6d} {total_housing:8d} {total_legal:6d} {total_permits:8d}")
     print(f"\n{len(digests)} monthly digests")
 
 
-def find_missing_months():
-    """Find months that have individual records but no monthly digest."""
-    if not INDIVIDUAL_JSONL.exists():
-        return []
-
-    records = load_records()
-    by_month = group_by_month(records)
-    MONTHLY_DIR.mkdir(parents=True, exist_ok=True)
-
-    missing = []
-    for month in sorted(by_month.keys()):
-        digest_path = MONTHLY_DIR / f"{month}.json"
-        if not digest_path.exists():
-            missing.append(month)
-        else:
-            existing = json.loads(digest_path.read_text())
-            if existing.get("record_count", 0) != len(by_month[month]):
-                missing.append(month)
-
-    return missing
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Build monthly digests from structured JSONL")
+    parser = argparse.ArgumentParser(description="Build monthly digests from all data sources")
     parser.add_argument("--force", action="store_true", help="Rebuild all months")
     parser.add_argument("--month", help="Rebuild specific month (YYYY-MM)")
     parser.add_argument("--stats", action="store_true", help="Show monthly stats")
@@ -268,9 +393,35 @@ def main():
     if args.stats:
         cmd_stats(args)
     elif args.check:
-        missing = find_missing_months()
-        if missing:
-            print(f"{len(missing)} months need rebuild: {', '.join(missing)}")
+        # Quick check: compute hashes and compare
+        MONTHLY_DIR.mkdir(parents=True, exist_ok=True)
+        meetings_by_month = load_meetings_by_month()
+        permits_by_month = load_permits_by_month()
+        intel_by_month = load_intel_by_month()
+        all_months = sorted(set(
+            list(meetings_by_month.keys()) +
+            list(permits_by_month.keys()) +
+            list(intel_by_month.keys())
+        ))
+        stale = []
+        for month in all_months:
+            digest = merge_month(
+                month,
+                meetings_by_month.get(month, []),
+                permits_by_month.get(month, []),
+                intel_by_month.get(month, []),
+            )
+            out_path = MONTHLY_DIR / f"{month}.json"
+            if not out_path.exists():
+                stale.append((month, "missing"))
+            else:
+                existing = json.loads(out_path.read_text())
+                if existing.get("_source_hash") != digest["_source_hash"]:
+                    stale.append((month, "changed"))
+        if stale:
+            print(f"{len(stale)} months need rebuild:")
+            for month, reason in stale:
+                print(f"  {month}: {reason}")
         else:
             print("All months up to date.")
     else:

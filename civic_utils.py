@@ -116,10 +116,12 @@ def summarize_text_local(text, meeting_info):
         text=text[:80000],
     )
 
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     try:
         result = subprocess.run(
             ["claude", "-p", prompt, "--output-format", "text"],
             capture_output=True, text=True, timeout=300,
+            env=env,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()
@@ -170,11 +172,13 @@ def claude_local_call(prompt, system=None, timeout=300):
         full_prompt = f"SYSTEM CONTEXT:\n{system}\n\n---\n\n"
     full_prompt += prompt
 
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     try:
         result = subprocess.run(
             ["claude", "-p", "--output-format", "text"],
             input=full_prompt,
             capture_output=True, text=True, timeout=timeout,
+            env=env,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()

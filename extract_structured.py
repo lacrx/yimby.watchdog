@@ -20,6 +20,7 @@ Combined: data/structured/all-records.jsonl (one line per record, for bulk reads
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -107,13 +108,17 @@ def _call_claude(prompt, max_retries=2):
     """Call claude -p with retries. Returns parsed JSON or None.
 
     Raises RateLimitHit on session/rate limits and AuthError on 401/403.
+    Uses subscription auth only — ANTHROPIC_API_KEY is stripped to avoid
+    burning API credits on batch extraction.
     """
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
     for attempt in range(max_retries + 1):
         try:
             result = subprocess.run(
                 ["claude", "-p", "--output-format", "text"],
                 input=prompt,
                 capture_output=True, text=True, timeout=300,
+                env=env,
             )
 
             stderr_lower = result.stderr.lower()
