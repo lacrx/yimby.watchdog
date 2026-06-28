@@ -185,14 +185,14 @@ def merge_month(month, meetings, permits, intel):
     substantive_count = 0
 
     for r in meetings:
-        if r.get("procedural_only"):
-            continue
-        substantive_count += 1
-
         if r.get("body"):
             bodies.add(r["body"])
         if r.get("agency"):
             agencies.add(r["agency"])
+
+        if r.get("procedural_only"):
+            continue
+        substantive_count += 1
 
         score = r.get("advocacy_score", "neutral")
         scores[score] = scores.get(score, 0) + 1
