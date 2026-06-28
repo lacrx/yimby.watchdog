@@ -10,18 +10,31 @@
 #   Process: extract JSONL (docs + transcripts) → monthly rollup → prose summaries
 #
 # Options:
-#   --deep          Download staff reports (not just agendas/minutes)
-#   --force         Re-process already summarized/extracted documents
-#   --years N       How many years back to fetch (default: 1)
-#   --transcribe    Also transcribe meeting videos
+#   --deep              Download staff reports (not just agendas/minutes)
+#   --force             Re-process already summarized/extracted documents
+#   --years N           How many years back to fetch (default: 1)
+#   --transcribe        Also transcribe meeting videos
+#   --extract-until H   Stop extraction at hour H (0-23). Omit for no time limit.
 #
 # Cron:
-#   0 1 * * * cd ~/repos/civics && ./civic-pipeline local --deep
+#   0 1 * * *   cd ~/repos/civics && ./civic-pipeline local --deep --extract-until 4
+#   0 18 * * 2-5 cd ~/repos/civics && ./civic-pipeline local --deep
 
 set -euo pipefail
 cd "$(dirname "$0")"
 export PATH="$HOME/.local/bin:$PATH"
 source .venv/bin/activate
+[ -f .env ] && set -a && source .env && set +a
+unset ANTHROPIC_API_KEY  # extraction uses claude -p via subscription, not paid API
+
+sync_to_s3() {
+    local prefix="$1"; local local_path="$2"; local storage_class="${3:-STANDARD}"
+    shift 3
+    [ -z "${S3_BUCKET:-}" ] && return 0
+    aws s3 sync "$local_path" "s3://${S3_BUCKET}/${prefix}" \
+        --storage-class "$storage_class" --no-progress --size-only \
+        "$@" >> data/s3-sync.log 2>&1 || log "S3 sync failed for $prefix (non-fatal)"
+}
 
 MODE="${1:-hybrid}"
 shift 2>/dev/null || true
@@ -30,14 +43,16 @@ DEEP=""
 FORCE=""
 YEARS="1"
 TRANSCRIBE=""
+EXTRACT_CUTOFF=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --deep)       DEEP="--deep"; shift ;;
-        --force)      FORCE="--force"; shift ;;
-        --years)      YEARS="$2"; shift 2 ;;
-        --transcribe) TRANSCRIBE="1"; shift ;;
-        *)            echo "Unknown option: $1"; exit 1 ;;
+        --deep)           DEEP="--deep"; shift ;;
+        --force)          FORCE="--force"; shift ;;
+        --years)          YEARS="$2"; shift 2 ;;
+        --transcribe)     TRANSCRIBE="1"; shift ;;
+        --extract-until)  EXTRACT_CUTOFF="$2"; shift 2 ;;
+        *)                echo "Unknown option: $1"; exit 1 ;;
     esac
 done
 
@@ -77,6 +92,18 @@ log "Oceanside fetch done."
 log "Fetching NCTD meetings..."
 python nctd.py fetch >> data/nctd-watch.log 2>&1
 log "NCTD fetch done."
+
+log "Fetching SANDAG meetings..."
+python sandag.py fetch --years "$YEARS" >> data/sandag-watch.log 2>&1
+log "SANDAG fetch done."
+
+log "Fetching SD County Board of Supervisors..."
+python sdcounty.py fetch --years "$YEARS" >> data/sdcounty-watch.log 2>&1
+log "SD County fetch done."
+
+log "Fetching Coastal Commission agendas..."
+python coastal.py fetch --years "$YEARS" >> data/coastal-watch.log 2>&1
+log "Coastal Commission fetch done."
 
 # ── 1b: Intel feed — check RSS/web for Oceanside-relevant items ──
 log "Checking intel feeds..."
@@ -126,6 +153,25 @@ if [ -n "$TRANSCRIBE" ]; then
     fi
 fi
 
+# ── S3 sync: raw sources ──
+if [ -n "${S3_BUCKET:-}" ]; then
+    log "Syncing raw sources to S3..."
+    sync_to_s3 "archive/documents/pdfs" "data/documents" "STANDARD" --exclude "*.txt" --exclude "*.skip" --exclude "*.json"
+    sync_to_s3 "raw/documents/txt" "data/documents" "STANDARD_IA" --exclude "*.pdf" --exclude "*.skip" --exclude "*.json"
+    sync_to_s3 "archive/audio" "data/audio" "STANDARD"
+    sync_to_s3 "archive/nctd/documents/pdfs" "data/nctd/documents" "STANDARD" --exclude "*.txt" --exclude "*.skip"
+    sync_to_s3 "raw/nctd/documents/txt" "data/nctd/documents" "STANDARD_IA" --exclude "*.pdf" --exclude "*.skip"
+    sync_to_s3 "metadata/meetings" "data/meetings" "STANDARD"
+    sync_to_s3 "metadata/nctd/meetings" "data/nctd/meetings" "STANDARD"
+    sync_to_s3 "metadata/sandag/meetings" "data/sandag" "STANDARD"
+    sync_to_s3 "metadata/sdcounty/meetings" "data/sdcounty" "STANDARD"
+    sync_to_s3 "metadata/coastal/meetings" "data/coastal" "STANDARD"
+    sync_to_s3 "operational/permits" "data/permits" "STANDARD"
+    sync_to_s3 "operational/intel" "data/intel" "STANDARD"
+    sync_to_s3 "raw/transcripts" "data/transcripts" "STANDARD_IA"
+    log "S3 sync (raw) done."
+fi
+
 # ═══════════════════════════════════════════
 # PHASE 2: PROCESS — merge and roll up existing records
 # ═══════════════════════════════════════════
@@ -146,20 +192,203 @@ log "Monthly rollups done."
 # Processes unextracted docs (new and backfill) until hard cutoff.
 # Newest docs sort first so recent meetings get priority.
 
-EXTRACT_CUTOFF=4
-if [ "$(date '+%H')" -lt "$EXTRACT_CUTOFF" ]; then
+EXTRACT_BEFORE=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
+EXTRACT_TIMESTAMP=$(mktemp)
+
+if [ -n "$EXTRACT_CUTOFF" ]; then
     log "Structured extraction until ${EXTRACT_CUTOFF}:00..."
     python extract_structured.py --stop-at "$EXTRACT_CUTOFF" $FORCE >> data/structured-extraction.log 2>&1
     log "Extraction done."
 else
-    log "No time left for extraction (past ${EXTRACT_CUTOFF}:00)."
+    log "Structured extraction (no time limit)..."
+    python extract_structured.py $FORCE >> data/structured-extraction.log 2>&1
+    log "Extraction done."
 fi
 
 # Prose summaries removed — structured JSONL + monthly rollups are the
 # canonical data layer. Agents read JSONL directly.
 
 # ═══════════════════════════════════════════
-# PHASE 4: EXECUTIVE (full mode only)
+# PHASE 4: NOTIFY — push notification if new extractions found
+# ═══════════════════════════════════════════
+
+EXTRACT_AFTER=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
+NEW_EXTRACTIONS=$((EXTRACT_AFTER - EXTRACT_BEFORE))
+
+NOTIFY_LOG="data/notified-meetings.log"
+touch "$NOTIFY_LOG"
+
+if [ "$NEW_EXTRACTIONS" -gt 0 ]; then
+    log "New extractions: $NEW_EXTRACTIONS. Checking for new meetings to notify..."
+
+    # Collect unique agency|body|date keys from ALL newly extracted files.
+    # Key: "agency|body|date" — deduped, 7-day recency window to skip backfill.
+    # Python does all the heavy lifting: dedup, recency, normalize body names.
+    MEETING_KEYS=$(find data/structured -name '*.json' -newer "$EXTRACT_TIMESTAMP" 2>/dev/null \
+        | xargs python3 -c "
+import json, sys, re
+from datetime import datetime
+seen = set()
+now = datetime.now()
+for path in sys.argv[1:]:
+    try:
+        r = json.load(open(path))
+        agency = r.get('agency', '').strip()
+        body = r.get('body', '').strip()
+        date = r.get('date', '').strip()
+        if not (agency and body and date and '-' in date):
+            continue
+        # Normalize: strip sub-body suffixes like '- Land Use'
+        body = re.sub(r'\s*-\s*(Land Use|Closed Session|Special).*', '', body)
+        meeting_dt = datetime.strptime(date, '%Y-%m-%d')
+        if abs((now - meeting_dt).days) > 7:
+            continue
+        key = f'{agency}|{body}|{date}'
+        if key not in seen:
+            seen.add(key)
+            print(key)
+    except:
+        pass
+" 2>/dev/null)
+
+    if [ -z "$MEETING_KEYS" ]; then
+        log "New extractions but no recent meetings found (backfill only)."
+    else
+        # Filter out already-notified meetings
+        NEW_MEETINGS=""
+        while IFS= read -r key; do
+            [ -z "$key" ] && continue
+            if ! grep -qxF "$key" "$NOTIFY_LOG" 2>/dev/null; then
+                NEW_MEETINGS="${NEW_MEETINGS}${key}
+"
+            fi
+        done <<< "$MEETING_KEYS"
+
+        # Trim trailing whitespace
+        NEW_MEETINGS=$(echo "$NEW_MEETINGS" | sed '/^$/d')
+
+        if [ -z "$NEW_MEETINGS" ]; then
+            log "All extracted meetings already notified. Skipping."
+        else
+            # Record BEFORE sending — prevents double-post on partial failure
+            echo "$NEW_MEETINGS" >> "$NOTIFY_LOG"
+
+            # Build human-readable meeting list (no LLM needed)
+            NOTIFY_MSG=$(echo "$NEW_MEETINGS" | while IFS='|' read -r agency body date; do
+                [ -z "$body" ] && continue
+                SHORT_DATE=$(python3 -c "
+parts='$date'.split('-')
+print(f'{int(parts[1])}/{int(parts[2])}')
+" 2>/dev/null)
+                echo "${body} ${SHORT_DATE}"
+            done | paste -sd', ' -)
+
+            if [ -n "$NOTIFY_MSG" ]; then
+                # Build detail line from the JSON records directly — no LLM call
+                DETAIL_MSG=$(echo "$NEW_MEETINGS" | python3 -c "
+import json, sys, glob, os
+from datetime import datetime
+
+# Parse target meetings
+targets = {}
+for line in sys.stdin:
+    parts = line.strip().split('|')
+    if len(parts) == 3:
+        targets[(parts[0], parts[1], parts[2])] = []
+
+# Find matching records from recently modified files
+for path in sorted(glob.glob('data/structured/*.json'), key=os.path.getmtime, reverse=True)[:100]:
+    try:
+        r = json.load(open(path))
+        agency = r.get('agency', '').strip()
+        body = r.get('body', '').strip()
+        import re
+        body = re.sub(r'\s*-\s*(Land Use|Closed Session|Special).*', '', body)
+        date = r.get('date', '').strip()
+        key = (agency, body, date)
+        if key in targets:
+            for h in r.get('housing_items', []):
+                desc = h.get('description', '')[:60]
+                if desc:
+                    targets[key].append(desc)
+            for v in r.get('votes', []):
+                item = v.get('item', '')[:60]
+                if item and ('hous' in item.lower() or 'zone' in item.lower() or 'density' in item.lower()):
+                    targets[key].append(item)
+    except:
+        pass
+
+# Format output
+parts_out = []
+for (agency, body, date), items in targets.items():
+    d = date.split('-')
+    short = f'{int(d[1])}/{int(d[2])}'
+    unique_items = list(dict.fromkeys(items))[:3]
+    if unique_items:
+        parts_out.append(f'{body} {short}: ' + ', '.join(unique_items))
+    else:
+        score = 'neutral'
+        # Check advocacy score
+        for path in sorted(glob.glob('data/structured/*.json'), key=os.path.getmtime, reverse=True)[:50]:
+            try:
+                r = json.load(open(path))
+                if r.get('agency','').strip() == agency and r.get('date','').strip() == date:
+                    score = r.get('advocacy_score', 'neutral')
+                    break
+            except: pass
+        parts_out.append(f'{body} {short} (scored {score}, zero housing items)')
+
+print('; '.join(parts_out)[:400])
+" 2>/dev/null) || true
+
+                if [ -z "$DETAIL_MSG" ]; then
+                    DETAIL_MSG="$NOTIFY_MSG"
+                fi
+
+                log "Notifying: $DETAIL_MSG"
+
+                # Discord webhook
+                if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
+                    curl -s -H "Content-Type: application/json" \
+                        -d "$(jq -n --arg msg "$DETAIL_MSG" '{content: $msg}')" \
+                        "$DISCORD_WEBHOOK_URL" >> data/pipeline-notify.log 2>&1 || true
+                fi
+
+                log "Notified: $DETAIL_MSG"
+            fi
+        fi
+    fi
+else
+    log "No new extractions."
+fi
+
+rm -f "$EXTRACT_TIMESTAMP"
+
+# ── S3 sync: structured data ──
+if [ -n "${S3_BUCKET:-}" ]; then
+    log "Syncing structured data to S3..."
+    sync_to_s3 "structured/records" "data/structured" "STANDARD" --exclude "meetings/*" --exclude "monthly/*" --exclude "*.jsonl" --exclude "*.log" --exclude "*.skip"
+    sync_to_s3 "structured/meetings" "data/structured/meetings" "STANDARD"
+    sync_to_s3 "structured/monthly" "data/structured/monthly" "STANDARD"
+    aws s3 cp data/structured/all-records.jsonl "s3://${S3_BUCKET}/structured/all-records.jsonl" --quiet 2>/dev/null || true
+    aws s3 cp data/structured/meetings-combined.jsonl "s3://${S3_BUCKET}/structured/meetings-combined.jsonl" --quiet 2>/dev/null || true
+    log "S3 sync (structured) done."
+fi
+
+# ═══════════════════════════════════════════
+# PHASE 5: EXECUTIVE (full mode only)
+# ═══════════════════════════════════════════
+
+# ═══════════════════════════════════════════
+# PHASE 5: DOCTOR — diagnose errors and self-heal
+# ═══════════════════════════════════════════
+
+log "Running pipeline doctor..."
+python pipeline_doctor.py >> data/pipeline-doctor-run.log 2>&1
+log "Doctor done."
+
+# ═══════════════════════════════════════════
+# PHASE 6: EXECUTIVE (full mode only)
 # ═══════════════════════════════════════════
 
 if [ "$MODE" = "full" ]; then

@@ -98,8 +98,16 @@ class RateLimitHit(Exception):
     pass
 
 
+class AuthError(Exception):
+    """Raised when claude -p fails authentication — no point retrying."""
+    pass
+
+
 def _call_claude(prompt, max_retries=2):
-    """Call claude -p with retries. Returns parsed JSON or None. Raises RateLimitHit."""
+    """Call claude -p with retries. Returns parsed JSON or None.
+
+    Raises RateLimitHit on session/rate limits and AuthError on 401/403.
+    """
     for attempt in range(max_retries + 1):
         try:
             result = subprocess.run(
@@ -108,9 +116,12 @@ def _call_claude(prompt, max_retries=2):
                 capture_output=True, text=True, timeout=300,
             )
 
-            combined = (result.stdout + result.stderr).lower()
-            if "session limit" in combined or "rate limit" in combined:
-                raise RateLimitHit(result.stdout.strip()[:200])
+            stderr_lower = result.stderr.lower()
+            if "session limit" in stderr_lower or "rate limit" in stderr_lower:
+                raise RateLimitHit(result.stderr.strip()[:200])
+
+            if "invalid authentication" in stderr_lower or "401" in stderr_lower or "403" in stderr_lower:
+                raise AuthError(result.stderr.strip()[:200] or result.stdout.strip()[:200])
 
             if result.returncode != 0:
                 if attempt < max_retries:
@@ -229,8 +240,7 @@ def extract_structured(text, meeting_meta):
 
     records = []
     for ci, chunk in enumerate(chunks):
-        chunk_label = f"[chunk {ci+1}/{len(chunks)}] " if len(chunks) > 1 else ""
-        prompt = EXTRACTION_PROMPT + meta_context + f"\n{chunk_label}(chars {ci*CHUNK_SIZE+1}-{min((ci+1)*CHUNK_SIZE, len(text))} of {len(text)})\n\n" + chunk
+        prompt = EXTRACTION_PROMPT + meta_context + "\n" + chunk
         record = _call_claude(prompt)
         if record:
             records.append(record)
@@ -375,8 +385,14 @@ def cmd_extract(args):
     success = 0
     failed = 0
     skipped = 0
+    consecutive_failures = 0
+    auth_failure_count = 0
+    MAX_CONSECUTIVE_FAILURES = 5
+    MAX_AUTH_RETRIES = 2
 
-    for i, (source_type, sf, out_path) in enumerate(to_process):
+    i = 0
+    while i < len(to_process):
+        source_type, sf, out_path = to_process[i]
         if stop_hour and datetime.now().hour >= stop_hour:
             remaining = len(to_process) - i
             print(f"\nStopping at {datetime.now().strftime('%H:%M')} ({remaining} remaining, will resume next run)")
@@ -397,6 +413,22 @@ def cmd_extract(args):
         meta = get_meeting_meta(sf)
         try:
             record = extract_structured(text, meta)
+        except AuthError as e:
+            auth_failure_count += 1
+
+            if auth_failure_count <= MAX_AUTH_RETRIES:
+                wait = 60 * auth_failure_count
+                print(f"\n  Auth error ({auth_failure_count}/{MAX_AUTH_RETRIES}): {str(e)[:100]}")
+                print(f"  Waiting {wait}s then retrying...", flush=True)
+                time.sleep(wait)
+                continue  # retry same file (i not incremented)
+
+            remaining = len(to_process) - i
+            print(f"\n  Auth error (persistent): {str(e)[:100]}")
+            print(f"  Stopping — authentication broken after {auth_failure_count} attempts.")
+            print(f"  Run `claude /login` to re-authenticate, then re-run extraction.")
+            print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
+            break
         except RateLimitHit as e:
             remaining = len(to_process) - i
             msg = str(e).lower()
@@ -437,12 +469,23 @@ def cmd_extract(args):
 
             out_path.write_text(json.dumps(record, indent=2, default=str))
             success += 1
+            consecutive_failures = 0
             print(f"  OK ({record.get('advocacy_score', '?')}, {len(text)} chars)")
         else:
             failed += 1
+            consecutive_failures += 1
             print(f"  FAILED")
 
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                remaining = len(to_process) - i - 1
+                print(f"\n  Circuit breaker: {MAX_CONSECUTIVE_FAILURES} consecutive failures.")
+                print(f"  Stopping — something is broken (auth, network, CLI).")
+                print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
+                break
+
+        auth_failure_count = 0  # reset on any successful claude call
         time.sleep(1)
+        i += 1
 
     print(f"\nDone. {success} extracted, {failed} failed, {skipped} permanently skipped.")
 
