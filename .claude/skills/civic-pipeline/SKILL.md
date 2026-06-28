@@ -113,11 +113,29 @@ civic-pipeline (bash wrapper, cron entry point)
 ├── nctd.py fetch → gonctd.com → data/nctd/documents/
 ├── intel_feed.py → data/intel/
 ├── update_skill_intel.py → .claude/skills/ca-housing-law/recent-developments.md
+├── oceanside.py permits → data/permits/ (incremental eTRAKiT scrape)
 ├── discover_videos.py → data/transcribe-batch.json
 ├── transcribe.py | transcribe_local.py → data/transcripts/
 ├── extract_structured.py → data/structured/*.json (newest first, stops at cutoff)
 ├── meeting_merge.py → meetings-combined.jsonl
-└── monthly_rollup.py → monthly-digests.jsonl
+├── monthly_rollup.py → monthly-digests.jsonl
+└── pipeline_doctor.py → data/pipeline-doctor.jsonl (post-run diagnostics)
+```
+
+## Pipeline Doctor
+
+`pipeline_doctor.py` runs after extraction each night. It:
+- Parses extraction + pipeline logs for errors
+- Identifies files that repeatedly block extraction (chunked auth failures)
+- Skips oversized non-meeting files automatically
+- Checks `claude -p` auth health
+- Tracks its own fixes and evaluates if they worked on the next run
+- Logs diagnosis history to `data/pipeline-doctor.jsonl`
+
+```bash
+python pipeline_doctor.py              # diagnose + fix
+python pipeline_doctor.py --dry-run    # diagnose only
+python pipeline_doctor.py --history    # show diagnosis history
 ```
 
 Executive summaries and council profiles run on-demand, not in the nightly pipeline.

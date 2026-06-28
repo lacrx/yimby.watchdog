@@ -149,7 +149,7 @@ def split_audio(audio_path, max_size=WHISPER_MAX_FILE_SIZE):
         print(f"  Cannot determine duration for splitting")
         return [audio_path]
 
-    chunk_duration = int(duration * (max_size / file_size) * 0.9)  # 10% safety margin
+    chunk_duration = int(duration * (max_size / file_size) * 0.8)  # 20% safety margin
     chunks = []
     offset = 0
     idx = 0

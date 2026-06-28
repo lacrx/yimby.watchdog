@@ -44,9 +44,9 @@ run.bold = True
 
 doc.add_paragraph(
     'That application — DB26-00001, a 142-unit multifamily project at 1640 Oceanside '
-    'Boulevard — was filed under AB 2011 (the Affordable Housing and High Road Jobs Act), '
-    'a state law that converts the approval to a ministerial process. The developer used '
-    'state law to bypass city discretionary review entirely. Without AB 2011, the count '
+    'Boulevard — was filed as a Density Bonus Application under state law. The project '
+    'includes a minimum of 21 affordable units (15% inclusionary requirement per '
+    'Oceanside\'s December 2023 ordinance). Without this state-law filing, the count '
     'would be zero.'
 )
 
@@ -103,27 +103,29 @@ doc.add_paragraph(
     'police training facility, a medical office, and two Walmart expansions.'
 )
 
-# ─── Section 3: 2025 vs 2026 Full Comparison ───
-doc.add_heading('2025 vs. 2026: Discretionary and Ministerial', level=2)
+# ─── Section 3: Full Housing Filings History ───
+doc.add_heading('Citywide Housing Filings: Nine-Year Trend (2018–2026)', level=2)
 
 doc.add_paragraph(
-    'The city\'s eTRAKiT system has two search portals: a project search for discretionary '
-    'applications and a permit search for ministerial building permits. The following table '
-    'combines both to show total housing activity.'
+    'The following table shows all housing units filed with the city, by year and type. '
+    '2018–2025 data is from HCD Annual Progress Report Table A (the same source as the '
+    'D-District chart above). 2026 is reconstructed from eTRAKiT, excluding units already '
+    'counted in prior years\' filings (Olive Park, North River Farms tract lots).'
 )
 
-table2 = doc.add_table(rows=9, cols=3, style='Light Shading Accent 1')
+table2 = doc.add_table(rows=11, cols=6, style='Light Shading Accent 1')
 table2.alignment = WD_TABLE_ALIGNMENT.CENTER
-headers2 = ['', '2025\n(full year)', '2026\n(Jan–Jun)']
+headers2 = ['Year', 'ADU', 'SFD/\nSFA', '2–4\nUnit', '5+\nUnit', 'Total']
 data2 = [
-    ['DISCRETIONARY (project search)', '', ''],
-    ['  Housing applications', '18', '1'],
-    ['', '', ''],
-    ['MINISTERIAL (building permits)', '', ''],
-    ['  ADUs', '156 units', '66 units'],
-    ['  Single Family', '285 units', '60 units'],
-    ['  Duplex', '46 units', '2 units'],
-    ['  Multi Family + Mid/High Rise', '243 units (est.)', '205 units (est.)'],
+    ['2018', '34', '347', '100', '78', '559'],
+    ['2019', '31', '227', '22', '810', '1,090'],
+    ['2020', '42', '52', '22', '283', '399'],
+    ['2021', '146', '245', '57', '1,250', '1,698'],
+    ['2022', '187', '200', '36', '2,774', '3,197'],
+    ['2023', '149', '36', '12', '1,765', '1,962'],
+    ['2024', '197', '292', '17', '1,515', '2,021'],
+    ['2025', '147', '409', '9', '1,389', '1,954'],
+    ['2026 (Jan–Jun)', '67', '4', '6', '142', '219'],
 ]
 for i, h in enumerate(headers2):
     cell = table2.rows[0].cells[i]
@@ -131,30 +133,67 @@ for i, h in enumerate(headers2):
     for p in cell.paragraphs:
         for r in p.runs:
             r.bold = True
+            r.font.size = Pt(9)
 for ri, row_data in enumerate(data2):
     for ci, val in enumerate(row_data):
         cell = table2.rows[ri + 1].cells[ci]
         cell.text = val
-        if row_data[0].startswith('DISC') or row_data[0].startswith('MINI'):
+        for p in cell.paragraphs:
+            for r in p.runs:
+                r.font.size = Pt(9)
+        if ri == 8:
             for p in cell.paragraphs:
                 for r in p.runs:
                     r.bold = True
-                    r.font.size = Pt(10)
+                    r.font.color.rgb = RGBColor(0x8B, 0x00, 0x00)
+# Totals row
+totals = ['TOTAL', '1,000', '1,812', '281', '10,006', '13,099']
+for ci, val in enumerate(totals):
+    cell = table2.rows[10].cells[ci]
+    cell.text = val
+    for p in cell.paragraphs:
+        for r in p.runs:
+            r.bold = True
+            r.font.size = Pt(9)
 
 doc.add_paragraph()
 
 doc.add_paragraph(
-    'Notes on the 2026 ministerial numbers:'
+    'Key patterns:'
+)
+
+patterns = [
+    '5+ unit projects dominate total production — averaging 1,358 units/year from '
+    '2021–2025. In the first half of 2026, only 142 units were filed in this category, '
+    'and that single project (DB26-00001) used AB 2011 to bypass city review.',
+    'The 2022 peak (2,774 units in 5+ projects) followed the November 2021 removal of '
+    'the downtown 43 du/acre cap. The October 2023 reimposition of a cap at 86 du/acre '
+    'preceded the decline from 2,774 to 1,765 to 1,515 to 1,389.',
+    'ADUs remained steady at ~150/year — the one type unaffected by local discretionary '
+    'barriers.',
+    'SFD/SFA spiked in 2025 (409 units) due to North River Farms tract lots — a '
+    'pre-entitled subdivision, not new development capacity.',
+    '2026 annualized (~478 units) would be the lowest production year since the city '
+    'began reporting to HCD, below even the 2020 COVID year (399).',
+]
+for pat in patterns:
+    doc.add_paragraph(pat, style='List Bullet')
+
+doc.add_paragraph()
+
+doc.add_paragraph(
+    'Notes on 2026 data:'
 )
 
 notes = [
-    '57 of 60 single-family permits are North River Farms tract lots — a pre-entitled '
-    'subdivision, not new development capacity.',
-    '199 of 205 multi-family/mid-rise units are Olive Park Affordable Apartments '
-    '(DB24-00001, approved 2024) — a single 100% affordable project pulling '
-    'construction permits from a prior-year approval.',
-    'Of the 66 ADUs, only 1 has been issued. 26 were returned for correction and 23 are '
-    'still in "received" status.',
+    '2026 HCD APR data will not be available until mid-2027. The 2026 figures are '
+    'reconstructed from eTRAKiT permit and project searches.',
+    'Olive Park Affordable (199 units) and North River Farms SFDs (57 lots) were excluded '
+    'from 2026 because they were already counted as filings in prior years\' HCD data '
+    '(DB24-00001 and the NRF subdivision, respectively).',
+    'The only 5+ unit filing in 2026 is DB26-00001 (142 units at 1640 Oceanside Blvd), '
+    'a Density Bonus Application with a minimum of 21 affordable units (15% inclusionary). '
+    'Without this state-law filing, the 5+ unit count would be zero.',
 ]
 for n in notes:
     doc.add_paragraph(n, style='List Bullet')
@@ -163,29 +202,15 @@ for n in notes:
 doc.add_heading('Total Housing Production: The Collapse in Context', level=2)
 
 doc.add_paragraph(
-    'Excluding pre-entitled projects (North River Farms tract lots and Olive Park pulling '
-    'from a 2024 approval), the city\'s organic 2026 housing production is:'
+    'The nine-year filing record reveals the full trajectory:'
 )
 
-p = doc.add_paragraph()
-run = p.add_run('66 ADUs + 3 SFDs + 1 duplex + 6 multi-family units = 78 units in 5.5 months')
-run.bold = True
-run.font.size = Pt(12)
-
-doc.add_paragraph()
-
-doc.add_paragraph(
-    'Annualized, that is approximately 170 units per year — in a city that averaged '
-    '2,290 units per year from 2022 to 2025.'
-)
-
-table3 = doc.add_table(rows=4, cols=3, style='Light Shading Accent 1')
+table3 = doc.add_table(rows=3, cols=5, style='Light Shading Accent 1')
 table3.alignment = WD_TABLE_ALIGNMENT.CENTER
-headers3 = ['Metric', '2025', '2026 (annualized)']
+headers3 = ['', '2021–2022\n(avg)', '2023–2025\n(avg)', '2026*\n(annualized)', 'Change']
 data3 = [
-    ['Discretionary housing apps', '18', '~2'],
-    ['Ministerial housing units', '~730', '~170 (organic)'],
-    ['Total', '~1,700 (incl. APR)', '~370 (est.)'],
+    ['Total units filed', '2,448', '1,979', '~478', '-80%'],
+    ['5+ unit projects', '2,012', '1,556', '~310', '-85%'],
 ]
 for i, h in enumerate(headers3):
     cell = table3.rows[0].cells[i]
@@ -193,21 +218,44 @@ for i, h in enumerate(headers3):
     for p in cell.paragraphs:
         for r in p.runs:
             r.bold = True
+            r.font.size = Pt(9)
 for ri, row_data in enumerate(data3):
     for ci, val in enumerate(row_data):
         cell = table3.rows[ri + 1].cells[ci]
         cell.text = val
-        if ri == 2:
+        for p in cell.paragraphs:
+            for r in p.runs:
+                r.font.size = Pt(9)
+        if ci == 4:
             for p in cell.paragraphs:
                 for r in p.runs:
                     r.bold = True
+                    r.font.color.rgb = RGBColor(0x8B, 0x00, 0x00)
+
+doc.add_paragraph(
+    '* 2026 is Jan–Jun, annualized. 2026 data from eTRAKiT, deduped against prior-year '
+    'HCD filings.',
+    style='List Bullet'
+)
 
 doc.add_paragraph()
 
 p = doc.add_paragraph()
 run = p.add_run(
-    'The RHNA target requires roughly 890 units per year. At the current organic pace, '
-    'Oceanside will produce less than 20% of its annual obligation.'
+    'At 219 units filed in 5.5 months (annualized ~478), 2026 would be the lowest '
+    'filing year since Oceanside began reporting to HCD — below even the 2020 COVID '
+    'year (399 units). And the only 5+ unit project filed used state law to bypass '
+    'local review entirely.'
+)
+run.bold = True
+
+doc.add_paragraph()
+
+p = doc.add_paragraph()
+run = p.add_run(
+    'The RHNA target requires roughly 890 new units per year. At the current filing '
+    'pace, Oceanside will produce less than half its annual obligation, accumulating '
+    'a deficit that makes the 2029 deadline unreachable.'
 )
 run.bold = True
 
@@ -282,10 +330,12 @@ doc.add_paragraph(
 )
 
 doc.add_paragraph(
-    'This is possible because the developer filed under AB 2011, which provides a '
-    'ministerial (by-right) approval pathway for housing projects on commercially zoned '
-    'land that meet affordability and labor requirements. The project does not require '
-    'City Council approval, Planning Commission review, or CEQA analysis.'
+    'The project is filed as a Density Bonus Application (eTRAKiT type "DB"), invoking '
+    'state density bonus law (Government Code §65915). Under Oceanside\'s inclusionary '
+    'housing ordinance (Chapter 14C, updated December 2023 to 15%), the project must '
+    'include a minimum of 21 deed-restricted affordable units at lower income levels '
+    '(≤80% AMI). The actual affordable count may be higher if the developer offered '
+    'additional affordable units in exchange for density bonus concessions.'
 )
 
 p = doc.add_paragraph()
@@ -307,9 +357,12 @@ verification = [
     'Discretionary projects: City of Oceanside eTRAKiT permit portal, project search '
     '(D-, DB-, RD-prefix applications). All projects for 2018–2026 were individually '
     'verified by direct URL query.',
-    'Building permits: City of Oceanside eTRAKiT permit portal, permit search '
-    '(BLDG-prefix permits). All 2,577 permits for 2025 and all 998 permits for 2026 '
-    'were individually scraped and categorized by permit type.',
+    'Citywide housing filings (2018–2025): HCD Annual Progress Report Table A, '
+    'APP_SUBMIT_DT field — same source and methodology as the D-District analysis.',
+    '2026 citywide filings: Reconstructed from eTRAKiT discretionary project search '
+    '(D/DB/RD-prefix) and building permit search (BLDG-prefix, 20,702 permits scraped '
+    '2020–2026). Deduped against prior-year HCD filings to avoid double-counting '
+    'Olive Park (DB24-00001) and North River Farms tract lots.',
     'HCD Annual Progress Report: Table A data from data.ca.gov, filtered to '
     'JURIS_NAME=OCEANSIDE, covering 2018–2025. 2026 APR data will not be available '
     'until mid-2027.',
@@ -326,9 +379,9 @@ for v in verification:
 doc.add_heading('Implications', level=2)
 
 implications = [
-    'RHNA compliance: At the current organic production rate (~170 units/year), Oceanside '
-    'will produce less than 20% of its annual RHNA obligation, accumulating a deficit that '
-    'makes the 2029 deadline unreachable.',
+    'RHNA compliance: At the current filing rate (~478 units/year annualized, of which '
+    'only 21 are affordable), Oceanside will produce barely half its annual RHNA obligation '
+    'of ~890 units — accumulating a deficit that makes the 2029 deadline unreachable.',
     'Builder\'s Remedy exposure: If the city fails to maintain adequate housing element '
     'progress, it risks losing its certified housing element status, triggering Builder\'s '
     'Remedy (Government Code 65589.5(d)), which allows developers to bypass local zoning '
