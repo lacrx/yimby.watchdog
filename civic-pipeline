@@ -376,10 +376,6 @@ if [ -n "${S3_BUCKET:-}" ]; then
 fi
 
 # ═══════════════════════════════════════════
-# PHASE 5: EXECUTIVE (full mode only)
-# ═══════════════════════════════════════════
-
-# ═══════════════════════════════════════════
 # PHASE 5: DOCTOR — diagnose errors and self-heal
 # ═══════════════════════════════════════════
 
@@ -388,15 +384,18 @@ python pipeline_doctor.py >> data/pipeline-doctor-run.log 2>&1
 log "Doctor done."
 
 # ═══════════════════════════════════════════
-# PHASE 6: EXECUTIVE (full mode only)
+# PHASE 6: EXECUTIVE — summaries and leadership profiles
 # ═══════════════════════════════════════════
+# Runs in all modes. Change detection skips unchanged profiles.
+# Full mode uses API (Opus); hybrid/local uses claude -p (subscription).
 
-if [ "$MODE" = "full" ]; then
-    log "Running executive summaries (API, Opus)..."
-    python executive_summaries.py --mode api >> data/pipeline.log 2>&1
-    log "Running council member profiles (API, Opus)..."
-    python council_member_summaries.py --mode api >> data/pipeline.log 2>&1
-    log "Executive pipeline done."
-fi
+EXEC_MODE="$SUMMARIZER"
+log "Running executive summaries (mode: $EXEC_MODE)..."
+python executive_summaries.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
+log "Executive summaries done."
+
+log "Running leadership profiles (mode: $EXEC_MODE)..."
+python leadership_profiles.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
+log "Leadership profiles done."
 
 log "Pipeline complete."
