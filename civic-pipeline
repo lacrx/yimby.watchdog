@@ -6,8 +6,8 @@
 #   civic-pipeline local   — claude -p (subscription) + faster-whisper. Zero API cost.
 #
 # Pipeline order: GATHER everything, THEN process.
-#   Gather: fetch docs → discover videos → transcribe audio
-#   Process: extract JSONL (docs + transcripts) → monthly rollup → prose summaries
+#   Gather: fetch docs (5 agencies) → fetch permits → intel feeds → discover videos
+#   Process: merge meetings → monthly rollup (meetings + permits + intel) → extract JSONL
 #
 # Options:
 #   --deep              Download staff reports (not just agendas/minutes)
@@ -62,7 +62,7 @@ log() {
 
 case "$MODE" in
     full|hybrid|local) ;;
-    *) echo "Usage: civic-pipeline <full|hybrid|local> [--deep] [--force] [--years N] [--transcribe]"
+    *) echo "Usage: civic-pipeline <full|hybrid|local> [--deep] [--force] [--years N] [--transcribe] [--extract-until H]"
        echo ""
        echo "Modes:"
        echo "  full    — Claude API + Whisper API (bulk, ~\$44/full-run)"

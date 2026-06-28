@@ -9,8 +9,8 @@ A single meeting may have sources arriving across multiple days:
   - Transcript (video posted days after, transcribed on next cron run)
 
 This script merges all JSONL records sharing a meeting_id into one
-consolidated record per meeting. Also tracks source counts to detect
-when new sources arrive and flag meetings needing prose re-summarization.
+consolidated record per meeting, using majority-vote for date and agency
+selection. Tracks source counts to detect when new sources arrive.
 
 Usage:
     python meeting_merge.py                # merge new/changed meetings
@@ -226,7 +226,7 @@ def cmd_merge(args):
     gained = [mid for mid in to_merge if state.get(mid, {}).get("source_count", 0) > 1
               and mid in by_meeting and len(by_meeting[mid]) > state.get(mid, {}).get("prev_count", 0)]
     if gained:
-        print(f"\n{len(gained)} meetings gained new sources — prose summaries may need regeneration")
+        print(f"\n{len(gained)} meetings gained new sources since last merge")
 
 
 def cmd_check(args):
