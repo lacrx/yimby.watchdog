@@ -5,33 +5,44 @@ description: Use when running or configuring the civic monitoring pipeline, adju
 
 # Civic Pipeline — Nightly Meeting Monitor
 
-Automated ingestion of Oceanside City Council, Planning Commission, and NCTD Board meetings. Runs nightly 1:00-3:00 AM via cron.
+Automated ingestion of Oceanside, NCTD, SANDAG, SD County BOS, and CA Coastal Commission meetings, plus building permits and intel feeds. Runs nightly 1:00-4:00 AM via cron, with an evening catch at 6 PM Tue-Fri.
 
 ## Nightly Flow
 
 ```
 1:00 AM  Phase 1 — GATHER
-         ├── Fetch new meetings from Legistar (Oceanside + NCTD)
-         ├── Check intel feeds (40+ RSS/web sources)
+         ├── Fetch meetings from Legistar (Oceanside, NCTD, SD County)
+         ├── Fetch meetings from Granicus (SANDAG)
+         ├── Fetch meetings from state API (Coastal Commission)
+         ├── Fetch building permits from eTRAKiT (current year, incremental)
+         ├── Check intel feeds (17+ RSS/web sources)
          ├── Discover new meeting videos
-         └── Transcribe audio (if enabled)
+         ├── Transcribe audio (if enabled)
+         └── Sync raw sources to S3
 
          Phase 2 — MERGE & ROLL UP (no LLM, fast)
          ├── Merge document records into per-meeting records
-         └── Rebuild monthly digests
+         └── Rebuild stale monthly digests (content-hash detection)
 
-         Phase 3 — EXTRACT (remaining time until cutoff)
-         ├── Structured extraction via claude -p
+         Phase 3 — EXTRACT (remaining time until 4 AM)
+         ├── Structured extraction via claude -p (subscription only)
          ├── Newest documents first
-         └── Hard cutoff at 3:00 AM
+         └── Hard cutoff at 4:00 AM
 
-3:00 AM  Done.
+4:00 AM  Sync structured data to S3. Pipeline doctor runs diagnostics.
+
+6:00 PM  Evening catch (Tue-Fri) — refetch + extract, no time limit.
+         Matches when cities typically post agendas.
 ```
 
 ## Cron
 
 ```bash
-0 1 * * * cd ~/repos/civics && ./civic-pipeline local --deep >> data/pipeline-cron.log 2>&1
+# Nightly: fetch current year + extract until 4 AM
+0 1 * * * cd ~/repos/civics && ./civic-pipeline local --deep --years 1 --extract-until 4 >> data/pipeline-cron.log 2>&1
+
+# Evening catch: Tue-Fri, no extraction time limit
+0 18 * * 2-5 cd ~/repos/civics && ./civic-pipeline local --deep >> data/pipeline-cron.log 2>&1
 ```
 
 ## Modes
@@ -41,6 +52,8 @@ Automated ingestion of Oceanside City Council, Planning Commission, and NCTD Boa
 | **local** | `claude -p` (subscription) | faster-whisper | $0 | Nightly cron (default) |
 | **hybrid** | `claude -p` (subscription) | Whisper API | ~$0.90/meeting | Better transcription |
 | **full** | Claude API (Opus) | Whisper API | ~$44/full-run | Bulk reprocessing + exec summaries via API |
+
+**IMPORTANT:** Pipeline always uses subscription (`claude -p`), never the API key. All `claude -p` subprocess calls strip `ANTHROPIC_API_KEY` from the environment to prevent accidental API credit burn.
 
 ## Data Flow
 
@@ -52,15 +65,17 @@ Per-document .json
         │
         ├──► all-records.jsonl (flat concat)
         │
-        ▼  meeting_merge.py
+        ▼  meeting_merge.py (majority-vote date/agency selection)
 meetings-combined.jsonl
         │
-        ▼  monthly_rollup.py (no LLM, pure data)
-monthly-digests.jsonl (340K vs 2.5M per-record — 7x smaller)
+        ▼  monthly_rollup.py (no LLM — merges meetings + permits + intel)
+monthly-digests.jsonl
         │
         ├──► executive_summaries.py (reads monthly digests)
         └──► council_member_summaries.py (reads per-record for full attribution)
 ```
+
+Monthly digests are independent — each month has a content hash computed from all its inputs (meetings, permits, intel). A month only rebuilds when its hash changes.
 
 ## Structured JSONL Fields
 
@@ -73,6 +88,11 @@ Each source document becomes a JSON record with:
 - `council_positions[]` — member, stance, evidence
 - `advocacy_score` — green/yellow/red/neutral
 
+Monthly digests add:
+
+- `permits` — total, estimated_units, by_type, by_status (SFD/duplex, multifamily, ADU only)
+- `intel[]` — source, title, url, relevance_score
+
 ## Quick Reference
 
 ```bash
@@ -82,8 +102,17 @@ Each source document becomes a JSON record with:
 # Check extraction progress
 python extract_structured.py --stats
 
-# Rebuild monthly digests
+# Check which months need rebuild
+python monthly_rollup.py --check
+
+# Rebuild monthly digests (only stale months)
+python monthly_rollup.py
+
+# Force rebuild all months
 python monthly_rollup.py --force
+
+# Monthly stats table
+python monthly_rollup.py --stats
 
 # Generate executive summaries (reads monthly digests, default)
 python executive_summaries.py
@@ -104,23 +133,33 @@ jq 'select(.council_positions[].member == "Joyce")' data/structured/all-records.
 | `--force` | Re-process already-extracted documents |
 | `--years N` | Fetch N years back (default: 1) |
 | `--transcribe` | Also run video transcription pipeline |
+| `--extract-until H` | Stop extraction at hour H (0-23) |
 
 ## Architecture
 
 ```
 civic-pipeline (bash wrapper, cron entry point)
 ├── oceanside.py fetch → Legistar → data/documents/
-├── nctd.py fetch → gonctd.com → data/nctd/documents/
+├── nctd.py fetch → Legistar → data/nctd/documents/
+├── sandag.py fetch → Granicus → data/sandag/
+├── sdcounty.py fetch → Legistar OData → data/sdcounty/
+├── coastal.py fetch → state API → data/coastal/
 ├── intel_feed.py → data/intel/
 ├── update_skill_intel.py → .claude/skills/ca-housing-law/recent-developments.md
 ├── oceanside.py permits → data/permits/ (incremental eTRAKiT scrape)
 ├── discover_videos.py → data/transcribe-batch.json
 ├── transcribe.py | transcribe_local.py → data/transcripts/
-├── extract_structured.py → data/structured/*.json (newest first, stops at cutoff)
+├── S3 sync (raw sources) → s3://civics-monitor-*/
 ├── meeting_merge.py → meetings-combined.jsonl
-├── monthly_rollup.py → monthly-digests.jsonl
+├── monthly_rollup.py → monthly-digests.jsonl (meetings + permits + intel)
+├── extract_structured.py → data/structured/*.json (newest first, stops at cutoff)
+├── S3 sync (structured) → s3://civics-monitor-*/
 └── pipeline_doctor.py → data/pipeline-doctor.jsonl (post-run diagnostics)
 ```
+
+## S3 Backup
+
+Raw sources and structured data sync to S3 each run. PDFs are archived there — local only keeps `.txt` files. Set `S3_BUCKET` in `.env` to enable; pipeline runs fine without it.
 
 ## Pipeline Doctor
 
@@ -128,7 +167,9 @@ civic-pipeline (bash wrapper, cron entry point)
 - Parses extraction + pipeline logs for errors
 - Identifies files that repeatedly block extraction (chunked auth failures)
 - Skips oversized non-meeting files automatically
-- Checks `claude -p` auth health
+- Checks `claude -p` auth health (with API key stripped)
+- Detects permit fetch errors (eTRAKiT connection failures)
+- Detects regional scraper errors (Legistar 404s, Granicus timeouts)
 - Tracks its own fixes and evaluates if they worked on the next run
 - Logs diagnosis history to `data/pipeline-doctor.jsonl`
 
