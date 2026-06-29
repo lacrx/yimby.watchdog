@@ -26,23 +26,21 @@ The output is structured data and analysis that turns years of meeting records i
 ## Data Flow
 
 ```
-Legistar API ──────────────────────────────┐
-  oceanside.py (Oceanside)                 │
-  nctd.py (NCTD)                           │
-  sdcounty.py (SD County BOS)              │
-SANDAG Granicus API                        │
-  sandag.py                                │
-Coastal Commission State API               │
-  coastal.py                               │
+scrapers/
+  Legistar API ────────────────────────────┐
+    oceanside.py (Oceanside)               │
+    nctd.py (NCTD)                         │
+    sdcounty.py (SD County BOS)            │
+  SANDAG Granicus API                      │
+    sandag.py                              │
+  Coastal Commission State API             │
+    coastal.py                             │
                                            ▼
-YouTube/KOCT ──► transcribe.py ──► data/transcripts/*.txt
-                                           │
-eTRAKiT ──► oceanside.py permits ──► data/permits/*.jsonl
-                                           │
-RSS/Web ──► intel_feed.py ──► data/intel/*.json
-                                           │
-                    ┌──────────────────────┘
-                    ▼
+  YouTube/KOCT ──► discover_videos.py      data/documents/*.txt
+  eTRAKiT ──► oceanside.py permits ──► data/permits/*.jsonl
+  RSS/Web ──► intel_feed.py ──► data/intel/*.json
+
+transforms/
          data/documents/*.txt  (pdftotext output)
                     │
                     ▼
@@ -65,11 +63,13 @@ RSS/Web ──► intel_feed.py ──► data/intel/*.json
                                            │
                                            ▼
                                   data/structured/monthly/*.json
+
+analysis/
                                            │
                                    ┌───────┴──────────┐
                                    ▼                  ▼
-                            executive_          council_member_
-                            summaries.py        summaries.py
+                            executive_          leadership_
+                            summaries.py        profiles.py
                                    │                  │
                                    ▼                  ▼
                              yearly executive   per-member profiles
@@ -167,14 +167,14 @@ Per-document records merge into per-meeting records (majority-vote date/agency s
 
 ```bash
 # Check extraction progress
-python extract_structured.py --stats
+python transforms/extract_structured.py --stats
 
 # Query with jq
 jq 'select(.advocacy_score == "red")' data/structured/all-records.jsonl
 jq 'select(.council_positions[].member == "Joyce")' data/structured/all-records.jsonl
 
 # Check which months need rebuild
-python monthly_rollup.py --check
+python transforms/monthly_rollup.py --check
 ```
 
 ## What's Monitored
@@ -198,26 +198,24 @@ The stack works for any California city with a Legistar portal (most cities use 
 
 ### What to change
 
-1. **Add a scraper for your city.** Copy `oceanside.py` and change the Legistar base URL and body names. The scraper pattern (fetch calendar → parse meetings → download PDFs → extract text) works for any Legistar instance.
+1. **Add a scraper for your city.** Copy `scrapers/oceanside.py` and change the Legistar base URL and body names. The scraper pattern (fetch calendar → parse meetings → download PDFs → extract text) works for any Legistar instance.
 
-2. **Add your regional agencies.** Copy `sandag.py` (Granicus API) or `sdcounty.py` (Legistar OData) depending on what your regional agencies use. Wire them into `civic-pipeline`.
+2. **Add your regional agencies.** Copy `scrapers/sandag.py` (Granicus API) or `scrapers/sdcounty.py` (Legistar OData) depending on what your regional agencies use. Wire them into `civic-pipeline`.
 
-3. **Update the intel feed.** `intel_feed.py` monitors feeds relevant to Oceanside/San Diego. Replace local sources with your city's regional journalism and advocacy orgs. Keep statewide sources (HCD, CalHDF, YIMBY Law, AG, CalMatters).
+3. **Update the intel feed.** `scrapers/intel_feed.py` monitors feeds relevant to Oceanside/San Diego. Replace local sources with your city's regional journalism and advocacy orgs. Keep statewide sources (HCD, CalHDF, YIMBY Law, AG, CalMatters).
 
-4. **Point permits at your city.** `oceanside.py permits` scrapes eTRAKiT. If your city uses a different permit portal, write a scraper that outputs the same JSONL format (`permit_no`, `type`, `status`, `applied`, `address`, `description`).
+4. **Point permits at your city.** `scrapers/oceanside.py permits` scrapes eTRAKiT. If your city uses a different permit portal, write a scraper that outputs the same JSONL format (`permit_no`, `type`, `status`, `applied`, `address`, `description`).
 
 5. **Set up S3 (optional).** Set `S3_BUCKET` in `.env`. The pipeline syncs automatically — raw sources, structured records, monthly digests. Without it, everything stays local.
 
 ### What you keep as-is
 
-- `extract_structured.py` — structured extraction prompt is jurisdiction-agnostic
-- `meeting_merge.py` — merges by meeting_id, no city-specific logic
-- `monthly_rollup.py` — rolls up meetings + permits + intel by month
-- `executive_summaries.py` — reads monthly digests, no city-specific logic
-- `council_member_summaries.py` — reads per-record data, no city-specific logic
-- `.claude/skills/ca-housing-law/` — California housing law reference (statewide)
-- `.claude/skills/policy-analysis/` — policy analysis framework (jurisdiction-agnostic)
-- `legal-reference/` — 21-file CA housing law library
+- `transforms/extract_structured.py` — structured extraction prompt is jurisdiction-agnostic
+- `transforms/meeting_merge.py` — merges by meeting_id, no city-specific logic
+- `transforms/monthly_rollup.py` — rolls up meetings + permits + intel by month
+- `analysis/executive_summaries.py` — reads monthly digests, no city-specific logic
+- `analysis/leadership_profiles.py` — reads per-record data, no city-specific logic
+- Policy knowledge base — CA housing law, fiscal analysis, crash data methodology (separate repo: `lacrx/policy-knowledge-docs`)
 
 ### What you need
 
@@ -243,22 +241,22 @@ cp .env.example .env
 # Edit .env — set S3_BUCKET if using AWS, otherwise leave empty
 
 # 3. Fetch meetings (current year, with staff reports)
-python oceanside.py fetch --deep
+python scrapers/oceanside.py fetch --deep
 
 # 4. Extract structured records (runs claude -p per document)
-python extract_structured.py
+python transforms/extract_structured.py
 
 # 5. Merge into per-meeting records
-python meeting_merge.py
+python transforms/meeting_merge.py
 
 # 6. Build monthly digests (meetings + permits + intel)
-python monthly_rollup.py
+python transforms/monthly_rollup.py
 
 # 7. Generate executive summaries
-python executive_summaries.py
+python analysis/executive_summaries.py
 
-# 8. Generate council member profiles
-python council_member_summaries.py
+# 8. Generate leadership profiles
+python analysis/leadership_profiles.py
 
 # 9. Set up nightly cron
 crontab -e
@@ -272,43 +270,37 @@ The initial extraction takes time — `extract_structured.py` calls `claude -p` 
 ```
 civics/
 ├── civic-pipeline              # Bash orchestrator (cron entry point)
-├── oceanside.py                # Oceanside Legistar scraper + eTRAKiT permits
-├── nctd.py                     # NCTD Legistar scraper
-├── sandag.py                   # SANDAG Granicus scraper
-├── sdcounty.py                 # SD County BOS Legistar OData scraper
-├── coastal.py                  # CA Coastal Commission API scraper
-├── transcribe.py               # Whisper API transcription
-├── transcribe_local.py         # Local Whisper transcription
-├── discover_videos.py          # YouTube video matching
-├── extract_structured.py       # LLM → structured JSONL (claude -p)
-├── meeting_merge.py            # Document → meeting merge (majority-vote)
-├── monthly_rollup.py           # Monthly digest rollup (meetings + permits + intel)
-├── executive_summaries.py      # Yearly summaries (reads monthly digests)
-├── council_member_summaries.py # Per-member profiles (reads per-record)
-├── intel_feed.py               # External source monitor (17+ feeds)
-├── update_skill_intel.py       # Intel → skill supplement
+├── civic_utils.py              # Shared utilities (PDF download, text extraction, LLM calls)
 ├── pipeline_doctor.py          # Self-healing pipeline diagnostics
-├── civic_utils.py              # Shared utilities
+├── backfill-permits.sh         # One-time historical permit backfill
+├── scrapers/                   # Phase 1: agency fetchers
+│   ├── oceanside.py            # Oceanside Legistar scraper + eTRAKiT permits
+│   ├── nctd.py                 # NCTD Legistar scraper
+│   ├── sandag.py               # SANDAG Granicus scraper
+│   ├── sdcounty.py             # SD County BOS Legistar OData scraper
+│   ├── coastal.py              # CA Coastal Commission API scraper
+│   ├── intel_feed.py           # External source monitor (17+ feeds)
+│   └── discover_videos.py      # YouTube video matching
+├── transforms/                 # Phase 2-3: merge, rollup, extract, transcribe
+│   ├── extract_structured.py   # LLM → structured JSONL (claude -p)
+│   ├── meeting_merge.py        # Document → meeting merge (majority-vote)
+│   ├── monthly_rollup.py       # Monthly digest rollup (meetings + permits + intel)
+│   ├── transcribe.py           # Whisper API transcription
+│   └── transcribe_local.py     # Local Whisper transcription
+├── analysis/                   # Phase 6: LLM-powered summaries
+│   ├── executive_summaries.py  # Yearly summaries (reads monthly digests)
+│   ├── leadership_profiles.py  # Per-member profiles with grades
+│   ├── council_member_summaries.py # Per-member summaries (reads per-record)
+│   └── update_skill_intel.py   # Intel → skill supplement
 ├── data/                       # All data (gitignored)
 │   ├── documents/              # Extracted text (.txt — PDFs archived to S3)
-│   ├── nctd/documents/         # NCTD extracted text
-│   ├── sandag/                 # SANDAG meeting metadata
-│   ├── sdcounty/               # SD County meeting metadata
-│   ├── coastal/                # CCC meeting metadata
-│   ├── transcripts/            # Meeting transcripts
 │   ├── structured/             # JSONL records + meetings + monthly digests
 │   ├── permits/                # eTRAKiT permit JSONL (one file per year)
 │   ├── intel/                  # External feed hits
-│   ├── executive-summaries/    # Generated analysis + council member profiles
-│   └── public-comments/        # Council comment submissions
-├── .claude/skills/             # Agent skills
-│   ├── ca-housing-law/         # CA housing law reference (statewide)
-│   ├── policy-analysis/        # Policy analysis framework
-│   ├── civic-pipeline/         # Pipeline operation guide
-│   └── transportation-safety/  # Ped/bike safety analysis
-├── legal-reference/            # CA housing law library (21 files)
-├── research/                   # Peer-reviewed literature reviews
-└── share/                      # Briefing materials and public documents
+│   └── executive-summaries/    # Generated analysis + leadership profiles
+└── .claude/skills/
+    ├── ca-housing-law/         # Auto-generated intel supplement
+    └── civic-pipeline/         # Pipeline operation guide
 ```
 
 ## License

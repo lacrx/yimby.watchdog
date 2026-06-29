@@ -60,19 +60,19 @@ Automated ingestion of Oceanside, NCTD, SANDAG, SD County BOS, and CA Coastal Co
 ```
 Per-document .txt (PDFs + transcripts)
         │
-        ▼  extract_structured.py (claude -p, newest first, resumable)
+        ▼  transforms/extract_structured.py (claude -p, newest first, resumable)
 Per-document .json
         │
         ├──► all-records.jsonl (flat concat)
         │
-        ▼  meeting_merge.py (majority-vote date/agency selection)
+        ▼  transforms/meeting_merge.py (majority-vote date/agency selection)
 meetings-combined.jsonl
         │
-        ▼  monthly_rollup.py (no LLM — merges meetings + permits + intel)
+        ▼  transforms/monthly_rollup.py (no LLM — merges meetings + permits + intel)
 monthly-digests.jsonl
         │
-        ├──► executive_summaries.py (reads monthly digests)
-        └──► council_member_summaries.py (reads per-record for full attribution)
+        ├──► analysis/executive_summaries.py (reads monthly digests)
+        └──► analysis/council_member_summaries.py (reads per-record for full attribution)
 ```
 
 Monthly digests are independent — each month has a content hash computed from all its inputs (meetings, permits, intel). A month only rebuilds when its hash changes.
@@ -100,25 +100,25 @@ Monthly digests add:
 ./civic-pipeline local --deep
 
 # Check extraction progress
-python extract_structured.py --stats
+python transforms/extract_structured.py --stats
 
 # Check which months need rebuild
-python monthly_rollup.py --check
+python transforms/monthly_rollup.py --check
 
 # Rebuild monthly digests (only stale months)
-python monthly_rollup.py
+python transforms/monthly_rollup.py
 
 # Force rebuild all months
-python monthly_rollup.py --force
+python transforms/monthly_rollup.py --force
 
 # Monthly stats table
-python monthly_rollup.py --stats
+python transforms/monthly_rollup.py --stats
 
 # Generate executive summaries (reads monthly digests, default)
-python executive_summaries.py
+python analysis/executive_summaries.py
 
 # Generate council member profiles (reads per-record data)
-python council_member_summaries.py
+python analysis/council_member_summaries.py
 
 # Query structured data
 jq 'select(.advocacy_score == "red")' data/structured/all-records.jsonl
@@ -139,21 +139,25 @@ jq 'select(.council_positions[].member == "Joyce")' data/structured/all-records.
 
 ```
 civic-pipeline (bash wrapper, cron entry point)
-├── oceanside.py fetch → Legistar → data/documents/
-├── nctd.py fetch → Legistar → data/nctd/documents/
-├── sandag.py fetch → Granicus → data/sandag/
-├── sdcounty.py fetch → Legistar OData → data/sdcounty/
-├── coastal.py fetch → state API → data/coastal/
-├── intel_feed.py → data/intel/
-├── update_skill_intel.py → .claude/skills/ca-housing-law/recent-developments.md
-├── oceanside.py permits → data/permits/ (incremental eTRAKiT scrape)
-├── discover_videos.py → data/transcribe-batch.json
-├── transcribe.py | transcribe_local.py → data/transcripts/
-├── S3 sync (raw sources) → s3://civics-monitor-*/
-├── meeting_merge.py → meetings-combined.jsonl
-├── monthly_rollup.py → monthly-digests.jsonl (meetings + permits + intel)
-├── extract_structured.py → data/structured/*.json (newest first, stops at cutoff)
-├── S3 sync (structured) → s3://civics-monitor-*/
+├── scrapers/
+│   ├── oceanside.py fetch → Legistar → data/documents/
+│   ├── nctd.py fetch → Legistar → data/nctd/documents/
+│   ├── sandag.py fetch → Granicus → data/sandag/
+│   ├── sdcounty.py fetch → Legistar OData → data/sdcounty/
+│   ├── coastal.py fetch → state API → data/coastal/
+│   ├── intel_feed.py → data/intel/
+│   ├── oceanside.py permits → data/permits/ (incremental eTRAKiT scrape)
+│   └── discover_videos.py → data/transcribe-batch.json
+├── transforms/
+│   ├── meeting_merge.py → meetings-combined.jsonl
+│   ├── monthly_rollup.py → monthly-digests.jsonl (meetings + permits + intel)
+│   ├── extract_structured.py → data/structured/*.json (newest first, stops at cutoff)
+│   ├── transcribe.py | transcribe_local.py → data/transcripts/
+│   └── S3 sync → s3://civics-monitor-*/
+├── analysis/
+│   ├── executive_summaries.py (reads monthly digests)
+│   ├── leadership_profiles.py (reads per-record + monthly)
+│   └── update_skill_intel.py → .claude/skills/ca-housing-law/recent-developments.md
 └── pipeline_doctor.py → data/pipeline-doctor.jsonl (post-run diagnostics)
 ```
 

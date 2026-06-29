@@ -11,7 +11,7 @@ for YEAR in 2021 2022 2023; do
     echo ""
     echo "=== $YEAR ==="
     echo "Started: $(date)"
-    python oceanside.py permits --year "$YEAR" --delay 2
+    python scrapers/oceanside.py permits --year "$YEAR" --delay 2
     echo "Finished $YEAR: $(date)"
 
     if [ "$YEAR" != "2023" ]; then

@@ -86,35 +86,35 @@ log "  Transcriber: $([ "$MODE" = "local" ] && echo "faster-whisper" || echo "Wh
 
 # ── 1a: Fetch meeting documents (Oceanside + NCTD) ──
 log "Fetching Oceanside meetings..."
-python oceanside.py fetch $DEEP --years "$YEARS" >> data/watch.log 2>&1
+python scrapers/oceanside.py fetch $DEEP --years "$YEARS" >> data/watch.log 2>&1
 log "Oceanside fetch done."
 
 log "Fetching NCTD meetings..."
-python nctd.py fetch >> data/nctd-watch.log 2>&1
+python scrapers/nctd.py fetch >> data/nctd-watch.log 2>&1
 log "NCTD fetch done."
 
 log "Fetching SANDAG meetings..."
-python sandag.py fetch --years "$YEARS" >> data/sandag-watch.log 2>&1
+python scrapers/sandag.py fetch --years "$YEARS" >> data/sandag-watch.log 2>&1
 log "SANDAG fetch done."
 
 log "Fetching SD County Board of Supervisors..."
-python sdcounty.py fetch --years "$YEARS" >> data/sdcounty-watch.log 2>&1
+python scrapers/sdcounty.py fetch --years "$YEARS" >> data/sdcounty-watch.log 2>&1
 log "SD County fetch done."
 
 log "Fetching Coastal Commission agendas..."
-python coastal.py fetch --years "$YEARS" >> data/coastal-watch.log 2>&1
+python scrapers/coastal.py fetch --years "$YEARS" >> data/coastal-watch.log 2>&1
 log "Coastal Commission fetch done."
 
 # ── 1b: Intel feed — check RSS/web for Oceanside-relevant items ──
 log "Checking intel feeds..."
-python intel_feed.py >> data/intel/feed.log 2>&1
+python scrapers/intel_feed.py >> data/intel/feed.log 2>&1
 log "Intel feed done."
-python update_skill_intel.py >> data/intel/feed.log 2>&1
+python analysis/update_skill_intel.py >> data/intel/feed.log 2>&1
 
 # ── 1c: Fetch new building permits (incremental) ──
 CURRENT_YEAR=$(date '+%Y')
 log "Fetching building permits ($CURRENT_YEAR, incremental)..."
-if python oceanside.py permits --year "$CURRENT_YEAR" >> data/permits/fetch.log 2>&1; then
+if python scrapers/oceanside.py permits --year "$CURRENT_YEAR" >> data/permits/fetch.log 2>&1; then
     log "Permits fetch done."
 else
     log "Permits fetch failed — continuing pipeline."
@@ -122,7 +122,7 @@ fi
 
 # ── 1d: Discover new meeting videos ──
 log "Discovering new meeting videos..."
-python discover_videos.py >> data/video-discovery.log 2>&1
+python scrapers/discover_videos.py >> data/video-discovery.log 2>&1
 log "Video discovery done."
 
 # ── 1e: Transcribe audio (if enabled) ──
@@ -136,12 +136,12 @@ if [ -n "$TRANSCRIBE" ]; then
         case "$MODE" in
             full|hybrid)
                 log "  Transcribing with Whisper API..."
-                python transcribe.py --batch data/transcribe-batch.json \
+                python transforms/transcribe.py --batch data/transcribe-batch.json \
                     >> data/transcribe.log 2>&1 || TRANSCRIBE_OK=false
                 ;;
             local)
                 log "  Transcribing with faster-whisper (local)..."
-                python transcribe_local.py batch data/transcribe-batch.json \
+                python transforms/transcribe_local.py batch data/transcribe-batch.json \
                     >> data/transcribe.log 2>&1 || TRANSCRIBE_OK=false
                 ;;
         esac
@@ -178,12 +178,12 @@ fi
 
 # ── 2a: Merge per-document records into per-meeting records ──
 log "Merging per-meeting records..."
-python meeting_merge.py >> data/meeting-merge.log 2>&1
+python transforms/meeting_merge.py >> data/meeting-merge.log 2>&1
 log "Meeting merge done."
 
 # ── 2b: Monthly rollups (auto-detects stale months) ──
 log "Building monthly digests..."
-python monthly_rollup.py >> data/monthly-rollup.log 2>&1
+python transforms/monthly_rollup.py >> data/monthly-rollup.log 2>&1
 log "Monthly rollups done."
 
 # ═══════════════════════════════════════════
@@ -197,11 +197,11 @@ EXTRACT_TIMESTAMP=$(mktemp)
 
 if [ -n "$EXTRACT_CUTOFF" ]; then
     log "Structured extraction until ${EXTRACT_CUTOFF}:00..."
-    python extract_structured.py --stop-at "$EXTRACT_CUTOFF" $FORCE >> data/structured-extraction.log 2>&1
+    python transforms/extract_structured.py --stop-at "$EXTRACT_CUTOFF" $FORCE >> data/structured-extraction.log 2>&1
     log "Extraction done."
 else
     log "Structured extraction (no time limit)..."
-    python extract_structured.py $FORCE >> data/structured-extraction.log 2>&1
+    python transforms/extract_structured.py $FORCE >> data/structured-extraction.log 2>&1
     log "Extraction done."
 fi
 
@@ -391,11 +391,11 @@ log "Doctor done."
 
 EXEC_MODE="$SUMMARIZER"
 log "Running executive summaries (mode: $EXEC_MODE)..."
-python executive_summaries.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
+python analysis/executive_summaries.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
 log "Executive summaries done."
 
 log "Running leadership profiles (mode: $EXEC_MODE)..."
-python leadership_profiles.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
+python analysis/leadership_profiles.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
 log "Leadership profiles done."
 
 log "Pipeline complete."
