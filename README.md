@@ -1,4 +1,4 @@
-# Civics
+# YIMBYoside Watchdog
 
 An AI-augmented watchdog stack for monitoring municipal government. Built to give one person the legal knowledge, attention span, and time that holding local government accountable normally requires a full newsroom or advocacy organization to sustain.
 
@@ -117,10 +117,10 @@ Extraction is resumable — each document produces its own output file. The pipe
 
 ```bash
 # Nightly: fetch current year + extract until 4 AM
-0 1 * * * cd ~/repos/civics && ./civic-pipeline local --deep --years 1 --extract-until 4 >> data/pipeline-cron.log 2>&1
+0 1 * * * cd ~/repos/yimbyoside.watchdog && ./civic-pipeline local --deep --years 1 --extract-until 4 >> data/pipeline-cron.log 2>&1
 
 # Evening catch: Tue-Fri, no extraction time limit
-0 18 * * 2-5 cd ~/repos/civics && ./civic-pipeline local --deep >> data/pipeline-cron.log 2>&1
+0 18 * * 2-5 cd ~/repos/yimbyoside.watchdog && ./civic-pipeline local --deep >> data/pipeline-cron.log 2>&1
 ```
 
 ### Processing Modes
@@ -231,8 +231,8 @@ The stack works for any California city with a Legistar portal (most cities use 
 
 ```bash
 # 1. Clone and set up
-git clone https://github.com/lacrx/yimbyoside.watchdog.git civics
-cd civics
+git clone https://github.com/lacrx/yimbyoside.watchdog.git
+cd yimbyoside.watchdog
 python -m venv .venv && source .venv/bin/activate
 pip install requests feedparser yt-dlp
 
@@ -268,7 +268,7 @@ The initial extraction takes time — `extract_structured.py` calls `claude -p` 
 ## Directory Structure
 
 ```
-civics/
+yimbyoside.watchdog/
 ├── civic-pipeline              # Bash orchestrator (cron entry point)
 ├── civic_utils.py              # Shared utilities (PDF download, text extraction, LLM calls)
 ├── pipeline_doctor.py          # Self-healing pipeline diagnostics
@@ -287,17 +287,27 @@ civics/
 │   ├── monthly_rollup.py       # Monthly digest rollup (meetings + permits + intel)
 │   ├── transcribe.py           # Whisper API transcription
 │   └── transcribe_local.py     # Local Whisper transcription
-├── analysis/                   # Phase 6: LLM-powered summaries
+├── analysis/                   # Phase 4: LLM-powered summaries
 │   ├── executive_summaries.py  # Yearly summaries (reads monthly digests)
 │   ├── leadership_profiles.py  # Per-member profiles with grades
 │   ├── council_member_summaries.py # Per-member summaries (reads per-record)
 │   └── update_skill_intel.py   # Intel → skill supplement
 ├── data/                       # All data (gitignored)
+│   ├── audio/                  # Downloaded meeting audio (pre-transcription)
+│   ├── coastal/                # Coastal Commission meeting data
+│   ├── cpra-templates/         # Public records act request templates
 │   ├── documents/              # Extracted text (.txt — PDFs archived to S3)
-│   ├── structured/             # JSONL records + meetings + monthly digests
-│   ├── permits/                # eTRAKiT permit JSONL (one file per year)
+│   ├── executive-summaries/    # Generated analysis + leadership profiles
 │   ├── intel/                  # External feed hits
-│   └── executive-summaries/    # Generated analysis + leadership profiles
+│   ├── meetings/               # Per-meeting metadata + agenda items (Legistar)
+│   ├── nctd/                   # NCTD meeting data
+│   ├── permits/                # eTRAKiT permit JSONL (one file per year)
+│   ├── public-comments/        # Drafted public comments
+│   ├── sandag/                 # SANDAG meeting data
+│   ├── sdcounty/               # SD County BOS meeting data
+│   ├── structured/             # JSONL records + meetings + monthly digests
+│   ├── transcripts/            # Whisper transcription output (JSON)
+│   └── transport-safety-refs/  # Vision Zero / crash data references
 └── .claude/skills/
     ├── ca-housing-law/         # Auto-generated intel supplement
     └── civic-pipeline/         # Pipeline operation guide

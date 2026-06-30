@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-SANDAG meeting monitor — scrapes Granicus for Board of Directors,
+SANDAG meeting monitor — fetches from eScribe platform for Board of Directors,
 Regional Planning Committee, and Transportation Committee meetings.
 
 Usage:
-    python sandag.py fetch [--years N]   # pull meetings + download agenda packets
-    python sandag.py list                # list all tracked meetings
-    python sandag.py search TERM         # full-text search across documents
+    python sandag.py fetch [--years N] [--deep]  # pull meetings + download documents
+    python sandag.py list                        # list all tracked meetings
+    python sandag.py search TERM                 # full-text search across documents
 
 Requires: requests, beautifulsoup4, lxml, pdftotext (CLI)
 """
@@ -17,8 +17,11 @@ import json
 import re
 import sys
 import time
+import urllib3
 from datetime import datetime
 from pathlib import Path
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -33,13 +36,14 @@ MEETINGS_DIR = DATA_DIR / "meetings"
 DOCS_DIR = REPO_ROOT / "data" / "documents"
 STATE_FILE = DATA_DIR / "state.json"
 
-GRANICUS_BASE = "https://sandag.granicus.com"
+ESCRIBE_BASE = "https://pub-sandag.escribemeetings.com"
+PAST_MEETINGS_URL = f"{ESCRIBE_BASE}/MeetingsCalendarView.aspx/PastMeetings"
 
-BODIES = {
-    "Board of Directors": 1,
-    "Regional Planning Committee": 7,
-    "Transportation Committee": 3,
-}
+BODIES = [
+    "Board of Directors",
+    "Regional Planning Committee",
+    "Transportation Committee",
+]
 
 
 def ensure_dirs():
@@ -55,100 +59,191 @@ def save_state(state):
     save_json(STATE_FILE, state)
 
 
-def fetch_granicus_page(view_id):
-    resp = requests.get(
-        f"{GRANICUS_BASE}/ViewPublisher.php?view_id={view_id}",
-        timeout=30,
-        headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0"},
-    )
-    resp.raise_for_status()
-    return resp.text
+def create_session():
+    session = requests.Session()
+    session.verify = False
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0",
+        "Content-Type": "application/json",
+    })
+    return session
 
 
-def parse_meetings(html, body_name, min_year=None):
-    soup = BeautifulSoup(html, "lxml")
-    meetings = []
+def parse_escribe_date(start_field):
+    """Parse /Date(milliseconds)/ format from eScribe API."""
+    m = re.search(r"/Date\((\d+)\)/", start_field)
+    if m:
+        return datetime.fromtimestamp(int(m.group(1)) / 1000)
+    return None
 
-    for row in soup.select("tr.listingRow"):
-        cells = row.find_all("td", class_="listItem")
-        if len(cells) < 5:
-            continue
 
-        name = cells[0].get_text(strip=True)
-        date_str = cells[1].get_text(strip=True)
+def make_meeting_id(body_name, date_str):
+    """Generate deterministic meeting ID matching Granicus-era formula."""
+    return hashlib.md5(
+        f"sandag-{body_name}-{date_str}".encode()
+    ).hexdigest()[:12]
 
-        if "canceled" in name.lower() or "cancelled" in name.lower():
-            continue
 
-        dt = None
-        date_clean = re.sub(r"[\s\xa0]+", " ", date_str)
-        m = re.match(r"([A-Za-z]+ \d{1,2}, \d{4})", date_clean)
-        if m:
-            try:
-                dt = datetime.strptime(m.group(1), "%b %d, %Y")
-            except ValueError:
-                try:
-                    dt = datetime.strptime(m.group(1), "%B %d, %Y")
-                except ValueError:
-                    continue
-        if not dt:
-            continue
+def extract_document_urls(meeting_data):
+    """Pull agenda, minutes, and video URLs from MeetingLinks."""
+    links = meeting_data.get("MeetingLinks", [])
+    agenda_url = None
+    minutes_url = None
+    video_url = None
+    meeting_page_url = None
 
-        if min_year and dt.year < min_year:
-            continue
+    for link in links:
+        link_type = link.get("Type", "")
+        fmt = link.get("Format", "")
+        url = link.get("Url", "")
 
-        agenda_a = cells[2].find("a", href=True)
-        minutes_a = cells[3].find("a", href=True)
-        packet_a = cells[4].find("a", href=True)
+        if link_type == "Agenda" and fmt == ".pdf":
+            agenda_url = url
+        elif link_type == "AgendaCover" and fmt == ".pdf" and not agenda_url:
+            agenda_url = url
+        elif link_type == "PostMinutes" and fmt == ".pdf":
+            minutes_url = url
+        elif link_type == "Video":
+            video_url = url
+        elif link_type == "PostAgenda" and fmt == "HTML":
+            meeting_page_url = url
 
-        agenda_url = None
-        if agenda_a:
-            href = agenda_a["href"]
-            if href.startswith("//"):
-                href = "https:" + href
-            agenda_url = href
+    def full_url(u):
+        if not u:
+            return None
+        if u.startswith("http"):
+            return u
+        return f"{ESCRIBE_BASE}/{u}"
 
-        minutes_url = minutes_a["href"] if minutes_a else None
-        packet_url = packet_a["href"] if packet_a else None
+    return {
+        "agenda_url": full_url(agenda_url),
+        "minutes_url": full_url(minutes_url),
+        "video_url": full_url(video_url),
+        "meeting_page_url": full_url(meeting_page_url),
+    }
 
-        event_id = None
-        if agenda_url:
-            eid = re.search(r"event_id=(\d+)", agenda_url)
-            if eid:
-                event_id = eid.group(1)
 
-        meeting_id = hashlib.md5(
-            f"sandag-{body_name}-{dt.strftime('%Y-%m-%d')}".encode()
-        ).hexdigest()[:12]
+def normalize_meeting(api_meeting, body_name):
+    """Convert eScribe API meeting to standard meeting.json format."""
+    dt = parse_escribe_date(api_meeting.get("Start", ""))
+    if not dt:
+        return None
 
-        meetings.append({
-            "id": meeting_id,
-            "body": f"SANDAG {body_name}",
-            "date": dt.strftime("%Y-%m-%d"),
-            "date_display": date_str,
-            "agency": "SANDAG",
-            "agenda_url": agenda_url,
-            "minutes_url": minutes_url,
-            "packet_url": packet_url,
-            "event_id": event_id,
-        })
+    date_str = dt.strftime("%Y-%m-%d")
+    mid = make_meeting_id(body_name, date_str)
+    urls = extract_document_urls(api_meeting)
 
-    return meetings
+    return {
+        "id": mid,
+        "body": f"SANDAG {body_name}",
+        "date": date_str,
+        "date_display": api_meeting.get("FormattedStart", ""),
+        "agency": "SANDAG",
+        "agenda_url": urls["agenda_url"],
+        "minutes_url": urls["minutes_url"],
+        "video_url": urls["video_url"],
+        "escribe_id": api_meeting.get("Id"),
+        "escribe_meeting_url": api_meeting.get("MeetingUrl"),
+    }
+
+
+def fetch_past_meetings(session, body_name, min_year):
+    """Paginate PastMeetings API, filter by year, skip cancelled."""
+    all_meetings = []
+    page = 1
+
+    while True:
+        resp = session.post(PAST_MEETINGS_URL, json={
+            "type": body_name,
+            "pageNumber": page,
+        }, timeout=30)
+        resp.raise_for_status()
+        data = resp.json().get("d", {})
+        meetings = data.get("Meetings", [])
+        total_count = data.get("TotalCount", 0)
+
+        if not meetings:
+            break
+
+        oldest_year = None
+        for m in meetings:
+            if m.get("Cancelled"):
+                continue
+            year = m.get("Year")
+            if year and year < min_year:
+                oldest_year = year
+                continue
+            normalized = normalize_meeting(m, body_name)
+            if normalized:
+                all_meetings.append(normalized)
+            if year:
+                oldest_year = year
+
+        fetched_so_far = page * 50
+        if fetched_so_far >= total_count:
+            break
+        if oldest_year and oldest_year < min_year:
+            break
+
+        page += 1
+        time.sleep(0.3)
+
+    return all_meetings
+
+
+def fetch_meeting_items(session, escribe_id):
+    """Fetch meeting page and extract agenda item attachments for --deep mode."""
+    url = f"{ESCRIBE_BASE}/Meeting.aspx?Id={escribe_id}&Agenda=PostAgenda&lang=English"
+    try:
+        resp = session.get(url, timeout=30)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"    Failed to fetch meeting page: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    items = []
+
+    for item_div in soup.select(".AgendaItemContainer, .agenda-item"):
+        title_el = item_div.select_one(".AgendaItemTitle a, .agenda-item-title a")
+        title = title_el.get_text(strip=True) if title_el else ""
+
+        attachments = []
+        for link in item_div.select("a[href*='FileStream.ashx']"):
+            href = link.get("href", "")
+            name = link.get_text(strip=True) or "attachment"
+            if href:
+                if not href.startswith("http"):
+                    href = f"{ESCRIBE_BASE}/{href}"
+                attachments.append({"name": name, "url": href})
+
+        if attachments:
+            items.append({"title": title, "attachments": attachments})
+
+    return items
+
+
+def sanitize_filename(name, max_len=60):
+    """Clean a string for use in filenames."""
+    name = re.sub(r'[^\w\s-]', '', name)
+    name = re.sub(r'\s+', '_', name.strip())
+    return name[:max_len] or "doc"
 
 
 def cmd_fetch(args):
     ensure_dirs()
     state = load_state()
+    session = create_session()
 
     min_year = datetime.now().year - args.years + 1
+    deep = getattr(args, "deep", False)
 
     total = 0
     new = 0
 
-    for body_name, view_id in BODIES.items():
-        print(f"Fetching {body_name} (view_id={view_id})...")
-        html = fetch_granicus_page(view_id)
-        meetings = parse_meetings(html, body_name, min_year=min_year)
+    for body_name in BODIES:
+        print(f"Fetching {body_name}...")
+        meetings = fetch_past_meetings(session, body_name, min_year)
         print(f"  {len(meetings)} meetings since {min_year}")
         total += len(meetings)
 
@@ -162,20 +257,18 @@ def cmd_fetch(args):
 
             is_new = mid not in state.get("meetings", {})
 
-            if m.get("packet_url"):
+            if m.get("agenda_url"):
                 pdf_path = DOCS_DIR / f"{mid}-agenda-packet.pdf"
                 txt_path = DOCS_DIR / f"{mid}-agenda-packet.txt"
                 if not txt_path.exists():
                     if is_new:
-                        print(f"  {m['date']} {body_name}: downloading packet...")
-                    if download_pdf(m["packet_url"], pdf_path):
+                        print(f"  {m['date']} {body_name}: downloading agenda...")
+                    if download_pdf(m["agenda_url"], pdf_path, verify=False):
                         text = extract_text(pdf_path)
-                        if text:
-                            if is_new:
-                                print(f"    Extracted {len(text)} chars")
-                    else:
-                        if is_new:
-                            print(f"    Download failed")
+                        if text and is_new:
+                            print(f"    Extracted {len(text)} chars")
+                    elif is_new:
+                        print(f"    Download failed")
                     time.sleep(0.5)
 
             if m.get("minutes_url"):
@@ -184,12 +277,25 @@ def cmd_fetch(args):
                 if not txt_path.exists():
                     if is_new:
                         print(f"  {m['date']} {body_name}: downloading minutes...")
-                    if download_pdf(m["minutes_url"], pdf_path):
+                    if download_pdf(m["minutes_url"], pdf_path, verify=False):
                         text = extract_text(pdf_path)
-                        if text:
-                            if is_new:
-                                print(f"    Extracted {len(text)} chars")
+                        if text and is_new:
+                            print(f"    Extracted {len(text)} chars")
                     time.sleep(0.5)
+
+            if deep and m.get("escribe_id"):
+                items = fetch_meeting_items(session, m["escribe_id"])
+                for i, item in enumerate(items, 1):
+                    for att in item["attachments"]:
+                        fname = sanitize_filename(att["name"])
+                        pdf_path = DOCS_DIR / f"{mid}-{i:02d}-{fname}.pdf"
+                        txt_path = pdf_path.with_suffix(".txt")
+                        if not txt_path.exists():
+                            if is_new:
+                                print(f"    Item {i}: {att['name'][:60]}...")
+                            if download_pdf(att["url"], pdf_path, verify=False):
+                                extract_text(pdf_path)
+                            time.sleep(0.5)
 
             state["meetings"][mid] = {
                 "body": m["body"],
@@ -249,11 +355,12 @@ def cmd_search(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SANDAG meeting monitor")
+    parser = argparse.ArgumentParser(description="SANDAG meeting monitor (eScribe)")
     sub = parser.add_subparsers(dest="command")
 
-    p_fetch = sub.add_parser("fetch", help="Pull SANDAG meetings and download packets")
+    p_fetch = sub.add_parser("fetch", help="Pull SANDAG meetings and download documents")
     p_fetch.add_argument("--years", type=int, default=1, help="How many years back (default: 1)")
+    p_fetch.add_argument("--deep", action="store_true", help="Also download agenda item attachments")
 
     sub.add_parser("list", help="List tracked meetings")
 

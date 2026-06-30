@@ -26,6 +26,7 @@ Output: data/structured/meetings/{meeting_id}.json (one per meeting)
 
 import argparse
 import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -33,9 +34,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = REPO_ROOT / "data"
 STRUCTURED_DIR = DATA_DIR / "structured"
+DOCS_DIR = DATA_DIR / "documents"
 MERGED_DIR = STRUCTURED_DIR / "meetings"
 MERGED_JSONL = STRUCTURED_DIR / "meetings-combined.jsonl"
 STATE_FILE = STRUCTURED_DIR / "meetings-state.json"
+DOC_DATES_FILE = STRUCTURED_DIR / "document-dates.json"
 
 
 def load_state():
@@ -67,8 +70,147 @@ def collect_records_by_meeting():
     return dict(by_meeting)
 
 
-def merge_records(meeting_id, records):
-    """Merge multiple document records into one consolidated meeting record."""
+MONTH_NAMES = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+}
+
+
+def parse_document_date(text):
+    """Extract a date from the first 1000 chars of a document's raw text.
+
+    Returns ISO date string (YYYY-MM-DD) or None.
+    """
+    head = text[:1000]
+
+    # "DATE:  August 5, 2020" (staff reports)
+    m = re.search(r"DATE:\s*(\w+)\s+(\d{1,2}),?\s+(\d{4})", head)
+    if m:
+        month = MONTH_NAMES.get(m.group(1).lower())
+        if month:
+            return f"{m.group(3)}-{month:02d}-{int(m.group(2)):02d}"
+
+    # "October 4, 2023" or "October 4 2023" (minutes, agendas)
+    m = re.search(
+        r"(January|February|March|April|May|June|July|August|September|October|November|December)"
+        r"\s+(\d{1,2}),?\s+(\d{4})", head)
+    if m:
+        month = MONTH_NAMES.get(m.group(1).lower())
+        if month:
+            return f"{m.group(3)}-{month:02d}-{int(m.group(2)):02d}"
+
+    # "12/18/2024" (slash dates)
+    m = re.search(r"(\d{1,2})/(\d{1,2})/(\d{4})", head)
+    if m:
+        return f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+
+    # "2024-12-18" (ISO)
+    m = re.search(r"(20\d{2})-(\d{2})-(\d{2})", head)
+    if m:
+        return m.group(0)
+
+    return None
+
+
+def scan_document_dates():
+    """Scan all raw document text files and extract dates from content.
+
+    Returns dict mapping filename stem to ISO date string.
+    """
+    dates = {}
+    for docs_dir in [DOCS_DIR, DATA_DIR / "nctd" / "documents"]:
+        if not docs_dir.exists():
+            continue
+        for f in docs_dir.glob("*.txt"):
+            try:
+                text = f.read_text(errors="replace")
+                d = parse_document_date(text)
+                if d:
+                    dates[f.stem] = d
+            except Exception:
+                continue
+    return dates
+
+
+def load_document_dates():
+    """Load cached document dates, scanning if cache doesn't exist."""
+    if DOC_DATES_FILE.exists():
+        return json.loads(DOC_DATES_FILE.read_text())
+    dates = scan_document_dates()
+    DOC_DATES_FILE.write_text(json.dumps(dates, indent=2, sort_keys=True))
+    return dates
+
+
+def parse_filename_year(filename):
+    """Extract a year from a filename if it refers to a historical document.
+
+    Returns the year as int if found and clearly refers to document origin
+    (not a fiscal year, budget label, or project number), else None.
+    """
+    # Strip meeting_id prefix and item_id: "1355279-8043738-2023_10_04_Meeting_Minutes"
+    parts = filename.split("-", 2)
+    name = parts[2] if len(parts) > 2 else filename
+
+    # YYYY_MM_DD or MM_DD_YYYY or MM_D_YYYY patterns (underscore-separated dates)
+    m = re.search(r"(20\d{2})_(\d{1,2})_(\d{1,2})", name)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d{1,2})_(\d{1,2})_(20\d{2})", name)
+    if m:
+        return int(m.group(3))
+
+    # "MM_DD_YYYY" with hyphens: "10-04-2023"
+    m = re.search(r"(\d{1,2})-(\d{1,2})-(20\d{2})", name)
+    if m:
+        return int(m.group(3))
+
+    # Ordinance/resolution numbers: "Ordinance_No__21_OR" or "Resolution_No__23_"
+    # Two-digit year prefix before _OR, _D, _P (ordinance/directive/policy markers)
+    m = re.search(r"No__(\d{2})_[A-Z]", name)
+    if m:
+        yy = int(m.group(1))
+        if 19 <= yy <= 99:
+            return 1900 + yy
+        elif 0 <= yy <= 30:
+            return 2000 + yy
+
+    return None
+
+
+def filename_date_matches(filename, meeting_date):
+    """Check if a filename's embedded date is consistent with the meeting date.
+
+    Returns True if no date found in filename, or if the year matches.
+    Returns False only when a clear date mismatch is detected.
+    """
+    if not meeting_date:
+        return True
+    try:
+        meeting_year = int(meeting_date[:4])
+    except (ValueError, IndexError):
+        return True
+
+    file_year = parse_filename_year(filename)
+    if file_year is None:
+        return True
+
+    return file_year == meeting_year
+
+
+def merge_records(meeting_id, records, doc_dates=None):
+    """Merge multiple document records into one consolidated meeting record.
+
+    Historical attachments (old minutes, resolutions included as exhibits) are
+    detected by date mismatch and excluded from votes/positions/quotes to avoid
+    contaminating the meeting record with stale council member data.
+
+    Date matching uses three signals (any mismatch triggers filtering):
+      1. Record's extracted date vs meeting's majority-vote date
+      2. Filename-embedded year vs meeting year
+      3. Raw document text date (from first 1000 chars) vs meeting date
+    """
+    if doc_dates is None:
+        doc_dates = {}
     all_votes = []
     all_housing = []
     all_fiscal = []
@@ -83,33 +225,59 @@ def merge_records(meeting_id, records):
     dates = []
     scores = []
 
+    # First pass: determine the meeting's canonical date via majority vote
+    for r in records:
+        if r.get("date"):
+            dates.append(r["date"])
+
+    from collections import Counter
+    meeting_date = Counter(dates).most_common(1)[0][0] if dates else ""
+    dates = []  # reset for second pass
+
     for r in records:
         if r.get("procedural_only") and len(records) > 1:
             continue
+
+        record_date = r.get("date", "")
+        record_file = r.get("_file", "")
+        record_stem = record_file.replace(".json", "") if record_file else ""
+
+        date_matches = (not record_date or not meeting_date or record_date == meeting_date) \
+            and filename_date_matches(record_file, meeting_date)
+
+        # Check raw document content date if available
+        if date_matches and record_stem and meeting_date:
+            doc_date = doc_dates.get(record_stem)
+            if doc_date and doc_date[:4] != meeting_date[:4]:
+                date_matches = False
 
         if r.get("body"):
             bodies.add(r["body"])
         if r.get("agency"):
             agencies.append(r["agency"])
-        if r.get("date"):
-            dates.append(r["date"])
+        if record_date:
+            dates.append(record_date)
         if r.get("doc_type"):
             doc_types.add(r["doc_type"])
-        if r.get("advocacy_score"):
+        if r.get("advocacy_score") and date_matches:
             scores.append(r["advocacy_score"])
         sources.append({
             "file": r.get("_file", r.get("_source", "")),
             "type": r.get("_source_type", r.get("doc_type", "")),
             "advocacy_score": r.get("advocacy_score"),
+            "date_match": date_matches,
         })
 
-        all_votes.extend(r.get("votes", []))
+        if date_matches:
+            all_votes.extend(r.get("votes", []))
+            all_positions.extend(r.get("council_positions", []))
+            all_quotes.extend(r.get("key_quotes", []))
+
+        # Housing, fiscal, legal always included — historical context is relevant
         all_housing.extend(r.get("housing_items", []))
         all_fiscal.extend(r.get("fiscal_items", []))
         all_legal.extend(r.get("legal_flags", []))
-        all_positions.extend(r.get("council_positions", []))
         all_comments.extend(r.get("public_comments", []))
-        all_quotes.extend(r.get("key_quotes", []))
 
     # Deduplicate strings
     all_legal = list(dict.fromkeys(all_legal))
@@ -127,8 +295,6 @@ def merge_records(meeting_id, records):
         elif not key:
             deduped_votes.append(v)
 
-    # Pick most common date and agency (majority vote, not alphabetical/earliest)
-    from collections import Counter
     date = Counter(dates).most_common(1)[0][0] if dates else ""
     agency = Counter(agencies).most_common(1)[0][0] if agencies else "Unknown"
 
@@ -195,7 +361,9 @@ def cmd_merge(args):
         print("No structured records found.")
         return
 
-    if args.force:
+    if args.meeting:
+        to_merge = [mid for mid in args.meeting if mid in by_meeting]
+    elif args.force:
         to_merge = list(by_meeting.keys())
     else:
         to_merge = find_changed_meetings(by_meeting, state)
@@ -206,9 +374,12 @@ def cmd_merge(args):
 
     print(f"Merging {len(to_merge)} meetings ({len(by_meeting)} total)")
 
+    doc_dates = load_document_dates()
+    print(f"  Document dates loaded: {len(doc_dates)} files")
+
     for mid in sorted(to_merge):
         records = by_meeting[mid]
-        merged = merge_records(mid, records)
+        merged = merge_records(mid, records, doc_dates)
         out_path = MERGED_DIR / f"{mid}.json"
         out_path.write_text(json.dumps(merged, indent=2, default=str))
 
@@ -290,10 +461,17 @@ def main():
     parser.add_argument("--force", action="store_true", help="Rebuild all merged records")
     parser.add_argument("--check", action="store_true", help="List meetings needing merge")
     parser.add_argument("--stats", action="store_true", help="Show merge statistics")
+    parser.add_argument("--meeting", action="append", metavar="ID", help="Only merge these meeting IDs (repeatable)")
+    parser.add_argument("--scan-dates", action="store_true", help="Rescan document dates from raw text files")
 
     args = parser.parse_args()
 
-    if args.stats:
+    if args.scan_dates:
+        print("Scanning document dates from raw text...")
+        dates = scan_document_dates()
+        DOC_DATES_FILE.write_text(json.dumps(dates, indent=2, sort_keys=True))
+        print(f"Scanned {len(dates)} document dates → {DOC_DATES_FILE}")
+    elif args.stats:
         cmd_stats(args)
     elif args.check:
         cmd_check(args)

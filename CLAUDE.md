@@ -1,8 +1,7 @@
 # Agent Instructions
 
 ## Engineering Knowledge Base
-When the task involves: python, testing, fastapi, aws, fargate, docker, terraform, bedrock, sagemaker
-fetch KB content before planning.
+For engineering tasks (infrastructure, deployment, testing patterns, cloud services, frameworks), fetch KB content before planning.
 
 ### How to Fetch
 Fetch files with: `gh api repos/lacrx/agent-knowledge-docs/contents/{path}?ref=main -H "Accept: application/vnd.github.raw+json"`
@@ -14,12 +13,10 @@ Fetch files with: `gh api repos/lacrx/agent-knowledge-docs/contents/{path}?ref=m
 4. If still no match, continue without KB.
 
 ### When NOT to Fetch
-Skip KB lookup for: GIS/spatial analysis, policy domain logic, data pipeline code
-that doesn't touch the topics above.
+Skip KB lookup for: GIS/spatial analysis, policy domain logic, data pipeline code that doesn't touch engineering infrastructure.
 
 ## Policy Knowledge Base
-When the task involves: ca-housing-law, land-use-analysis, transportation-safety, municipal-fiscal, pra-strategy, rhna-compliance, obstruction-patterns, sb-79, density-bonus, adu-law, housing-element, vision-zero, complete-streets, crash-data
-fetch relevant articles and skills. Unlike the engineering KB (used once during planning), fetch policy KB content **whenever relevant** — during extractions, analysis, drafting, evaluation, or any policy-adjacent work.
+For policy-adjacent work (housing law, land use, transit, municipal governance, advocacy, PRA strategy), fetch relevant articles and skills. Unlike the engineering KB (used once during planning), fetch policy KB content **whenever relevant** — during extractions, analysis, drafting, evaluation, or any policy-adjacent work.
 
 ### How to Fetch
 Fetch files with: `gh api repos/lacrx/policy-knowledge-docs/contents/{path}?ref=main -H "Accept: application/vnd.github.raw+json"`

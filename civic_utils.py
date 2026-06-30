@@ -21,7 +21,7 @@ if ENV_FILE.exists():
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0"
 
 
-def download_pdf(url, dest_path, headers=None):
+def download_pdf(url, dest_path, headers=None, verify=True):
     """Download a PDF. Skips if already exists and non-empty."""
     if dest_path.exists() and dest_path.stat().st_size > 0:
         return True
@@ -29,7 +29,8 @@ def download_pdf(url, dest_path, headers=None):
     if headers:
         hdrs.update(headers)
     try:
-        resp = requests.get(url, timeout=60, headers=hdrs, allow_redirects=True)
+        resp = requests.get(url, timeout=60, headers=hdrs, allow_redirects=True,
+                            verify=verify)
         resp.raise_for_status()
         if b"%PDF" in resp.content[:10]:
             dest_path.write_bytes(resp.content)

@@ -351,9 +351,14 @@ def cmd_extract(args):
         print("No source files found. Run fetch first.")
         return
 
+    meeting_filter = set(args.meeting) if args.meeting else None
+
     to_process = []
     skipped_markers = 0
     for source_type, sf in all_sources:
+        if meeting_filter and not any(sf.stem.startswith(mid) for mid in meeting_filter):
+            continue
+
         if has_skip_marker(sf):
             skipped_markers += 1
             continue
@@ -414,6 +419,7 @@ def cmd_extract(args):
             write_skip_marker(sf, skip_reason)
             skipped += 1
             print(f"  Skipping permanently: {skip_reason} ({len(text.strip())} chars)")
+            i += 1
             continue
 
         meta = get_meeting_meta(sf)
@@ -554,6 +560,7 @@ def main():
     parser.add_argument("--stats", action="store_true", help="Show extraction statistics")
     parser.add_argument("--rebuild", action="store_true", help="Rebuild combined JSONL from existing records")
     parser.add_argument("--stop-at", type=int, metavar="HOUR", help="Stop extraction at this hour (0-23). Resumes next run.")
+    parser.add_argument("--meeting", action="append", metavar="ID", help="Only extract sources for these meeting IDs (repeatable)")
 
     args = parser.parse_args()
 
