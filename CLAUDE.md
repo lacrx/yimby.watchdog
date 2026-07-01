@@ -1,6 +1,9 @@
 # Agent Instructions
 
+This repo is the ETL/pipeline layer for civic monitoring. It scrapes meeting agendas, transcribes video, extracts structured data (JSONL), and manages the transcription backlog. It does NOT generate prose analysis or advocacy intelligence — that lives in `yimbydemssd.oside.analysis`.
+
 ## Related Projects
+- `yimbydemssd.oside.analysis`: downstream analysis — executive summaries, council member profiles, leadership grading. Reads from this repo's `data/` directory
 - `stoside.data`: municipal fiscal intelligence, budget/CIP/vote history
 - `agent-knowledge-docs`: engineering patterns KB
 - `policy-knowledge-docs`: policy analysis KB
