@@ -62,6 +62,18 @@ agencies:
       - Senior Commission
       - Traffic Safety & Mobility Commission
       - Community-Police Engagement Commission
+    body_pages:
+      City Council: /city-hall/meetings-agendas
+      Planning Commission: /city-hall/meetings-agendas/boards-commissions/planning-commission
+      Housing Commission: /city-hall/meetings-agendas/boards-commissions/housing-commission
+      Arts Commission: /city-hall/meetings-agendas/boards-commissions/arts-commission
+      Historic Preservation Commission: /city-hall/meetings-agendas/boards-commissions/historic-preservation
+      Environmental Sustainability Commission: /city-hall/meetings-agendas/boards-commissions/environmental-sustainability-commission
+      Parks & Recreation Commission: /city-hall/meetings-agendas/boards-commissions/parks-recreation
+      Library Board of Trustees: /city-hall/meetings-agendas/boards-commissions/library-board-of-trustees
+      Senior Commission: /city-hall/meetings-agendas/boards-commissions/senior-commission
+      Traffic Safety & Mobility Commission: /city-hall/meetings-agendas/boards-commissions/traffic-mobility-commission
+      Community-Police Engagement Commission: /city-hall/meetings-agendas/boards-commissions/community-police-engagement-commission
     deep_fetch: false
     enabled: true  # WAF bypass via browser headers; fragile — preflight monitors
 
@@ -90,6 +102,16 @@ agencies:
       - Climate & Resiliency
       - Parks and Recreation Commission
       - Public Arts Advisory Commission
+    escribe_bodies:
+      - Council Meetings REGULAR
+      - Closed Session
+    drupal_pages:
+      council:
+        path: /en/city-council-meetings
+        body_prefix: City Council
+      commissions:
+        path: /en/government/public-meetings/citizen-commission-council-standing-committee-meetings
+        body_prefix: null
     deep_fetch: false
     enabled: true
 

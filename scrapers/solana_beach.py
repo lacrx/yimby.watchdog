@@ -34,39 +34,17 @@ from bs4 import BeautifulSoup
 
 from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
-    load_agencies, agency_data_dir,
+    load_agencies, agency_data_dir, USER_AGENT,
+    parse_escribe_date, cmd_list_meetings,
 )
 
 SLUG = "solana_beach"
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0"
 
 ESCRIBE_BASE = "https://pub-solanabeach.escribemeetings.com"
 PAST_MEETINGS_URL = f"{ESCRIBE_BASE}/MeetingsCalendarView.aspx/PastMeetings"
 
-ESCRIBE_BODIES = [
-    "Council Meetings REGULAR",
-    "Closed Session",
-]
-
-DRUPAL_PAGES = {
-    "council": {
-        "path": "/en/city-council-meetings",
-        "body_prefix": "City Council",
-    },
-    "commissions": {
-        "path": "/en/government/public-meetings/citizen-commission-council-standing-committee-meetings",
-        "body_prefix": None,
-    },
-}
-
 
 # ── eScribe source (2026+) ──────────────────────────────────────────
-
-def parse_escribe_date(start_field):
-    m = re.search(r"/Date\((\d+)\)/", start_field)
-    if m:
-        return datetime.fromtimestamp(int(m.group(1)) / 1000)
-    return None
 
 
 def meeting_id_escribe(body, dt):
@@ -99,7 +77,7 @@ def extract_escribe_docs(meeting_data):
     return {"agenda_url": full_url(agenda_url), "minutes_url": full_url(minutes_url)}
 
 
-def fetch_escribe_meetings(cutoff_date, deep=False):
+def fetch_escribe_meetings(cutoff_date, escribe_bodies, deep=False):
     """Fetch meetings from eScribe API. Returns list of (meeting_meta, docs) tuples."""
     session = requests.Session()
     session.verify = False
@@ -111,7 +89,7 @@ def fetch_escribe_meetings(cutoff_date, deep=False):
     min_year = cutoff_date.year
     results = []
 
-    for body_type in ESCRIBE_BODIES:
+    for body_type in escribe_bodies:
         page = 1
         while True:
             resp = session.post(PAST_MEETINGS_URL, json={
@@ -256,11 +234,11 @@ def parse_drupal_page(html, base_url, body_prefix=None, cutoff_date=None):
     return meetings
 
 
-def fetch_drupal_meetings(base_url, cutoff_date):
+def fetch_drupal_meetings(base_url, cutoff_date, drupal_pages):
     """Fetch meetings from all Drupal pages."""
     all_meetings = []
 
-    for page_key, page_cfg in DRUPAL_PAGES.items():
+    for page_key, page_cfg in drupal_pages.items():
         path = page_cfg["path"]
         body_prefix = page_cfg["body_prefix"]
         url = f"{base_url}{path}"
@@ -290,6 +268,8 @@ def cmd_fetch(args):
 
     cfg = agencies[SLUG]
     base_url = cfg["base_url"].rstrip("/")
+    escribe_bodies = cfg.get("escribe_bodies", ["Council Meetings REGULAR"])
+    drupal_pages = cfg.get("drupal_pages", {})
 
     data_dir = agency_data_dir(SLUG)
     docs_dir = data_dir / "documents"
@@ -312,7 +292,7 @@ def cmd_fetch(args):
     # Source 1: eScribe for 2026+ council meetings
     print("\n  eScribe API (2026+ council)...")
     try:
-        escribe_meetings = fetch_escribe_meetings(cutoff, deep=args.deep)
+        escribe_meetings = fetch_escribe_meetings(cutoff, escribe_bodies, deep=args.deep)
         print(f"    {len(escribe_meetings)} meetings from eScribe")
 
         for item in escribe_meetings:
@@ -356,7 +336,7 @@ def cmd_fetch(args):
 
     # Source 2: Drupal for historical + commissions
     print("\n  Drupal pages (historical + commissions)...")
-    drupal_meetings = fetch_drupal_meetings(base_url, cutoff)
+    drupal_meetings = fetch_drupal_meetings(base_url, cutoff, drupal_pages)
     print(f"    {len(drupal_meetings)} meetings total from Drupal")
 
     for meeting in drupal_meetings:
@@ -420,21 +400,7 @@ def cmd_fetch(args):
 
 
 def cmd_list(args):
-    meetings_dir = agency_data_dir(SLUG) / "meetings"
-    if not meetings_dir.exists():
-        print("No meetings directory found.")
-        return
-
-    meetings = []
-    for mdir in sorted(meetings_dir.iterdir()):
-        mf = mdir / "meeting.json"
-        if mf.exists():
-            meetings.append(load_json(mf))
-
-    meetings.sort(key=lambda m: m.get("date", ""), reverse=True)
-    for m in meetings:
-        print(f"  {m.get('date', '?'):12s}  {m.get('body', '?'):35s}  {m.get('id', '?')}")
-    print(f"\n  {len(meetings)} meetings total")
+    cmd_list_meetings(SLUG)
 
 
 def main():

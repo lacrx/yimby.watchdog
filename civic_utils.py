@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Shared utilities for civic monitoring scrapers."""
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 
 import requests
@@ -245,6 +248,52 @@ def claude_local_call(prompt, system=None, timeout=300):
     except subprocess.TimeoutExpired:
         print(f"  claude -p timed out ({timeout}s)")
         return None
+
+
+def parse_escribe_date(start_field):
+    """Parse /Date(milliseconds)/ format from eScribe API."""
+    m = re.search(r"/Date\((\d+)\)/", start_field)
+    if m:
+        return datetime.fromtimestamp(int(m.group(1)) / 1000)
+    return None
+
+
+def safe_filename(name, max_len=80):
+    """Clean a string for use in filenames."""
+    name = re.sub(r'[^\w\s\-.]', '', name)
+    name = re.sub(r'\s+', '_', name).strip('_')
+    return name[:max_len] or "document"
+
+
+def make_meeting_id(prefix, body, dt):
+    """Generate slug-based meeting ID: {prefix}-{body_slug}-{YYYYMMDD}."""
+    body_slug = re.sub(r'[^a-z0-9]+', '-', body.lower()).strip('-')[:30]
+    date_part = dt.strftime('%Y%m%d') if isinstance(dt, datetime) else dt
+    return f"{prefix}-{body_slug}-{date_part}"
+
+
+def make_meeting_id_hash(prefix, body, date_str):
+    """Generate hash-based meeting ID for platforms with non-unique body+date."""
+    return hashlib.md5(f"{prefix}-{body}-{date_str}".encode()).hexdigest()[:12]
+
+
+def cmd_list_meetings(slug):
+    """Generic list command — prints all meetings for an agency."""
+    meetings_dir = agency_meetings_dir(slug)
+    if not meetings_dir.exists():
+        print("No meetings directory found.")
+        return
+
+    meetings = []
+    for mdir in sorted(meetings_dir.iterdir()):
+        mf = mdir / "meeting.json"
+        if mf.exists():
+            meetings.append(load_json(mf))
+
+    meetings.sort(key=lambda m: m.get("date", ""), reverse=True)
+    for m in meetings:
+        print(f"  {m.get('date', '?'):12s}  {m.get('body', '?'):40s}  {m.get('id', '?')}")
+    print(f"\n  {len(meetings)} meetings total")
 
 
 def load_json(path):

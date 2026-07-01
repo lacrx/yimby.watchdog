@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from bs4 import BeautifulSoup
 
-from civic_utils import extract_text, save_json, load_json, agency_data_dir
+from civic_utils import extract_text, save_json, load_json, agency_data_dir, load_agencies, cmd_list_meetings
 
 SLUG = "carlsbad"
 BASE_URL = "https://www.carlsbadca.gov"
@@ -45,19 +45,6 @@ CURL_BASE = [
     "-H", "Sec-Fetch-User: ?1",
 ]
 
-BODY_PAGES = {
-    "City Council": "/city-hall/meetings-agendas",
-    "Planning Commission": "/city-hall/meetings-agendas/boards-commissions/planning-commission",
-    "Housing Commission": "/city-hall/meetings-agendas/boards-commissions/housing-commission",
-    "Arts Commission": "/city-hall/meetings-agendas/boards-commissions/arts-commission",
-    "Historic Preservation Commission": "/city-hall/meetings-agendas/boards-commissions/historic-preservation",
-    "Environmental Sustainability Commission": "/city-hall/meetings-agendas/boards-commissions/environmental-sustainability-commission",
-    "Parks & Recreation Commission": "/city-hall/meetings-agendas/boards-commissions/parks-recreation",
-    "Library Board of Trustees": "/city-hall/meetings-agendas/boards-commissions/library-board-of-trustees",
-    "Senior Commission": "/city-hall/meetings-agendas/boards-commissions/senior-commission",
-    "Traffic Safety & Mobility Commission": "/city-hall/meetings-agendas/boards-commissions/traffic-mobility-commission",
-    "Community-Police Engagement Commission": "/city-hall/meetings-agendas/boards-commissions/community-police-engagement-commission",
-}
 
 DATE_PATTERNS = [
     (r"((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4})",
@@ -212,7 +199,13 @@ def cmd_fetch(args):
     new_count = 0
     doc_count = 0
 
-    for body, path in BODY_PAGES.items():
+    cfg = load_agencies(enabled_only=False).get(SLUG, {})
+    body_pages = cfg.get("body_pages", {})
+    if not body_pages:
+        print(f"No body_pages configured for {SLUG} in agencies.yaml")
+        sys.exit(1)
+
+    for body, path in body_pages.items():
         print(f"\n  {body}...")
         try:
             html = fetch_page(path)
@@ -292,21 +285,7 @@ def cmd_fetch(args):
 
 
 def cmd_list(args):
-    meetings_dir = agency_data_dir(SLUG) / "meetings"
-    if not meetings_dir.exists():
-        print("No meetings directory found.")
-        return
-
-    meetings = []
-    for mdir in sorted(meetings_dir.iterdir()):
-        mf = mdir / "meeting.json"
-        if mf.exists():
-            meetings.append(load_json(mf))
-
-    meetings.sort(key=lambda m: m.get("date", ""), reverse=True)
-    for m in meetings:
-        print(f"  {m.get('date', '?'):12s}  {m.get('body', '?'):40s}  {m.get('id', '?')}")
-    print(f"\n  {len(meetings)} meetings total")
+    cmd_list_meetings(SLUG)
 
 
 def main():

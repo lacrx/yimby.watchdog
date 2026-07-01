@@ -31,10 +31,10 @@ from bs4 import BeautifulSoup
 
 from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
-    load_agencies, agency_data_dir,
+    load_agencies, agency_data_dir, USER_AGENT,
+    safe_filename, cmd_list_meetings,
 )
 
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0"
 GRAN_NS = "https://www.granicus.com/schema/rss-supplements"
 
 DATE_PATTERNS = [
@@ -164,12 +164,6 @@ def extract_pdf_links_from_agenda(agenda_url, base_url):
     return pdfs
 
 
-def safe_filename(s, max_len=80):
-    s = re.sub(r'[^\w\s\-.]', '', s)
-    s = re.sub(r'\s+', '_', s).strip('_')
-    return s[:max_len] if s else "document"
-
-
 def cmd_fetch(args):
     agencies = load_agencies(enabled_only=False)
     slug = args.agency
@@ -279,26 +273,7 @@ def cmd_fetch(args):
 
 
 def cmd_list(args):
-    agencies = load_agencies(enabled_only=False)
-    slug = args.agency
-    if slug not in agencies:
-        print(f"Unknown agency: {slug}")
-        sys.exit(1)
-
-    meetings_dir = agency_data_dir(slug) / "meetings"
-    if not meetings_dir.exists():
-        print("No meetings directory found.")
-        return
-
-    meetings = []
-    for mdir in sorted(meetings_dir.iterdir()):
-        mf = mdir / "meeting.json"
-        if mf.exists():
-            meetings.append(load_json(mf))
-
-    meetings.sort(key=lambda m: m.get("date", ""), reverse=True)
-    for m in meetings:
-        print(f"  {m.get('date', '?'):12s}  {m.get('body', '?'):35s}  {m.get('id', '?')}")
+    cmd_list_meetings(args.agency)
 
 
 def main():

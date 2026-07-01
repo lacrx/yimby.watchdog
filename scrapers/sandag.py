@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import requests
 from bs4 import BeautifulSoup
 
-from civic_utils import download_pdf, extract_text, save_json, load_json
+from civic_utils import download_pdf, extract_text, save_json, load_json, parse_escribe_date, safe_filename
 
 DATA_DIR = REPO_ROOT / "data" / "sandag"
 MEETINGS_DIR = DATA_DIR / "meetings"
@@ -68,13 +68,6 @@ def create_session():
     })
     return session
 
-
-def parse_escribe_date(start_field):
-    """Parse /Date(milliseconds)/ format from eScribe API."""
-    m = re.search(r"/Date\((\d+)\)/", start_field)
-    if m:
-        return datetime.fromtimestamp(int(m.group(1)) / 1000)
-    return None
 
 
 def make_meeting_id(body_name, date_str):
@@ -223,12 +216,6 @@ def fetch_meeting_items(session, escribe_id):
     return items
 
 
-def sanitize_filename(name, max_len=60):
-    """Clean a string for use in filenames."""
-    name = re.sub(r'[^\w\s-]', '', name)
-    name = re.sub(r'\s+', '_', name.strip())
-    return name[:max_len] or "doc"
-
 
 def cmd_fetch(args):
     ensure_dirs()
@@ -287,7 +274,7 @@ def cmd_fetch(args):
                 items = fetch_meeting_items(session, m["escribe_id"])
                 for i, item in enumerate(items, 1):
                     for att in item["attachments"]:
-                        fname = sanitize_filename(att["name"])
+                        fname = safe_filename(att["name"], max_len=60)
                         pdf_path = DOCS_DIR / f"{mid}-{i:02d}-{fname}.pdf"
                         txt_path = pdf_path.with_suffix(".txt")
                         if not txt_path.exists():
