@@ -1,12 +1,12 @@
 #!/bin/bash
 # Civic monitoring pipeline — three modes:
 #
-#   civic-pipeline full    — Claude API (Opus/Sonnet) + Whisper API. Bulk processing.
-#   civic-pipeline hybrid  — claude -p (subscription) + Whisper API. Daily use.
+#   civic-pipeline full    — claude -p (subscription) + Whisper API.
+#   civic-pipeline hybrid  — claude -p (subscription) + Whisper API.
 #   civic-pipeline local   — claude -p (subscription) + faster-whisper. Zero API cost.
 #
 # Pipeline order: GATHER everything, THEN process.
-#   Gather: fetch docs (5 agencies) → fetch permits → intel feeds → discover videos
+#   Gather: fetch docs (9 agencies) → fetch permits → intel feeds → discover videos
 #   Process: merge meetings → monthly rollup (meetings + permits + intel) → extract JSONL
 #
 # Options:
@@ -100,8 +100,8 @@ case "$MODE" in
 esac
 
 case "$MODE" in
-    full)          SUMMARIZER="api" ;;
-    hybrid|local)  SUMMARIZER="local" ;;
+    full)          ;; # Whisper API
+    hybrid|local)  ;; # faster-whisper
 esac
 
 log "Starting civic pipeline"
@@ -364,20 +364,5 @@ fi
 log "Running pipeline doctor..."
 python3 pipeline_doctor.py >> data/pipeline-doctor-run.log 2>&1
 log "Doctor done."
-
-# ═══════════════════════════════════════════
-# PHASE 6: EXECUTIVE — summaries and leadership profiles
-# ═══════════════════════════════════════════
-# Runs in all modes. Change detection skips unchanged profiles.
-# Full mode uses API (Opus); hybrid/local uses claude -p (subscription).
-
-EXEC_MODE="$SUMMARIZER"
-log "Running executive summaries (mode: $EXEC_MODE)..."
-python3 analysis/executive_summaries.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
-log "Executive summaries done."
-
-log "Running leadership profiles (mode: $EXEC_MODE)..."
-python3 analysis/leadership_profiles.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
-log "Leadership profiles done."
 
 log "Pipeline complete."
