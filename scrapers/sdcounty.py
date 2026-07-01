@@ -27,7 +27,7 @@ from civic_utils import download_pdf, extract_text, save_json, load_json
 
 DATA_DIR = REPO_ROOT / "data" / "sdcounty"
 MEETINGS_DIR = DATA_DIR / "meetings"
-DOCS_DIR = REPO_ROOT / "data" / "documents"
+DOCS_DIR = DATA_DIR / "documents"
 STATE_FILE = DATA_DIR / "state.json"
 
 API_BASE = "https://webapi.legistar.com/v1/sdcounty"

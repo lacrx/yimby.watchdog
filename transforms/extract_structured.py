@@ -28,13 +28,12 @@ from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+from civic_utils import all_docs_dirs, all_meetings_dirs
+
 DATA_DIR = REPO_ROOT / "data"
-DOCS_DIR = DATA_DIR / "documents"
-NCTD_DOCS_DIR = DATA_DIR / "nctd" / "documents"
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 STRUCTURED_DIR = DATA_DIR / "structured"
-MEETINGS_DIR = DATA_DIR / "meetings"
-NCTD_MEETINGS_DIR = DATA_DIR / "nctd" / "meetings"
 
 EXTRACTION_PROMPT = """Extract structured data from this raw local government document. Return ONLY valid JSON, no markdown fencing, no explanation.
 
@@ -87,7 +86,7 @@ def get_meeting_meta(doc_path):
     stem = doc_path.stem
     mid = stem.split("-")[0]
 
-    for meetings_dir in [MEETINGS_DIR, NCTD_MEETINGS_DIR]:
+    for meetings_dir in all_meetings_dirs():
         meta_file = meetings_dir / mid / "meeting.json"
         if meta_file.exists():
             return json.loads(meta_file.read_text())
@@ -283,10 +282,9 @@ def collect_all_sources():
     sources = []
 
     # Raw document text (PDFs → pdftotext) — newest first so recent meetings get priority
-    for ddir in [DOCS_DIR, NCTD_DOCS_DIR]:
-        if ddir.exists():
-            for f in sorted(ddir.glob("*.txt"), reverse=True):
-                sources.append(("doc", f))
+    for ddir in all_docs_dirs():
+        for f in sorted(ddir.glob("*.txt"), reverse=True):
+            sources.append(("doc", f))
 
     # Transcripts (audio → whisper)
     if TRANSCRIPTS_DIR.exists():
@@ -516,9 +514,7 @@ def cmd_stats(args):
         print("No structured records found. Run extract first.")
         return
 
-    total_docs = len(list(DOCS_DIR.glob("*.txt")))
-    if NCTD_DOCS_DIR.exists():
-        total_docs += len(list(NCTD_DOCS_DIR.glob("*.txt")))
+    total_docs = sum(len(list(d.glob("*.txt"))) for d in all_docs_dirs())
     total_transcripts = len(list(TRANSCRIPTS_DIR.glob("*-transcript.txt"))) if TRANSCRIPTS_DIR.exists() else 0
     total_sources = total_docs + total_transcripts
 

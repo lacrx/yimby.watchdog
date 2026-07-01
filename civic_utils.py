@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 import requests
+import yaml
 
 
 ENV_FILE = Path(__file__).parent / ".env"
@@ -18,7 +19,59 @@ if ENV_FILE.exists():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
+REPO_ROOT = Path(__file__).resolve().parent
+DATA_DIR = REPO_ROOT / "data"
+AGENCIES_FILE = REPO_ROOT / "agencies.yaml"
+
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0"
+
+_agencies_cache = None
+
+
+def load_agencies(enabled_only=True):
+    """Load agency registry from agencies.yaml. Returns dict keyed by slug."""
+    global _agencies_cache
+    if _agencies_cache is None:
+        with open(AGENCIES_FILE) as f:
+            _agencies_cache = yaml.safe_load(f).get("agencies", {})
+    if enabled_only:
+        return {k: v for k, v in _agencies_cache.items() if v.get("enabled", True)}
+    return dict(_agencies_cache)
+
+
+def agency_data_dir(slug):
+    """Return data directory for an agency: data/{slug}/"""
+    return DATA_DIR / slug
+
+
+def agency_docs_dir(slug):
+    """Return documents directory for an agency: data/{slug}/documents/"""
+    return DATA_DIR / slug / "documents"
+
+
+def agency_meetings_dir(slug):
+    """Return meetings directory for an agency: data/{slug}/meetings/"""
+    return DATA_DIR / slug / "meetings"
+
+
+def all_docs_dirs(enabled_only=True):
+    """Return list of existing document directories across all agencies."""
+    dirs = []
+    for slug in load_agencies(enabled_only=enabled_only):
+        d = agency_docs_dir(slug)
+        if d.exists():
+            dirs.append(d)
+    return dirs
+
+
+def all_meetings_dirs(enabled_only=True):
+    """Return list of existing meeting directories across all agencies."""
+    dirs = []
+    for slug in load_agencies(enabled_only=enabled_only):
+        d = agency_meetings_dir(slug)
+        if d.exists():
+            dirs.append(d)
+    return dirs
 
 
 def download_pdf(url, dest_path, headers=None, verify=True):

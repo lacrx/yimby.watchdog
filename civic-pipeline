@@ -27,6 +27,34 @@ source .venv/bin/activate
 [ -f .env ] && set -a && source .env && set +a
 unset ANTHROPIC_API_KEY  # extraction uses claude -p via subscription, not paid API
 
+# ── Overlap protection ──
+PIDFILE="data/.pipeline.pid"
+if [ -f "$PIDFILE" ]; then
+    OLD_PID=$(cat "$PIDFILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] Pipeline already running (PID $OLD_PID). Killing stale run."
+        kill "$OLD_PID" 2>/dev/null || true
+        sleep 2
+        kill -9 "$OLD_PID" 2>/dev/null || true
+    fi
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
+
+PHASE_TIMEOUT=1800  # 30 min max per scraper phase
+
+run_with_timeout() {
+    local label="$1"; shift
+    timeout "$PHASE_TIMEOUT" "$@" && return 0
+    local rc=$?
+    if [ "$rc" -eq 124 ]; then
+        log "$label timed out after ${PHASE_TIMEOUT}s — killed."
+    else
+        log "$label failed (exit $rc) — continuing."
+    fi
+    return 0
+}
+
 sync_to_s3() {
     local prefix="$1"; local local_path="$2"; local storage_class="${3:-STANDARD}"
     shift 3
@@ -81,74 +109,159 @@ log "  Summarizer: $SUMMARIZER"
 log "  Transcriber: $([ "$MODE" = "local" ] && echo "faster-whisper" || echo "Whisper API")"
 
 # ═══════════════════════════════════════════
+# PHASE 0: PREFLIGHT — verify endpoints before fetching
+# ═══════════════════════════════════════════
+
+log "Running preflight health checks..."
+python3 pipeline_preflight.py >> data/preflight.log 2>&1
+PREFLIGHT_RC=$?
+if [ "$PREFLIGHT_RC" -eq 2 ]; then
+    log "PREFLIGHT ABORT: All agencies failing — likely network issue. Stopping pipeline."
+    exit 1
+elif [ "$PREFLIGHT_RC" -eq 1 ]; then
+    log "Preflight: some agencies unhealthy (see data/preflight.log). Continuing with healthy ones."
+fi
+log "Preflight done."
+
+# ═══════════════════════════════════════════
 # PHASE 1: GATHER — collect all raw sources
 # ═══════════════════════════════════════════
 
-# ── 1a: Fetch meeting documents (Oceanside + NCTD) ──
-log "Fetching Oceanside meetings..."
-python scrapers/oceanside.py fetch $DEEP --years "$YEARS" >> data/watch.log 2>&1
-log "Oceanside fetch done."
+# ── 1a: Fetch meeting documents (all enabled agencies) ──
+while IFS='|' read -r SLUG PLATFORM NAME AGENCY_YEARS; do
+    LOG_FILE="data/${SLUG}/watch.log"
+    mkdir -p "data/${SLUG}"
+    AGENCY_DEEP=""
+    # Only pass --deep to agencies configured for it
+    if python3 -c "import yaml; c=yaml.safe_load(open('agencies.yaml')); exit(0 if c['agencies']['$SLUG'].get('deep_fetch') else 1)" 2>/dev/null; then
+        AGENCY_DEEP="$DEEP"
+    fi
+    # Per-agency lookback: use agency's lookback_months if set, else global --years
+    FETCH_YEARS="${AGENCY_YEARS:-$YEARS}"
 
-log "Fetching NCTD meetings..."
-python scrapers/nctd.py fetch >> data/nctd-watch.log 2>&1
-log "NCTD fetch done."
+    log "Fetching $NAME meetings (${FETCH_YEARS}y lookback)..."
+    case "$PLATFORM" in
+        legistar_html)
+            run_with_timeout "$NAME fetch" python3 scrapers/oceanside.py fetch $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        legistar_odata)
+            run_with_timeout "$NAME fetch" python3 scrapers/sdcounty.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        escribe)
+            run_with_timeout "$NAME fetch" python3 scrapers/sandag.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        custom_html)
+            run_with_timeout "$NAME fetch" python3 scrapers/nctd.py fetch >> "$LOG_FILE" 2>&1
+            ;;
+        coastal_api)
+            run_with_timeout "$NAME fetch" python3 scrapers/coastal.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        granicus)
+            run_with_timeout "$NAME fetch" python3 scrapers/granicus.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        civicplus)
+            run_with_timeout "$NAME fetch" python3 scrapers/civicplus.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        civicclerk)
+            run_with_timeout "$NAME fetch" python3 scrapers/civicclerk.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        carlsbad_cms)
+            run_with_timeout "$NAME fetch" python3 scrapers/carlsbad.py fetch $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        solana_drupal)
+            run_with_timeout "$NAME fetch" python3 scrapers/solana_beach.py fetch $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        *)
+            log "  $NAME: unknown platform '$PLATFORM', skipping."
+            ;;
+    esac
+    log "$NAME fetch done."
+done < <(python3 -c "
+import yaml
+cfg = yaml.safe_load(open('agencies.yaml'))
+for slug, a in cfg['agencies'].items():
+    if a.get('enabled', True):
+        lb = a.get('lookback_months')
+        years = f'{lb / 12:.2f}' if lb else ''
+        print(f\"{slug}|{a['platform']}|{a.get('name', slug)}|{years}\")
+")
 
-log "Fetching SANDAG meetings..."
-python scrapers/sandag.py fetch --years "$YEARS" >> data/sandag-watch.log 2>&1
-log "SANDAG fetch done."
-
-log "Fetching SD County Board of Supervisors..."
-python scrapers/sdcounty.py fetch --years "$YEARS" >> data/sdcounty-watch.log 2>&1
-log "SD County fetch done."
-
-log "Fetching Coastal Commission agendas..."
-python scrapers/coastal.py fetch --years "$YEARS" >> data/coastal-watch.log 2>&1
-log "Coastal Commission fetch done."
-
-# ── 1b: Intel feed — check RSS/web for Oceanside-relevant items ──
+# ── 1b: Intel feed — check RSS/web for relevant items ──
 log "Checking intel feeds..."
-python scrapers/intel_feed.py >> data/intel/feed.log 2>&1
+run_with_timeout "Intel feed" python3 scrapers/intel_feed.py >> data/intel/feed.log 2>&1
 log "Intel feed done."
-python analysis/update_skill_intel.py >> data/intel/feed.log 2>&1
+python3 analysis/update_skill_intel.py >> data/intel/feed.log 2>&1
 
-# ── 1c: Fetch new building permits (incremental) ──
+# ── 1c: Fetch building permits (agencies with permit config) ──
 CURRENT_YEAR=$(date '+%Y')
-log "Fetching building permits ($CURRENT_YEAR, incremental)..."
-if python scrapers/oceanside.py permits --year "$CURRENT_YEAR" >> data/permits/fetch.log 2>&1; then
-    log "Permits fetch done."
-else
-    log "Permits fetch failed — continuing pipeline."
-fi
+while IFS='|' read -r SLUG NAME; do
+    log "Fetching $NAME permits ($CURRENT_YEAR, incremental)..."
+    mkdir -p "data/${SLUG}/permits"
+    if run_with_timeout "$NAME permits" python3 scrapers/etrakit.py fetch --agency "$SLUG" --year "$CURRENT_YEAR" >> "data/${SLUG}/permits/fetch.log" 2>&1; then
+        log "$NAME permits done."
+    else
+        log "$NAME permits failed — continuing pipeline."
+    fi
+done < <(python3 -c "
+import yaml
+cfg = yaml.safe_load(open('agencies.yaml'))
+for slug, a in cfg['agencies'].items():
+    if a.get('enabled', True) and a.get('permits'):
+        print(f\"{slug}|{a.get('name', slug)}\")
+")
 
 # ── 1d: Discover new meeting videos ──
 log "Discovering new meeting videos..."
-python scrapers/discover_videos.py >> data/video-discovery.log 2>&1
+run_with_timeout "Video discovery" python3 scrapers/discover_videos.py >> data/video-discovery.log 2>&1
 log "Video discovery done."
 
 # ── 1e: Transcribe audio (if enabled) ──
+# Only transcribe high-priority meetings by default (City Council, Planning Commission,
+# or meetings with housing/zoning keyword hits in agenda text).
+# Full/hybrid modes use Whisper API (~$0.006/min); local uses faster-whisper (free).
 if [ -n "$TRANSCRIBE" ]; then
     if [ ! -f data/transcribe-batch.json ]; then
         log "  No data/transcribe-batch.json found. Skipping transcription."
     else
-        BATCH_COUNT=$(python -c "import json; b=json.loads(open('data/transcribe-batch.json').read()); print(len(b))" 2>/dev/null || echo 0)
-        log "  Batch file has $BATCH_COUNT entries"
-        TRANSCRIBE_OK=true
-        case "$MODE" in
-            full|hybrid)
-                log "  Transcribing with Whisper API..."
-                python transforms/transcribe.py --batch data/transcribe-batch.json \
-                    >> data/transcribe.log 2>&1 || TRANSCRIBE_OK=false
-                ;;
-            local)
-                log "  Transcribing with faster-whisper (local)..."
-                python transforms/transcribe_local.py batch data/transcribe-batch.json \
-                    >> data/transcribe.log 2>&1 || TRANSCRIBE_OK=false
-                ;;
-        esac
-        if [ "$TRANSCRIBE_OK" = true ]; then
-            log "Transcription done."
+        # Filter batch to high-priority meetings only (unless --force)
+        BATCH_FILE="data/transcribe-batch.json"
+        if [ -z "$FORCE" ]; then
+            FILTERED_FILE="data/transcribe-batch-filtered.json"
+            python3 -c "
+import json
+batch = json.loads(open('$BATCH_FILE').read())
+high = [e for e in batch if e.get('priority', 'high') == 'high']
+low = [e for e in batch if e.get('priority') == 'low']
+if low:
+    print(f'  Skipping {len(low)} low-priority meetings (use --force to include all)')
+open('$FILTERED_FILE', 'w').write(json.dumps(high, indent=2))
+print(f'  {len(high)} high-priority meetings to transcribe')
+" >> data/transcribe.log 2>&1
+            BATCH_FILE="$FILTERED_FILE"
+        fi
+        BATCH_COUNT=$(python3 -c "import json; b=json.loads(open('$BATCH_FILE').read()); print(len(b))" 2>/dev/null || echo 0)
+        log "  Transcribing $BATCH_COUNT meetings"
+        if [ "$BATCH_COUNT" -gt 0 ] 2>/dev/null; then
+            TRANSCRIBE_OK=true
+            case "$MODE" in
+                full|hybrid)
+                    log "  Transcribing with Whisper API..."
+                    python3 transforms/transcribe.py --batch "$BATCH_FILE" \
+                        >> data/transcribe.log 2>&1 || TRANSCRIBE_OK=false
+                    ;;
+                local)
+                    log "  Transcribing with faster-whisper (local)..."
+                    python3 transforms/transcribe_local.py batch "$BATCH_FILE" \
+                        >> data/transcribe.log 2>&1 || TRANSCRIBE_OK=false
+                    ;;
+            esac
+            if [ "$TRANSCRIBE_OK" = true ]; then
+                log "Transcription done."
+            else
+                log "Transcription failed — continuing with extraction."
+            fi
         else
-            log "Transcription failed — continuing with extraction."
+            log "  No high-priority meetings to transcribe."
         fi
     fi
 fi
@@ -156,17 +269,27 @@ fi
 # ── S3 sync: raw sources ──
 if [ -n "${S3_BUCKET:-}" ]; then
     log "Syncing raw sources to S3..."
-    sync_to_s3 "archive/documents/pdfs" "data/documents" "STANDARD" --exclude "*.txt" --exclude "*.skip" --exclude "*.json"
-    sync_to_s3 "raw/documents/txt" "data/documents" "STANDARD_IA" --exclude "*.pdf" --exclude "*.skip" --exclude "*.json"
+    # Per-agency documents and meetings
+    while IFS='|' read -r SLUG _; do
+        if [ -d "data/${SLUG}/documents" ]; then
+            sync_to_s3 "archive/${SLUG}/documents/pdfs" "data/${SLUG}/documents" "STANDARD" --exclude "*.txt" --exclude "*.skip" --exclude "*.json"
+            sync_to_s3 "raw/${SLUG}/documents/txt" "data/${SLUG}/documents" "STANDARD_IA" --exclude "*.pdf" --exclude "*.skip" --exclude "*.json"
+        fi
+        if [ -d "data/${SLUG}/meetings" ]; then
+            sync_to_s3 "metadata/${SLUG}/meetings" "data/${SLUG}/meetings" "STANDARD"
+        fi
+        if [ -d "data/${SLUG}/permits" ]; then
+            sync_to_s3 "operational/${SLUG}/permits" "data/${SLUG}/permits" "STANDARD"
+        fi
+    done < <(python3 -c "
+import yaml
+cfg = yaml.safe_load(open('agencies.yaml'))
+for slug, a in cfg['agencies'].items():
+    if a.get('enabled', True):
+        print(f\"{slug}|{a.get('name', slug)}\")
+")
+    # Shared resources
     sync_to_s3 "archive/audio" "data/audio" "STANDARD"
-    sync_to_s3 "archive/nctd/documents/pdfs" "data/nctd/documents" "STANDARD" --exclude "*.txt" --exclude "*.skip"
-    sync_to_s3 "raw/nctd/documents/txt" "data/nctd/documents" "STANDARD_IA" --exclude "*.pdf" --exclude "*.skip"
-    sync_to_s3 "metadata/meetings" "data/meetings" "STANDARD"
-    sync_to_s3 "metadata/nctd/meetings" "data/nctd/meetings" "STANDARD"
-    sync_to_s3 "metadata/sandag/meetings" "data/sandag" "STANDARD"
-    sync_to_s3 "metadata/sdcounty/meetings" "data/sdcounty" "STANDARD"
-    sync_to_s3 "metadata/coastal/meetings" "data/coastal" "STANDARD"
-    sync_to_s3 "operational/permits" "data/permits" "STANDARD"
     sync_to_s3 "operational/intel" "data/intel" "STANDARD"
     sync_to_s3 "raw/transcripts" "data/transcripts" "STANDARD_IA"
     log "S3 sync (raw) done."
@@ -178,12 +301,12 @@ fi
 
 # ── 2a: Merge per-document records into per-meeting records ──
 log "Merging per-meeting records..."
-python transforms/meeting_merge.py >> data/meeting-merge.log 2>&1
+python3 transforms/meeting_merge.py >> data/meeting-merge.log 2>&1
 log "Meeting merge done."
 
 # ── 2b: Monthly rollups (auto-detects stale months) ──
 log "Building monthly digests..."
-python transforms/monthly_rollup.py >> data/monthly-rollup.log 2>&1
+python3 transforms/monthly_rollup.py >> data/monthly-rollup.log 2>&1
 log "Monthly rollups done."
 
 # ═══════════════════════════════════════════
@@ -197,11 +320,11 @@ EXTRACT_TIMESTAMP=$(mktemp)
 
 if [ -n "$EXTRACT_CUTOFF" ]; then
     log "Structured extraction until ${EXTRACT_CUTOFF}:00..."
-    python transforms/extract_structured.py --stop-at "$EXTRACT_CUTOFF" $FORCE >> data/structured-extraction.log 2>&1
+    python3 transforms/extract_structured.py --stop-at "$EXTRACT_CUTOFF" $FORCE >> data/structured-extraction.log 2>&1
     log "Extraction done."
 else
     log "Structured extraction (no time limit)..."
-    python transforms/extract_structured.py $FORCE >> data/structured-extraction.log 2>&1
+    python3 transforms/extract_structured.py $FORCE >> data/structured-extraction.log 2>&1
     log "Extraction done."
 fi
 
@@ -209,155 +332,14 @@ fi
 # canonical data layer. Agents read JSONL directly.
 
 # ═══════════════════════════════════════════
-# PHASE 4: NOTIFY — push notification if new extractions found
+# PHASE 4: SUMMARY
 # ═══════════════════════════════════════════
 
 EXTRACT_AFTER=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
 NEW_EXTRACTIONS=$((EXTRACT_AFTER - EXTRACT_BEFORE))
 
-NOTIFY_LOG="data/notified-meetings.log"
-touch "$NOTIFY_LOG"
-
 if [ "$NEW_EXTRACTIONS" -gt 0 ]; then
-    log "New extractions: $NEW_EXTRACTIONS. Checking for new meetings to notify..."
-
-    # Collect unique agency|body|date keys from ALL newly extracted files.
-    # Key: "agency|body|date" — deduped, 7-day recency window to skip backfill.
-    # Python does all the heavy lifting: dedup, recency, normalize body names.
-    MEETING_KEYS=$(find data/structured -name '*.json' -newer "$EXTRACT_TIMESTAMP" 2>/dev/null \
-        | xargs python3 -c "
-import json, sys, re
-from datetime import datetime
-seen = set()
-now = datetime.now()
-for path in sys.argv[1:]:
-    try:
-        r = json.load(open(path))
-        agency = r.get('agency', '').strip()
-        body = r.get('body', '').strip()
-        date = r.get('date', '').strip()
-        if not (agency and body and date and '-' in date):
-            continue
-        # Normalize: strip sub-body suffixes like '- Land Use'
-        body = re.sub(r'\s*-\s*(Land Use|Closed Session|Special).*', '', body)
-        meeting_dt = datetime.strptime(date, '%Y-%m-%d')
-        if abs((now - meeting_dt).days) > 7:
-            continue
-        key = f'{agency}|{body}|{date}'
-        if key not in seen:
-            seen.add(key)
-            print(key)
-    except:
-        pass
-" 2>/dev/null)
-
-    if [ -z "$MEETING_KEYS" ]; then
-        log "New extractions but no recent meetings found (backfill only)."
-    else
-        # Filter out already-notified meetings
-        NEW_MEETINGS=""
-        while IFS= read -r key; do
-            [ -z "$key" ] && continue
-            if ! grep -qxF "$key" "$NOTIFY_LOG" 2>/dev/null; then
-                NEW_MEETINGS="${NEW_MEETINGS}${key}
-"
-            fi
-        done <<< "$MEETING_KEYS"
-
-        # Trim trailing whitespace
-        NEW_MEETINGS=$(echo "$NEW_MEETINGS" | sed '/^$/d')
-
-        if [ -z "$NEW_MEETINGS" ]; then
-            log "All extracted meetings already notified. Skipping."
-        else
-            # Record BEFORE sending — prevents double-post on partial failure
-            echo "$NEW_MEETINGS" >> "$NOTIFY_LOG"
-
-            # Build human-readable meeting list (no LLM needed)
-            NOTIFY_MSG=$(echo "$NEW_MEETINGS" | while IFS='|' read -r agency body date; do
-                [ -z "$body" ] && continue
-                SHORT_DATE=$(python3 -c "
-parts='$date'.split('-')
-print(f'{int(parts[1])}/{int(parts[2])}')
-" 2>/dev/null)
-                echo "${body} ${SHORT_DATE}"
-            done | paste -sd', ' -)
-
-            if [ -n "$NOTIFY_MSG" ]; then
-                # Build detail line from the JSON records directly — no LLM call
-                DETAIL_MSG=$(echo "$NEW_MEETINGS" | python3 -c "
-import json, sys, glob, os
-from datetime import datetime
-
-# Parse target meetings
-targets = {}
-for line in sys.stdin:
-    parts = line.strip().split('|')
-    if len(parts) == 3:
-        targets[(parts[0], parts[1], parts[2])] = []
-
-# Find matching records from recently modified files
-for path in sorted(glob.glob('data/structured/*.json'), key=os.path.getmtime, reverse=True)[:100]:
-    try:
-        r = json.load(open(path))
-        agency = r.get('agency', '').strip()
-        body = r.get('body', '').strip()
-        import re
-        body = re.sub(r'\s*-\s*(Land Use|Closed Session|Special).*', '', body)
-        date = r.get('date', '').strip()
-        key = (agency, body, date)
-        if key in targets:
-            for h in r.get('housing_items', []):
-                desc = h.get('description', '')[:60]
-                if desc:
-                    targets[key].append(desc)
-            for v in r.get('votes', []):
-                item = v.get('item', '')[:60]
-                if item and ('hous' in item.lower() or 'zone' in item.lower() or 'density' in item.lower()):
-                    targets[key].append(item)
-    except:
-        pass
-
-# Format output
-parts_out = []
-for (agency, body, date), items in targets.items():
-    d = date.split('-')
-    short = f'{int(d[1])}/{int(d[2])}'
-    unique_items = list(dict.fromkeys(items))[:3]
-    if unique_items:
-        parts_out.append(f'{body} {short}: ' + ', '.join(unique_items))
-    else:
-        score = 'neutral'
-        # Check advocacy score
-        for path in sorted(glob.glob('data/structured/*.json'), key=os.path.getmtime, reverse=True)[:50]:
-            try:
-                r = json.load(open(path))
-                if r.get('agency','').strip() == agency and r.get('date','').strip() == date:
-                    score = r.get('advocacy_score', 'neutral')
-                    break
-            except: pass
-        parts_out.append(f'{body} {short} (scored {score}, zero housing items)')
-
-print('; '.join(parts_out)[:400])
-" 2>/dev/null) || true
-
-                if [ -z "$DETAIL_MSG" ]; then
-                    DETAIL_MSG="$NOTIFY_MSG"
-                fi
-
-                log "Notifying: $DETAIL_MSG"
-
-                # Discord webhook
-                if [ -n "${DISCORD_WEBHOOK_URL:-}" ]; then
-                    curl -s -H "Content-Type: application/json" \
-                        -d "$(jq -n --arg msg "$DETAIL_MSG" '{content: $msg}')" \
-                        "$DISCORD_WEBHOOK_URL" >> data/pipeline-notify.log 2>&1 || true
-                fi
-
-                log "Notified: $DETAIL_MSG"
-            fi
-        fi
-    fi
+    log "New extractions: $NEW_EXTRACTIONS."
 else
     log "No new extractions."
 fi
@@ -380,7 +362,7 @@ fi
 # ═══════════════════════════════════════════
 
 log "Running pipeline doctor..."
-python pipeline_doctor.py >> data/pipeline-doctor-run.log 2>&1
+python3 pipeline_doctor.py >> data/pipeline-doctor-run.log 2>&1
 log "Doctor done."
 
 # ═══════════════════════════════════════════
@@ -391,11 +373,11 @@ log "Doctor done."
 
 EXEC_MODE="$SUMMARIZER"
 log "Running executive summaries (mode: $EXEC_MODE)..."
-python analysis/executive_summaries.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
+python3 analysis/executive_summaries.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
 log "Executive summaries done."
 
 log "Running leadership profiles (mode: $EXEC_MODE)..."
-python analysis/leadership_profiles.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
+python3 analysis/leadership_profiles.py --mode "$EXEC_MODE" >> data/pipeline.log 2>&1
 log "Leadership profiles done."
 
 log "Pipeline complete."

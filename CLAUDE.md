@@ -1,5 +1,10 @@
 # Agent Instructions
 
+## Related Projects
+- `stoside.data`: municipal fiscal intelligence, budget/CIP/vote history
+- `agent-knowledge-docs`: engineering patterns KB
+- `policy-knowledge-docs`: policy analysis KB
+
 ## Engineering Knowledge Base
 For engineering tasks (infrastructure, deployment, testing patterns, cloud services, frameworks), fetch KB content before planning.
 

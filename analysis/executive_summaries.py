@@ -25,10 +25,9 @@ if ENV_FILE.exists():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-from civic_utils import claude_local_call
+from civic_utils import claude_local_call, all_meetings_dirs
 
 DATA_DIR = REPO_ROOT / "data"
-MEETINGS_DIR = DATA_DIR / "meetings"
 SUMMARIES_DIR = DATA_DIR / "summaries"
 STRUCTURED_DIR = DATA_DIR / "structured"
 MERGED_DIR = STRUCTURED_DIR / "meetings"
@@ -76,24 +75,25 @@ def call_claude(prompt, max_tokens=2000):
 def load_summaries_by_year():
     """Load prose summaries grouped by year and body."""
     meeting_info = {}
-    for mdir in MEETINGS_DIR.iterdir():
-        mf = mdir / "meeting.json"
-        if not mf.exists():
-            continue
-        m = json.loads(mf.read_text())
-        date = m.get("date", "")
-        body = m.get("body", m.get("EventBodyName", ""))
-        year = None
-        for fmt in ["%m/%d/%Y", "%Y-%m-%d"]:
-            try:
-                dt = datetime.strptime(
-                    date.split("T")[0] if "T" in date else date, fmt
-                )
-                year = dt.year
-                break
-            except ValueError:
-                pass
-        meeting_info[mdir.name] = {"date": date, "body": body, "year": year}
+    for meetings_dir in all_meetings_dirs():
+        for mdir in meetings_dir.iterdir():
+            mf = mdir / "meeting.json"
+            if not mf.exists():
+                continue
+            m = json.loads(mf.read_text())
+            date = m.get("date", "")
+            body = m.get("body", m.get("EventBodyName", ""))
+            year = None
+            for fmt in ["%m/%d/%Y", "%Y-%m-%d"]:
+                try:
+                    dt = datetime.strptime(
+                        date.split("T")[0] if "T" in date else date, fmt
+                    )
+                    year = dt.year
+                    break
+                except ValueError:
+                    pass
+            meeting_info[mdir.name] = {"date": date, "body": body, "year": year}
 
     by_year = defaultdict(lambda: defaultdict(list))
     for sf in sorted(SUMMARIES_DIR.glob("*-summary.md")):

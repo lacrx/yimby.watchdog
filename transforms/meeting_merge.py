@@ -32,9 +32,11 @@ from collections import defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+from civic_utils import all_docs_dirs
+
 DATA_DIR = REPO_ROOT / "data"
 STRUCTURED_DIR = DATA_DIR / "structured"
-DOCS_DIR = DATA_DIR / "documents"
 MERGED_DIR = STRUCTURED_DIR / "meetings"
 MERGED_JSONL = STRUCTURED_DIR / "meetings-combined.jsonl"
 STATE_FILE = STRUCTURED_DIR / "meetings-state.json"
@@ -118,9 +120,7 @@ def scan_document_dates():
     Returns dict mapping filename stem to ISO date string.
     """
     dates = {}
-    for docs_dir in [DOCS_DIR, DATA_DIR / "nctd" / "documents"]:
-        if not docs_dir.exists():
-            continue
+    for docs_dir in all_docs_dirs():
         for f in docs_dir.glob("*.txt"):
             try:
                 text = f.read_text(errors="replace")

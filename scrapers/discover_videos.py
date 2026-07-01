@@ -29,10 +29,10 @@ from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+from civic_utils import all_meetings_dirs, load_agencies
 
 DATA_DIR = REPO_ROOT / "data"
-MEETINGS_DIR = DATA_DIR / "meetings"
-NCTD_MEETINGS_DIR = DATA_DIR / "nctd" / "meetings"
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 BATCH_FILE = DATA_DIR / "transcribe-batch.json"
 
@@ -40,6 +40,22 @@ PLAYLISTS = {
     "City Council": "PLUunlla2QsxHz0ZCuVvsi-xwpm6tZiGMN",
     "Planning Commission": "PLUunlla2QsxGU8lQ-GUqresB-pzfcXYhA",
 }
+
+# Bodies whose meetings always warrant transcription
+HIGH_PRIORITY_BODIES = {
+    "city council", "planning commission", "board of directors",
+    "board of supervisors",
+}
+
+# Keywords in agenda text that escalate a meeting to high priority
+SENSITIVITY_KEYWORDS = [
+    "housing", "rezone", "rezoning", "zoning", "density", "affordable",
+    "general plan", "specific plan", "ADU", "accessory dwelling",
+    "CEQA", "environmental", "eminent domain",
+    "SB 79", "SB 330", "density bonus", "RHNA", "Builder's Remedy",
+    "transit-oriented", "LCP", "Coastal Commission",
+    "budget", "tax", "fee increase",
+]
 
 DATE_PATTERNS = [
     r"(\w+ \d{1,2},? \d{4})",          # "May 20, 2026" or "May 20 2026"
@@ -107,7 +123,9 @@ def load_meetings():
     """Load all meeting metadata with dates parsed."""
     meetings = {}
 
-    for meetings_dir, agency in [(MEETINGS_DIR, "oceanside"), (NCTD_MEETINGS_DIR, "nctd")]:
+    agencies = load_agencies()
+    for slug in agencies:
+        meetings_dir = DATA_DIR / slug / "meetings"
         if not meetings_dir.exists():
             continue
         for mdir in meetings_dir.iterdir():
@@ -131,7 +149,7 @@ def load_meetings():
                 "date": dt,
                 "date_str": date_str,
                 "body": m.get("body", ""),
-                "agency": agency,
+                "agency": slug,
                 "video_url": m.get("video_url"),
             }
 
@@ -142,6 +160,39 @@ def already_transcribed(meeting_id):
     """Check if a meeting already has a transcript."""
     txt = TRANSCRIPTS_DIR / f"{meeting_id}-transcript.txt"
     return txt.exists() and txt.stat().st_size > 0
+
+
+def score_priority(meeting_info):
+    """Score a meeting's transcription priority. Returns 'high' or 'low'."""
+    body = (meeting_info.get("body") or "").lower()
+
+    # High-priority bodies always get transcribed
+    if any(hpb in body for hpb in HIGH_PRIORITY_BODIES):
+        return "high"
+
+    # Check agenda text for sensitivity keywords
+    mid = meeting_info.get("id", "")
+    agency = meeting_info.get("agency", "")
+    search_dirs = []
+    if agency:
+        search_dirs.append(DATA_DIR / agency / "documents")
+    else:
+        for d in DATA_DIR.iterdir():
+            if (d / "documents").is_dir():
+                search_dirs.append(d / "documents")
+    for docs_dir in search_dirs:
+        if not docs_dir.exists():
+            continue
+        for txt_file in docs_dir.glob(f"{mid}*.txt"):
+            try:
+                text = txt_file.read_text(errors="ignore").lower()
+                hits = sum(1 for kw in SENSITIVITY_KEYWORDS if kw.lower() in text)
+                if hits >= 2:
+                    return "high"
+            except Exception:
+                continue
+
+    return "low"
 
 
 def load_existing_batch():
@@ -205,12 +256,14 @@ def discover_all(args):
             if not args.force and already_transcribed(mid):
                 continue
 
+            priority = score_priority(match)
             entry = {
                 "meeting_id": mid,
                 "date": match["date_str"],
                 "body": match["body"],
                 "url": video["url"],
                 "title": video["title"],
+                "priority": priority,
             }
             new_entries.append(entry)
             existing_ids.add(mid)
@@ -231,11 +284,13 @@ def discover_all(args):
         if not args.force and already_transcribed(mid):
             continue
 
+        priority = score_priority(m)
         entry = {
             "meeting_id": mid,
             "date": m["date_str"],
             "body": m["body"],
             "url": m["video_url"],
+            "priority": priority,
         }
         new_entries.append(entry)
         existing_ids.add(mid)

@@ -23,22 +23,16 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-DATA_DIR = Path(__file__).parent / "data"
-DOCS_DIR = DATA_DIR / "documents"
-NCTD_DOCS_DIR = DATA_DIR / "nctd" / "documents"
-SDCOUNTY_DIR = DATA_DIR / "sdcounty"
-COASTAL_DIR = DATA_DIR / "coastal"
+REPO_ROOT = Path(__file__).parent
+sys.path.insert(0, str(REPO_ROOT))
+from civic_utils import load_agencies, all_docs_dirs, agency_data_dir
+
+DATA_DIR = REPO_ROOT / "data"
 STRUCTURED_DIR = DATA_DIR / "structured"
 DIAGNOSIS_LOG = DATA_DIR / "pipeline-doctor.jsonl"
 EXTRACTION_LOG = DATA_DIR / "structured-extraction.log"
 PIPELINE_LOG = DATA_DIR / "pipeline-cron.log"
 NOTIFY_LOG = DATA_DIR / "pipeline-notify.log"
-OCEANSIDE_LOG = DATA_DIR / "watch.log"
-NCTD_LOG = DATA_DIR / "nctd-watch.log"
-SANDAG_LOG = DATA_DIR / "sandag-watch.log"
-SDCOUNTY_LOG = DATA_DIR / "sdcounty-watch.log"
-COASTAL_LOG = DATA_DIR / "coastal-watch.log"
-PERMITS_LOG = DATA_DIR / "permits" / "fetch.log"
 
 SAFE_SKIP_REASONS = {
     "repeated_auth_blocker": "File blocks extraction repeatedly via auth errors on chunking",
@@ -125,15 +119,49 @@ def get_pipeline_errors(log_lines):
         "failed_phases": [],
         "zero_extraction_runs": 0,
         "last_productive_run": None,
+        "timed_out_phases": [],
+        "command_not_found": [],
+        "overlapping_runs": [],
+        "phase_durations": [],
     }
 
     current_date = None
+    last_start = None
+    last_complete = None
+    phase_start = None
+    phase_label = None
+
     for line in log_lines:
         line = line.strip()
+
+        ts_m = re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]', line)
+        ts = None
+        if ts_m:
+            try:
+                ts = datetime.strptime(ts_m.group(1), '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                pass
 
         date_m = re.match(r'\[(\d{4}-\d{2}-\d{2})', line)
         if date_m:
             current_date = date_m.group(1)
+
+        if "Starting civic pipeline" in line and ts:
+            if last_start and not last_complete:
+                errors["overlapping_runs"].append(
+                    f"Run started {ts_m.group(1)} while previous run (started {last_start.strftime('%Y-%m-%d %H:%M')}) never completed"
+                )
+            last_start = ts
+            last_complete = None
+
+        if "Pipeline complete" in line and ts:
+            last_complete = ts
+
+        if "timed out" in line:
+            errors["timed_out_phases"].append(line)
+
+        if "command not found" in line:
+            errors["command_not_found"].append(line)
 
         if "Terminated" in line:
             errors["terminated_phases"].append(current_date or "unknown")
@@ -146,6 +174,22 @@ def get_pipeline_errors(log_lines):
 
         if re.search(r'New extractions: \d+', line):
             errors["last_productive_run"] = current_date
+
+        # Track phase durations
+        fetch_start_m = re.search(r'Fetching (.+?)\.\.\.', line)
+        if fetch_start_m and ts:
+            if phase_start and phase_label:
+                duration = (ts - phase_start).total_seconds()
+                errors["phase_durations"].append((phase_label, duration, phase_start.strftime('%Y-%m-%d')))
+            phase_label = fetch_start_m.group(1)
+            phase_start = ts
+
+        fetch_done_m = re.search(r'(.+?) fetch done', line) or re.search(r'(.+?) done', line)
+        if fetch_done_m and ts and phase_start:
+            duration = (ts - phase_start).total_seconds()
+            errors["phase_durations"].append((phase_label or fetch_done_m.group(1), duration, phase_start.strftime('%Y-%m-%d')))
+            phase_start = None
+            phase_label = None
 
     return errors
 
@@ -183,9 +227,7 @@ def find_blocking_files():
 def find_oversized_files():
     """Find source files that are too large and likely not meeting content."""
     oversized = []
-    for docs_dir in [DOCS_DIR, NCTD_DOCS_DIR]:
-        if not docs_dir.exists():
-            continue
+    for docs_dir in all_docs_dirs():
         for f in docs_dir.glob("*.txt"):
             if f.stat().st_size > MAX_SOURCE_SIZE_FOR_SKIP:
                 skip_path = f.with_suffix(f.suffix + ".skip")
@@ -219,9 +261,9 @@ def check_auth_health():
 
 def count_remaining():
     """Count files still needing extraction."""
-    sources = list(DOCS_DIR.glob("*.txt"))
-    if NCTD_DOCS_DIR.exists():
-        sources += list(NCTD_DOCS_DIR.glob("*.txt"))
+    sources = []
+    for docs_dir in all_docs_dirs():
+        sources += list(docs_dir.glob("*.txt"))
 
     extracted = set(f.stem for f in STRUCTURED_DIR.glob("*.json"))
     remaining = []
@@ -278,6 +320,9 @@ def diagnose(dry_run=False):
         "last_productive_run": pipe_errors["last_productive_run"],
         "blocking_files": len(blockers),
         "oversized_files": len(oversized),
+        "timed_out_phases": len(pipe_errors["timed_out_phases"]),
+        "overlapping_runs": len(pipe_errors["overlapping_runs"]),
+        "command_not_found": len(pipe_errors["command_not_found"]),
     }
 
     print(f"  Remaining files:     {len(remaining)}")
@@ -291,10 +336,13 @@ def diagnose(dry_run=False):
     if blockers:
         for fname, count in blockers:
             # Check if already skipped
-            source_path = DOCS_DIR / fname
-            if not source_path.exists():
-                source_path = NCTD_DOCS_DIR / fname
-            skip_path = source_path.with_suffix(source_path.suffix + ".skip") if source_path.exists() else None
+            source_path = None
+            for docs_dir in all_docs_dirs():
+                candidate = docs_dir / fname
+                if candidate.exists():
+                    source_path = candidate
+                    break
+            skip_path = source_path.with_suffix(source_path.suffix + ".skip") if source_path else None
 
             if skip_path and skip_path.exists():
                 continue  # already handled
@@ -303,7 +351,7 @@ def diagnose(dry_run=False):
             diagnosis["findings"].append(finding)
             print(f"  FINDING: {finding}")
 
-            if not dry_run and source_path.exists() and skip_path:
+            if not dry_run and source_path and source_path.exists() and skip_path:
                 skip_path.write_text(json.dumps({
                     "reason": "repeated_auth_blocker",
                     "skipped_at": now.isoformat(),
@@ -360,7 +408,14 @@ def diagnose(dry_run=False):
 
     # ─── Finding: NCTD/SANDAG fetch errors ───
 
-    for label, log_path in [("Oceanside", OCEANSIDE_LOG), ("NCTD", NCTD_LOG), ("SANDAG", SANDAG_LOG), ("SD County", SDCOUNTY_LOG), ("Coastal Commission", COASTAL_LOG), ("eTRAKiT permits", PERMITS_LOG)]:
+    agency_logs = []
+    for slug, config in load_agencies().items():
+        log_path = agency_data_dir(slug) / "watch.log"
+        agency_logs.append((config.get("name", slug), log_path))
+        permits_log = agency_data_dir(slug) / "permits" / "fetch.log"
+        if permits_log.exists():
+            agency_logs.append((f"{config.get('name', slug)} permits", permits_log))
+    for label, log_path in agency_logs:
         log_lines_agency = read_tail(log_path, 100)
         agency_errors = [l.strip() for l in log_lines_agency if "error" in l.lower() or "failed" in l.lower() or "Traceback" in l]
         if agency_errors:
@@ -369,6 +424,43 @@ def diagnose(dry_run=False):
             print(f"  FINDING: {finding}")
             for e in agency_errors[-3:]:
                 print(f"    {e[:120]}")
+
+    # ─── Finding: Timed-out phases ───
+
+    if pipe_errors["timed_out_phases"]:
+        for phase_line in pipe_errors["timed_out_phases"][-5:]:
+            finding = f"Phase timed out: {phase_line[:120]}"
+            diagnosis["findings"].append(finding)
+            print(f"  FINDING: {finding}")
+        diagnosis["recommendations"].append(
+            "Scraper phase exceeded 30min timeout — check if site is slow or scraper is re-fetching old data"
+        )
+
+    # ─── Finding: Command not found ───
+
+    if pipe_errors["command_not_found"]:
+        finding = f"'command not found' errors ({len(pipe_errors['command_not_found'])}x) — check civic-pipeline uses python3"
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+
+    # ─── Finding: Overlapping runs ───
+
+    if pipe_errors["overlapping_runs"]:
+        for overlap in pipe_errors["overlapping_runs"][-3:]:
+            finding = f"Overlapping run: {overlap}"
+            diagnosis["findings"].append(finding)
+            print(f"  FINDING: {finding}")
+
+    # ─── Finding: Slow phases ───
+
+    PHASE_DURATION_WARN = 1200  # 20 min
+    slow_phases = [(label, dur, date) for label, dur, date in pipe_errors["phase_durations"]
+                   if dur > PHASE_DURATION_WARN]
+    if slow_phases:
+        for label, dur, date in slow_phases[-5:]:
+            finding = f"Slow phase: {label} took {dur/60:.0f}min on {date}"
+            diagnosis["findings"].append(finding)
+            print(f"  FINDING: {finding}")
 
     # ─── Finding: Stalled pipeline ───
 

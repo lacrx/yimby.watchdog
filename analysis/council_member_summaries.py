@@ -27,13 +27,9 @@ if ENV_FILE.exists():
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
-from civic_utils import claude_local_call
+from civic_utils import claude_local_call, all_meetings_dirs
 
 DATA_DIR = REPO_ROOT / "data"
-MEETINGS_DIR = DATA_DIR / "meetings"
-SUMMARIES_DIR = DATA_DIR / "summaries"
-NCTD_SUMMARIES_DIR = DATA_DIR / "nctd" / "summaries"
-NCTD_MEETINGS_DIR = DATA_DIR / "nctd" / "meetings"
 STRUCTURED_DIR = DATA_DIR / "structured"
 MERGED_DIR = STRUCTURED_DIR / "meetings"
 OUTPUT_DIR = DATA_DIR / "executive-summaries" / "council-members"
@@ -150,9 +146,7 @@ COUNCIL_MEMBERS = {
 
 def load_meeting_info():
     info = {}
-    for meetings_dir in [MEETINGS_DIR, NCTD_MEETINGS_DIR]:
-        if not meetings_dir.exists():
-            continue
+    for meetings_dir in all_meetings_dirs():
         for mdir in meetings_dir.iterdir():
             mf = mdir / "meeting.json"
             if not mf.exists():
@@ -195,9 +189,8 @@ def collect_member_mentions(member_key, member_info, meeting_info):
     aliases = member_info["aliases"]
     by_year = defaultdict(list)
 
-    summary_dirs = [SUMMARIES_DIR]
-    if NCTD_SUMMARIES_DIR.exists():
-        summary_dirs.append(NCTD_SUMMARIES_DIR)
+    summary_dirs = [d.parent / "summaries" for d in all_meetings_dirs()
+                     if (d.parent / "summaries").exists()]
 
     for sdir in summary_dirs:
         for sf in sorted(sdir.glob("*-summary.md")):

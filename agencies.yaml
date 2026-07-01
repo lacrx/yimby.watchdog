@@ -1,0 +1,174 @@
+# Agency registry — one entry per monitored body.
+# Pipeline, scrapers, and transforms read this to discover agencies dynamically.
+#
+# Platform types:
+#   legistar_html   — Legistar Calendar.aspx HTML scraping
+#   legistar_odata  — Legistar OData REST API (webapi.legistar.com)
+#   escribe         — eScribe JSON API
+#   granicus        — Granicus Publisher RSS + AgendaViewer
+#   civicplus       — CivicPlus AgendaCenter HTML
+#   civicclerk      — CivicClerk OData API (Events endpoint)
+#   carlsbad_cms    — CivicPlus CMS folders behind Akamai WAF (curl only)
+#   solana_drupal   — Drupal Views + eScribe dual-source
+#   coastal_api     — CA Coastal Commission JSON API
+#   custom_html     — Custom HTML scraping (one-off sites)
+#
+# lookback_months: overrides pipeline --years for this agency.
+#   Omit for full historical lookback (Oceanside).
+#   Set to 2-3 for forward-only monitoring of new cities.
+
+agencies:
+
+  # ── North County Coastal ──────────────────────────────────────────
+
+  oceanside:
+    name: City of Oceanside
+    region: north_county_coastal
+    platform: legistar_html
+    base_url: https://oceanside.legistar.com
+    bodies:
+      - City Council
+      - Planning Commission
+      - Housing Commission
+      - Manufactured Home Fair Practices Commission
+      - Downtown Advisory Committee
+      - Historic Preservation Advisory Commission
+      - Economic Development Commission
+      - Utilities Commission
+      - Harbor and Beaches Advisory Committee
+      - Citizen Investment Oversight Committee
+      - Measure X Citizen Oversight Committee
+    deep_fetch: true
+    permits:
+      platform: etrakit
+      base_url: https://etrakit.cityofoceanside.com/etrakit3
+    enabled: true
+
+  carlsbad:
+    name: City of Carlsbad
+    region: north_county_coastal
+    platform: carlsbad_cms
+    base_url: https://www.carlsbadca.gov
+    lookback_months: 2
+    bodies:
+      - City Council
+      - Planning Commission
+      - Housing Commission
+      - Arts Commission
+      - Historic Preservation Commission
+      - Environmental Sustainability Commission
+      - Parks & Recreation Commission
+      - Library Board of Trustees
+      - Senior Commission
+      - Traffic Safety & Mobility Commission
+      - Community-Police Engagement Commission
+    deep_fetch: false
+    enabled: true  # WAF bypass via browser headers; fragile — preflight monitors
+
+  encinitas:
+    name: City of Encinitas
+    region: north_county_coastal
+    platform: granicus
+    base_url: https://encinitas.granicus.com
+    view_id: 7
+    lookback_months: 2
+    bodies: []  # all bodies in view
+    deep_fetch: false
+    enabled: true
+
+  solana_beach:
+    name: City of Solana Beach
+    region: north_county_coastal
+    platform: solana_drupal
+    base_url: https://cityofsolanabeach.ca.gov
+    escribe_base: https://pub-solanabeach.escribemeetings.com
+    lookback_months: 2
+    bodies:
+      - City Council
+      - Budget & Finance
+      - School Relations Committee
+      - Climate & Resiliency
+      - Parks and Recreation Commission
+      - Public Arts Advisory Commission
+    deep_fetch: false
+    enabled: true
+
+  del_mar:
+    name: City of Del Mar
+    region: north_county_coastal
+    platform: civicplus
+    base_url: https://www.delmar.ca.us
+    lookback_months: 2
+    bodies:
+      - City Council
+      - Planning Commission
+      - Design Review Board
+      - Finance Committee
+      - Administrative Hearings
+      - CPP - Citizens' Participation Program
+      - Lagoon Committee
+      - Parks & Recreation Committee
+      - Sustainability Advisory Committee
+      - Traffic & Parking Advisory Committee
+      - Undergrounding Program Advisory Committee
+      - Measure Q Citizen Oversight Committee
+    deep_fetch: false
+    enabled: true
+
+  # ── Regional / Transit ────────────────────────────────────────────
+
+  nctd:
+    name: North County Transit District
+    region: transit
+    platform: custom_html
+    base_url: https://gonctd.com/boardagenda/
+    lookback_months: 2
+    bodies:
+      - Board of Directors
+      - FAST Planning Committee
+    deep_fetch: false
+    enabled: true
+
+  sandag:
+    name: SANDAG
+    region: transit
+    platform: escribe
+    base_url: https://pub-sandag.escribemeetings.com
+    lookback_months: 3
+    bodies:
+      - Board of Directors
+      - Regional Planning Committee
+      - Transportation Committee
+    deep_fetch: false
+    enabled: true
+
+  # ── County / State ────────────────────────────────────────────────
+
+  sdcounty:
+    name: County of San Diego
+    region: county
+    platform: legistar_odata
+    api_base: https://webapi.legistar.com/v1/sdcounty
+    lookback_months: 3
+    bodies:
+      181: Board of Supervisors
+      138: Board of Supervisors - Land Use
+    deep_fetch: false
+    enabled: true
+
+  coastal:
+    name: California Coastal Commission
+    region: state
+    platform: coastal_api
+    api_base: https://api.coastal.ca.gov/agendas/v1
+    lookback_months: 3
+    sd_district_classes:
+      - san-diego
+    watch_keywords:
+      - Oceanside
+      - LCPA
+      - LCP Amendment
+      - North County
+      - San Luis Rey
+    deep_fetch: false
+    enabled: true
