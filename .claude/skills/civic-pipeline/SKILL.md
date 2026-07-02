@@ -71,8 +71,7 @@ meetings-combined.jsonl
         ▼  transforms/monthly_rollup.py (no LLM — merges meetings + permits + intel)
 monthly-digests.jsonl
         │
-        ├──► analysis/executive_summaries.py (reads monthly digests)
-        └──► analysis/council_member_summaries.py (reads per-record for full attribution)
+        └──► yimby.analysis repo (reads monthly digests + per-record for summaries/profiles)
 ```
 
 Monthly digests are independent — each month has a content hash computed from all its inputs (meetings, permits, intel). A month only rebuilds when its hash changes.
@@ -86,8 +85,6 @@ Each source document becomes a JSON record with:
 - `fiscal_items[]` — description, amount, type
 - `legal_flags[]` — potential violations, enforcement actions
 - `council_positions[]` — member, stance, evidence
-- `advocacy_score` — green/yellow/red/neutral
-
 Monthly digests add:
 
 - `permits` — total, estimated_units, by_type, by_status (SFD/duplex, multifamily, ADU only)
@@ -114,14 +111,7 @@ python transforms/monthly_rollup.py --force
 # Monthly stats table
 python transforms/monthly_rollup.py --stats
 
-# Generate executive summaries (reads monthly digests, default)
-python analysis/executive_summaries.py
-
-# Generate council member profiles (reads per-record data)
-python analysis/council_member_summaries.py
-
 # Query structured data
-jq 'select(.advocacy_score == "red")' data/structured/all-records.jsonl
 jq 'select(.council_positions[].member == "Joyce")' data/structured/all-records.jsonl
 ```
 
@@ -153,17 +143,13 @@ civic-pipeline (bash wrapper, cron entry point)
 │   ├── monthly_rollup.py → monthly-digests.jsonl (meetings + permits + intel)
 │   ├── extract_structured.py → data/structured/*.json (newest first, stops at cutoff)
 │   ├── transcribe.py | transcribe_local.py → data/transcripts/
-│   └── S3 sync → s3://civics-monitor-*/
-├── analysis/
-│   ├── executive_summaries.py (reads monthly digests)
-│   ├── leadership_profiles.py (reads per-record + monthly)
-│   └── update_skill_intel.py → .claude/skills/ca-housing-law/recent-developments.md
+│   └── S3 sync → s3://yimby-watchdog-data/
 └── pipeline_doctor.py → data/pipeline-doctor.jsonl (post-run diagnostics)
 ```
 
 ## S3 Backup
 
-Raw sources and structured data sync to S3 each run. PDFs are archived there — local only keeps `.txt` files. Set `S3_BUCKET` in `.env` to enable; pipeline runs fine without it.
+Raw sources and structured data sync to S3 each run. PDFs are archived there — local only keeps `.txt` files. Set `WATCHDOG_S3_BUCKET` in `.env` to enable; pipeline runs fine without it.
 
 ## Pipeline Doctor
 

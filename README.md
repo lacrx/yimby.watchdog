@@ -18,10 +18,9 @@ This stack does:
 4. **Extracts** structured records from every document — votes, motions, fiscal impacts, housing items — into machine-readable JSONL
 5. **Rolls up** all data sources (meetings + permits + intel) into independent monthly digests with content-hash change detection
 6. **Monitors** RSS feeds and web pages from housing enforcement orgs, state agencies, transit agencies, and local journalism for items relevant to the city
-7. **Generates** per-council-member advocacy profiles graded on housing votes, yearly executive summaries, legal exposure analyses, and issue-specific deep dives
-8. **Archives** raw sources to S3, keeping only working data (text + structured records) local
+7. **Archives** raw sources to S3, keeping only working data (text + structured records) local
 
-The output is structured data and analysis that turns years of meeting records into accountability tools — the kind of institutional memory that usually only exists in a reporter's notebook or a lobbyist's CRM.
+The output is structured data that turns years of meeting records into accountability tools. Downstream analysis (executive summaries, council member profiles, leadership grading) lives in `yimby.analysis`.
 
 ## Data Flow
 
@@ -64,18 +63,7 @@ transforms/
                                            ▼
                                   data/structured/monthly/*.json
 
-analysis/
-                                           │
-                                   ┌───────┴──────────┐
-                                   ▼                  ▼
-                            executive_          leadership_
-                            summaries.py        profiles.py
-                                   │                  │
-                                   ▼                  ▼
-                             yearly executive   per-member profiles
-                             summaries (.md)    with grades (.md)
-
-S3 (civics-monitor bucket)
+S3 (yimby-watchdog-data bucket)
   ├── archive/    PDFs + audio (durable archive)
   ├── raw/        extracted text + transcripts
   ├── structured/ records + meetings + monthly digests
@@ -161,8 +149,6 @@ Every raw source (PDF text, transcript) becomes a structured JSON record with ty
 - `fiscal_items[]` — description, amount, type
 - `legal_flags[]` — potential violations, enforcement actions
 - `council_positions[]` — member, stance, evidence
-- `advocacy_score` — green/yellow/red/neutral
-
 Per-document records merge into per-meeting records (majority-vote date/agency selection), then roll up into monthly digests alongside permit data and intel feed items. Each month is independent — rebuilds only when its content hash changes.
 
 ```bash
@@ -170,7 +156,6 @@ Per-document records merge into per-meeting records (majority-vote date/agency s
 python transforms/extract_structured.py --stats
 
 # Query with jq
-jq 'select(.advocacy_score == "red")' data/structured/all-records.jsonl
 jq 'select(.council_positions[].member == "Joyce")' data/structured/all-records.jsonl
 
 # Check which months need rebuild
@@ -190,8 +175,6 @@ python transforms/monthly_rollup.py --check
 
 **External Sources (17+ feeds):** State agencies (HCD, Attorney General, CCC), enforcement orgs (CalHDF, YIMBY Law, Californians for Homeownership), regional transit (SANDAG, NCTD), legal analysis (Holland & Knight), journalism (Voice of San Diego, CalMatters, Circulate SD).
 
-**Council Members Profiled (11):** Each profile includes a housing advocacy letter grade, net score, every recorded vote on housing-related items, factional analysis, and an assessment of the gap between stated goals and actual votes.
-
 ## Replicating This
 
 The stack works for any California city with a Legistar portal (most cities use one). The analysis layer — extraction, merge, rollups, summaries — is jurisdiction-agnostic.
@@ -206,15 +189,13 @@ The stack works for any California city with a Legistar portal (most cities use 
 
 4. **Point permits at your city.** `scrapers/oceanside.py permits` scrapes eTRAKiT. If your city uses a different permit portal, write a scraper that outputs the same JSONL format (`permit_no`, `type`, `status`, `applied`, `address`, `description`).
 
-5. **Set up S3 (optional).** Set `S3_BUCKET` in `.env`. The pipeline syncs automatically — raw sources, structured records, monthly digests. Without it, everything stays local.
+5. **Set up S3 (optional).** Set `WATCHDOG_S3_BUCKET` in `.env`. The pipeline syncs automatically — raw sources, structured records, monthly digests. Without it, everything stays local.
 
 ### What you keep as-is
 
 - `transforms/extract_structured.py` — structured extraction prompt is jurisdiction-agnostic
 - `transforms/meeting_merge.py` — merges by meeting_id, no city-specific logic
 - `transforms/monthly_rollup.py` — rolls up meetings + permits + intel by month
-- `analysis/executive_summaries.py` — reads monthly digests, no city-specific logic
-- `analysis/leadership_profiles.py` — reads per-record data, no city-specific logic
 - Policy knowledge base — CA housing law, fiscal analysis, crash data methodology (separate repo: `lacrx/policy-knowledge-docs`)
 
 ### What you need
@@ -238,7 +219,7 @@ pip install requests feedparser yt-dlp
 
 # 2. Configure
 cp .env.example .env
-# Edit .env — set S3_BUCKET if using AWS, otherwise leave empty
+# Edit .env — set WATCHDOG_S3_BUCKET if using AWS, otherwise leave empty
 
 # 3. Fetch meetings (current year, with staff reports)
 python scrapers/oceanside.py fetch --deep
@@ -252,13 +233,7 @@ python transforms/meeting_merge.py
 # 6. Build monthly digests (meetings + permits + intel)
 python transforms/monthly_rollup.py
 
-# 7. Generate executive summaries
-python analysis/executive_summaries.py
-
-# 8. Generate leadership profiles
-python analysis/leadership_profiles.py
-
-# 9. Set up nightly cron
+# 7. Set up nightly cron
 crontab -e
 # Add the two cron lines from the "Cron Setup" section above
 ```
@@ -287,17 +262,12 @@ yimby.watchdog/
 │   ├── monthly_rollup.py       # Monthly digest rollup (meetings + permits + intel)
 │   ├── transcribe.py           # Whisper API transcription
 │   └── transcribe_local.py     # Local Whisper transcription
-├── analysis/                   # Phase 4: LLM-powered summaries
-│   ├── executive_summaries.py  # Yearly summaries (reads monthly digests)
-│   ├── leadership_profiles.py  # Per-member profiles with grades
-│   ├── council_member_summaries.py # Per-member summaries (reads per-record)
-│   └── update_skill_intel.py   # Intel → skill supplement
 ├── data/                       # All data (gitignored)
 │   ├── audio/                  # Downloaded meeting audio (pre-transcription)
 │   ├── coastal/                # Coastal Commission meeting data
 │   ├── cpra-templates/         # Public records act request templates
 │   ├── documents/              # Extracted text (.txt — PDFs archived to S3)
-│   ├── executive-summaries/    # Generated analysis + leadership profiles
+│   ├── executive-summaries/    # Generated analysis (via yimby.analysis)
 │   ├── intel/                  # External feed hits
 │   ├── meetings/               # Per-meeting metadata + agenda items (Legistar)
 │   ├── nctd/                   # NCTD meeting data
@@ -309,7 +279,6 @@ yimby.watchdog/
 │   ├── transcripts/            # Whisper transcription output (JSON)
 │   └── transport-safety-refs/  # Vision Zero / crash data references
 └── .claude/skills/
-    ├── ca-housing-law/         # Auto-generated intel supplement
     └── civic-pipeline/         # Pipeline operation guide
 ```
 

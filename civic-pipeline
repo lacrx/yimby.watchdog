@@ -17,8 +17,8 @@
 #   --extract-until H   Stop extraction at hour H (0-23). Omit for no time limit.
 #
 # Cron:
-#   0 1 * * *   cd ~/repos/civics && ./civic-pipeline local --deep --extract-until 4
-#   0 18 * * 2-5 cd ~/repos/civics && ./civic-pipeline local --deep
+#   0 1 * * *   cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep --extract-until 4
+#   0 18 * * 2-5 cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -58,8 +58,8 @@ run_with_timeout() {
 sync_to_s3() {
     local prefix="$1"; local local_path="$2"; local storage_class="${3:-STANDARD}"
     shift 3
-    [ -z "${S3_BUCKET:-}" ] && return 0
-    aws s3 sync "$local_path" "s3://${S3_BUCKET}/${prefix}" \
+    [ -z "${WATCHDOG_S3_BUCKET:-}" ] && return 0
+    aws s3 sync "$local_path" "s3://${WATCHDOG_S3_BUCKET}/${prefix}" \
         --storage-class "$storage_class" --no-progress --size-only \
         "$@" >> data/s3-sync.log 2>&1 || log "S3 sync failed for $prefix (non-fatal)"
 }
@@ -109,9 +109,7 @@ case "$MODE" in
     hybrid|local)  ;; # faster-whisper
 esac
 
-log "Starting civic pipeline"
-log "  Summarizer: $SUMMARIZER"
-log "  Transcriber: $([ "$MODE" = "local" ] && echo "faster-whisper" || echo "Whisper API")"
+log "Starting civic pipeline (mode=$MODE)"
 
 # ═══════════════════════════════════════════
 # PHASE 0: PREFLIGHT — verify endpoints before fetching
@@ -195,7 +193,6 @@ for slug, a in cfg['agencies'].items():
 log "Checking intel feeds..."
 run_with_timeout "Intel feed" python3 scrapers/intel_feed.py >> data/intel/feed.log 2>&1
 log "Intel feed done."
-python3 analysis/update_skill_intel.py >> data/intel/feed.log 2>&1
 
 # ── 1c: Fetch building permits (agencies with permit config) ──
 CURRENT_YEAR=$(date '+%Y')
@@ -272,7 +269,7 @@ print(f'  {len(high)} high-priority meetings to transcribe')
 fi
 
 # ── S3 sync: raw sources ──
-if [ -n "${S3_BUCKET:-}" ]; then
+if [ -n "${WATCHDOG_S3_BUCKET:-}" ]; then
     log "Syncing raw sources to S3..."
     # Per-agency documents and meetings
     while IFS='|' read -r SLUG _; do
@@ -352,13 +349,13 @@ fi
 rm -f "$EXTRACT_TIMESTAMP"
 
 # ── S3 sync: structured data ──
-if [ -n "${S3_BUCKET:-}" ]; then
+if [ -n "${WATCHDOG_S3_BUCKET:-}" ]; then
     log "Syncing structured data to S3..."
     sync_to_s3 "structured/records" "data/structured" "STANDARD" --exclude "meetings/*" --exclude "monthly/*" --exclude "*.jsonl" --exclude "*.log" --exclude "*.skip"
     sync_to_s3 "structured/meetings" "data/structured/meetings" "STANDARD"
     sync_to_s3 "structured/monthly" "data/structured/monthly" "STANDARD"
-    aws s3 cp data/structured/all-records.jsonl "s3://${S3_BUCKET}/structured/all-records.jsonl" --quiet 2>/dev/null || true
-    aws s3 cp data/structured/meetings-combined.jsonl "s3://${S3_BUCKET}/structured/meetings-combined.jsonl" --quiet 2>/dev/null || true
+    aws s3 cp data/structured/all-records.jsonl "s3://${WATCHDOG_S3_BUCKET}/structured/all-records.jsonl" --quiet 2>/dev/null || true
+    aws s3 cp data/structured/meetings-combined.jsonl "s3://${WATCHDOG_S3_BUCKET}/structured/meetings-combined.jsonl" --quiet 2>/dev/null || true
     log "S3 sync (structured) done."
 fi
 

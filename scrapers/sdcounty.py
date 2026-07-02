@@ -60,7 +60,7 @@ def fetch_events(body_id, min_year):
         f"&$top=200"
     )
     resp = requests.get(url, timeout=30, headers={
-        "User-Agent": "Mozilla/5.0 civics-monitor/1.0",
+        "User-Agent": "Mozilla/5.0 yimby-watchdog/1.0",
         "Accept": "application/json",
     })
     resp.raise_for_status()

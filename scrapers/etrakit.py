@@ -30,7 +30,7 @@ from bs4 import BeautifulSoup
 
 from civic_utils import load_agencies, agency_data_dir
 
-UA = "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0"
+UA = "Mozilla/5.0 (X11; Linux x86_64) yimby-watchdog/1.0"
 
 
 def fetch_permit(session, base_url, permit_no):

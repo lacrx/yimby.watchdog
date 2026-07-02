@@ -44,6 +44,11 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 
+# Terraform
+infra/.terraform/
+infra/terraform.tfstate*
+infra/tfplan
+
 # Testing
 .coverage
 htmlcov/

@@ -63,7 +63,7 @@ def create_session():
     session = requests.Session()
     session.verify = False
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) yimby-watchdog/1.0",
         "Content-Type": "application/json",
     })
     return session

@@ -32,7 +32,7 @@ from civic_utils import (
     load_agencies, agency_data_dir,
 )
 
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0"
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) yimby-watchdog/1.0"
 HEADERS = {"Accept": "application/json", "User-Agent": USER_AGENT}
 
 # fileType values for GetEventFileStream

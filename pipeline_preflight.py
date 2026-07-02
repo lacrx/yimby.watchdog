@@ -42,7 +42,7 @@ from civic_utils import load_agencies, agency_data_dir
 HEALTH_FILE = REPO_ROOT / "data" / "preflight-health.json"
 QUARANTINE_THRESHOLD = 3
 PROBE_TIMEOUT = 15
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0"
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) yimby-watchdog/1.0"
 
 
 def load_health():

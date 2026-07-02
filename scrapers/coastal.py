@@ -57,7 +57,7 @@ def fetch_agenda(year, month):
     url = f"{API_BASE}/{year}/{month}"
     try:
         resp = requests.get(url, timeout=30, headers={
-            "User-Agent": "Mozilla/5.0 civics-monitor/1.0",
+            "User-Agent": "Mozilla/5.0 yimby-watchdog/1.0",
         })
         if resp.status_code == 404:
             return None
