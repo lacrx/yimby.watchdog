@@ -96,12 +96,16 @@ def main():
         print(f"  {full_key} = {display_value}")
 
         if args.write:
-            ssm.put_parameter(
+            put_args = dict(
                 Name=full_key,
                 Value=value,
                 Type="String",
                 Overwrite=True,
             )
+            if len(value) > 4096:
+                put_args["Tier"] = "Advanced"
+                print(f"    (advanced tier — {len(value)} chars)")
+            ssm.put_parameter(**put_args)
 
     if not args.write:
         print(f"\nDry run — pass --write to push {len(params)} parameters to SSM")
