@@ -23,7 +23,7 @@ if ENV_FILE.exists():
             os.environ.setdefault(k.strip(), v.strip())
 
 REPO_ROOT = Path(__file__).resolve().parent
-DATA_DIR = REPO_ROOT / "data"
+DATA_DIR = Path(os.environ.get("WATCHDOG_DATA_DIR", str(REPO_ROOT / "data")))
 AGENCIES_FILE = REPO_ROOT / "agencies.yaml"
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) civics-monitor/1.0"

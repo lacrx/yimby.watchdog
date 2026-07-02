@@ -90,12 +90,17 @@ log() {
 
 case "$MODE" in
     full|hybrid|local) ;;
-    *) echo "Usage: civic-pipeline <full|hybrid|local> [--deep] [--force] [--years N] [--transcribe] [--extract-until H]"
+    sync-and-extract)
+        # AWS split mode: pull from S3, extract locally, push back
+        exec ./extract-local $FORCE $([ -n "$EXTRACT_CUTOFF" ] && echo "--extract-until $EXTRACT_CUTOFF")
+        ;;
+    *) echo "Usage: civic-pipeline <full|hybrid|local|sync-and-extract> [--deep] [--force] [--years N] [--transcribe] [--extract-until H]"
        echo ""
        echo "Modes:"
-       echo "  full    — Claude API + Whisper API (bulk, ~\$44/full-run)"
-       echo "  hybrid  — claude -p + Whisper API (daily, ~\$0.90/meeting transcription only)"
-       echo "  local   — claude -p + faster-whisper (zero API cost)"
+       echo "  full              — Claude API + Whisper API (bulk, ~\$44/full-run)"
+       echo "  hybrid            — claude -p + Whisper API (daily, ~\$0.90/meeting transcription only)"
+       echo "  local             — claude -p + faster-whisper (zero API cost)"
+       echo "  sync-and-extract  — Pull from S3, extract via claude -p, push back (AWS split mode)"
        exit 1 ;;
 esac
 

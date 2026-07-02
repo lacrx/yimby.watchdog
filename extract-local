@@ -1,0 +1,75 @@
+#!/bin/bash
+# Local extraction workflow — pull scraped data from S3, extract via claude -p, push results back.
+#
+# Run after AWS Lambda has scraped new documents:
+#   ./extract-local                     # extract new docs, no time limit
+#   ./extract-local --extract-until 5   # stop at 5 AM
+#
+# This script does NOT scrape — Lambda handles that on a nightly schedule.
+# It only: (1) syncs raw text from S3, (2) runs extraction, (3) pushes structured data back.
+
+set -euo pipefail
+cd "$(dirname "$0")"
+source .venv/bin/activate
+[ -f .env ] && set -a && source .env && set +a
+unset ANTHROPIC_API_KEY  # extraction uses claude -p, not paid API
+
+BUCKET="${S3_BUCKET:-yimby-watchdog-data}"
+FORCE=""
+EXTRACT_CUTOFF=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force)          FORCE="--force"; shift ;;
+        --extract-until)  EXTRACT_CUTOFF="$2"; shift 2 ;;
+        *)                echo "Usage: extract-local [--force] [--extract-until H]"; exit 1 ;;
+    esac
+done
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [extract-local] $*"
+}
+
+# ── Step 1: Pull raw text + metadata from S3 ──
+log "Syncing raw data from s3://$BUCKET/ ..."
+for slug in oceanside sdcounty sandag coastal nctd; do
+    aws s3 sync "s3://$BUCKET/raw/$slug/documents/" "data/$slug/documents/" \
+        --exclude "*.pdf" --exclude "*.skip" --quiet 2>/dev/null || true
+    aws s3 sync "s3://$BUCKET/raw/$slug/meetings/" "data/$slug/meetings/" \
+        --quiet 2>/dev/null || true
+done
+log "Sync done."
+
+# ── Step 2: Pull pending extraction manifest (if exists) ──
+aws s3 cp "s3://$BUCKET/pipeline/pending-extraction.json" data/pipeline/ --quiet 2>/dev/null || true
+
+# ── Step 3: Run structured extraction via claude -p ──
+EXTRACT_BEFORE=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
+
+if [ -n "$EXTRACT_CUTOFF" ]; then
+    log "Extracting until ${EXTRACT_CUTOFF}:00..."
+    python3 transforms/extract_structured.py --stop-at "$EXTRACT_CUTOFF" $FORCE
+else
+    log "Extracting (no time limit)..."
+    python3 transforms/extract_structured.py $FORCE
+fi
+
+EXTRACT_AFTER=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
+NEW_EXTRACTIONS=$((EXTRACT_AFTER - EXTRACT_BEFORE))
+log "$NEW_EXTRACTIONS new extractions."
+
+# ── Step 4: Push structured data back to S3 ──
+if [ "$NEW_EXTRACTIONS" -gt 0 ]; then
+    log "Pushing structured data to S3..."
+    aws s3 sync data/structured/ "s3://$BUCKET/structured/" \
+        --exclude "*.log" --exclude "*.skip" --quiet
+    log "S3 push done."
+else
+    log "No new extractions — skipping S3 push."
+fi
+
+# ── Step 5: Run pipeline doctor ──
+log "Running pipeline doctor..."
+python3 pipeline_doctor.py >> data/pipeline-doctor-run.log 2>&1 || true
+
+log "Done."
