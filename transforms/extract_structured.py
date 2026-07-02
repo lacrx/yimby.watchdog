@@ -30,6 +30,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from civic_utils import all_docs_dirs, all_meetings_dirs
+from transforms.triage import predict_relevance
 
 DATA_DIR = REPO_ROOT / "data"
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
@@ -380,6 +381,10 @@ def cmd_extract(args):
             print(f"  ... and {len(to_process) - 10} more")
         return
 
+    use_triage = not getattr(args, "no_triage", False)
+    if use_triage:
+        print("  Triage enabled (rule-based substantive filter)")
+
     stop_hour = getattr(args, "stop_at", None)
     print(f"Extracting structured data: {len(to_process)} sources to process")
     if stop_hour:
@@ -387,6 +392,7 @@ def cmd_extract(args):
     success = 0
     failed = 0
     skipped = 0
+    triage_skipped = 0
     consecutive_failures = 0
     auth_failure_count = 0
     MAX_CONSECUTIVE_FAILURES = 5
@@ -412,6 +418,14 @@ def cmd_extract(args):
             print(f"  Skipping permanently: {skip_reason} ({len(text.strip())} chars)")
             i += 1
             continue
+
+        if use_triage:
+            extract, prob = predict_relevance(text, sf.name)
+            if not extract:
+                triage_skipped += 1
+                print(f"  Triage skip (p={prob:.3f})")
+                i += 1
+                continue
 
         meta = get_meeting_meta(sf)
         try:
@@ -490,7 +504,8 @@ def cmd_extract(args):
         time.sleep(1)
         i += 1
 
-    print(f"\nDone. {success} extracted, {failed} failed, {skipped} permanently skipped.")
+    triage_msg = f", {triage_skipped} triage-skipped" if triage_skipped else ""
+    print(f"\nDone. {success} extracted, {failed} failed, {skipped} permanently skipped{triage_msg}.")
 
     if success > 0:
         rebuild_combined(STRUCTURED_DIR)
@@ -547,6 +562,7 @@ def main():
     parser.add_argument("--rebuild", action="store_true", help="Rebuild combined JSONL from existing records")
     parser.add_argument("--stop-at", type=int, metavar="HOUR", help="Stop extraction at this hour (0-23). Resumes next run.")
     parser.add_argument("--meeting", action="append", metavar="ID", help="Only extract sources for these meeting IDs (repeatable)")
+    parser.add_argument("--no-triage", action="store_true", help="Disable ML triage — extract all documents")
 
     args = parser.parse_args()
 

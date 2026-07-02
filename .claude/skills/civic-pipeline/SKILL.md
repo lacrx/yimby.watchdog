@@ -39,10 +39,10 @@ Automated ingestion of Oceanside, NCTD, SANDAG, SD County BOS, and CA Coastal Co
 
 ```bash
 # Nightly: fetch current year + extract until 4 AM
-0 1 * * * cd ~/repos/civics && ./civic-pipeline local --deep --years 1 --extract-until 4 >> data/pipeline-cron.log 2>&1
+0 1 * * * cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep --years 1 --extract-until 4 >> data/pipeline-cron.log 2>&1
 
 # Evening catch: Tue-Fri, no extraction time limit
-0 18 * * 2-5 cd ~/repos/civics && ./civic-pipeline local --deep >> data/pipeline-cron.log 2>&1
+0 18 * * 2-5 cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep >> data/pipeline-cron.log 2>&1
 ```
 
 ## Modes
