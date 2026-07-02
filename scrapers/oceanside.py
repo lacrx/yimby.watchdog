@@ -34,6 +34,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import requests
 from bs4 import BeautifulSoup
+from civic_utils import agency_data_dir
 
 ENV_FILE = REPO_ROOT / ".env"
 if ENV_FILE.exists():
@@ -44,7 +45,7 @@ if ENV_FILE.exists():
             os.environ.setdefault(k.strip(), v.strip())
 
 BASE_URL = "https://oceanside.legistar.com"
-DATA_DIR = REPO_ROOT / "data" / "oceanside"
+DATA_DIR = agency_data_dir("oceanside")
 MEETINGS_DIR = DATA_DIR / "meetings"
 DOCS_DIR = DATA_DIR / "documents"
 SUMMARIES_DIR = DATA_DIR / "summaries"

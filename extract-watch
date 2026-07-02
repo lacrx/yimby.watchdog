@@ -1,0 +1,41 @@
+#!/bin/bash
+# Poll S3 for pending-extraction marker, run extract-local when found.
+# Designed for */5 cron — exits immediately if no work or already running.
+#
+# Cron:
+#   */5 * * * * cd ~/repos/yimby.watchdog && ./extract-watch >> data/extract-watch.log 2>&1
+
+set -euo pipefail
+cd "$(dirname "$0")"
+[ -f .env ] && set -a && source .env && set +a
+
+BUCKET="${WATCHDOG_S3_BUCKET:-yimby-watchdog-data}"
+PIDFILE="data/.extract.pid"
+MARKER="pipeline/pending-extraction.json"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [extract-watch] $*"
+}
+
+# ── Skip if extraction already running ──
+if [ -f "$PIDFILE" ]; then
+    OLD_PID=$(cat "$PIDFILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        exit 0
+    fi
+fi
+
+# ── Check S3 marker ──
+if ! aws s3api head-object --bucket "$BUCKET" --key "$MARKER" --profile watchdog --region us-west-2 >/dev/null 2>&1; then
+    exit 0
+fi
+
+# ── Marker found — claim it ──
+log "New docs detected. Starting extraction."
+mkdir -p data/pipeline
+aws s3 cp "s3://$BUCKET/$MARKER" data/pipeline/ --profile watchdog --region us-west-2 --quiet 2>/dev/null || true
+aws s3 rm "s3://$BUCKET/$MARKER" --profile watchdog --region us-west-2 --quiet 2>/dev/null || true
+
+# ── Run extraction (extract-local manages its own PID file) ──
+./extract-local
+log "Extraction complete."

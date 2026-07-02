@@ -27,11 +27,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
 
 import feedparser
 import requests
-
-DATA_DIR = REPO_ROOT / "data"
+from civic_utils import DATA_DIR
 INTEL_DIR = DATA_DIR / "intel"
 STATE_FILE = INTEL_DIR / "feed-state.json"
 

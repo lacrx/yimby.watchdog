@@ -32,9 +32,9 @@ sys.path.insert(0, str(REPO_ROOT))
 import requests
 from bs4 import BeautifulSoup
 
-from civic_utils import download_pdf, extract_text, summarize_text, summarize_text_local, save_json, load_json
+from civic_utils import download_pdf, extract_text, save_json, load_json, agency_data_dir
 
-DATA_DIR = REPO_ROOT / "data" / "nctd"
+DATA_DIR = agency_data_dir("nctd")
 MEETINGS_DIR = DATA_DIR / "meetings"
 DOCS_DIR = DATA_DIR / "documents"
 SUMMARIES_DIR = DATA_DIR / "summaries"
@@ -205,10 +205,7 @@ def cmd_fetch(args):
 
 
 def _get_summarizer(args):
-    mode = getattr(args, "summarizer", "api")
-    if mode == "local":
-        return summarize_text_local
-    return summarize_text
+    raise NotImplementedError("Summarization moved to yimby.analysis")
 
 
 def cmd_summarize(args):

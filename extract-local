@@ -15,8 +15,21 @@ source .venv/bin/activate
 unset ANTHROPIC_API_KEY  # extraction uses claude -p, not paid API
 
 BUCKET="${WATCHDOG_S3_BUCKET:-yimby-watchdog-data}"
+PIDFILE="data/.extract.pid"
 FORCE=""
 EXTRACT_CUTOFF=""
+
+# ── Overlap protection ──
+if [ -f "$PIDFILE" ]; then
+    OLD_PID=$(cat "$PIDFILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [extract-local] Already running (PID $OLD_PID). Exiting."
+        exit 0
+    fi
+    rm -f "$PIDFILE"
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
 
 while [[ $# -gt 0 ]]; do
     case "$1" in

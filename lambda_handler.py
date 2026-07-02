@@ -160,10 +160,10 @@ def run_scrape(agency_slug=None):
             results[slug] = {"status": "error", "error": str(e)[:500]}
 
     if BUCKET and new_docs:
-        write_json("pipeline/pending-extraction.json", {
+        write_json("pending-extraction.json", {
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "new_docs": new_docs,
-        }, prefix="")
+        }, prefix="pipeline")
 
     return {"results": results, "total_new_docs": len(new_docs)}
 

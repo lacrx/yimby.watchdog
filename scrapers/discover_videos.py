@@ -30,9 +30,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-from civic_utils import all_meetings_dirs, load_agencies
-
-DATA_DIR = REPO_ROOT / "data"
+from civic_utils import all_meetings_dirs, load_agencies, DATA_DIR
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 BATCH_FILE = DATA_DIR / "transcribe-batch.json"
 

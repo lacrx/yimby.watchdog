@@ -29,9 +29,9 @@ sys.path.insert(0, str(REPO_ROOT))
 import requests
 from bs4 import BeautifulSoup
 
-from civic_utils import download_pdf, extract_text, save_json, load_json, parse_escribe_date, safe_filename
+from civic_utils import download_pdf, extract_text, save_json, load_json, parse_escribe_date, safe_filename, agency_data_dir
 
-DATA_DIR = REPO_ROOT / "data" / "sandag"
+DATA_DIR = agency_data_dir("sandag")
 MEETINGS_DIR = DATA_DIR / "meetings"
 DOCS_DIR = DATA_DIR / "documents"
 STATE_FILE = DATA_DIR / "state.json"

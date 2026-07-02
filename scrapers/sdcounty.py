@@ -23,9 +23,9 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import requests
 
-from civic_utils import download_pdf, extract_text, save_json, load_json
+from civic_utils import download_pdf, extract_text, save_json, load_json, agency_data_dir
 
-DATA_DIR = REPO_ROOT / "data" / "sdcounty"
+DATA_DIR = agency_data_dir("sdcounty")
 MEETINGS_DIR = DATA_DIR / "meetings"
 DOCS_DIR = DATA_DIR / "documents"
 STATE_FILE = DATA_DIR / "state.json"
