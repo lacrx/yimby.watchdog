@@ -14,7 +14,7 @@ source .venv/bin/activate
 [ -f .env ] && set -a && source .env && set +a
 unset ANTHROPIC_API_KEY  # extraction uses claude -p, not paid API
 
-BUCKET="${S3_BUCKET:-yimby-watchdog-data}"
+BUCKET="${WATCHDOG_S3_BUCKET:-yimby-watchdog-data}"
 FORCE=""
 EXTRACT_CUTOFF=""
 
@@ -32,12 +32,18 @@ log() {
 
 # ── Step 1: Pull raw text + metadata from S3 ──
 log "Syncing raw data from s3://$BUCKET/ ..."
-for slug in oceanside sdcounty sandag coastal nctd; do
+while IFS= read -r slug; do
     aws s3 sync "s3://$BUCKET/raw/$slug/documents/" "data/$slug/documents/" \
         --exclude "*.pdf" --exclude "*.skip" --quiet 2>/dev/null || true
     aws s3 sync "s3://$BUCKET/raw/$slug/meetings/" "data/$slug/meetings/" \
         --quiet 2>/dev/null || true
-done
+done < <(python3 -c "
+import yaml
+cfg = yaml.safe_load(open('agencies.yaml'))
+for slug, a in cfg['agencies'].items():
+    if a.get('enabled', True):
+        print(slug)
+")
 log "Sync done."
 
 # ── Step 2: Pull pending extraction manifest (if exists) ──
