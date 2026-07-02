@@ -45,13 +45,16 @@ def main():
     parser.add_argument("--write", action="store_true", help="Actually write to SSM (default is dry-run)")
     parser.add_argument("--delete", action="store_true", help="Delete all parameters under prefix")
     parser.add_argument("--region", default="us-west-2")
+    parser.add_argument("--profile", default=None, help="AWS profile name")
     parser.add_argument("--config", default="config.local.yaml", help="Config file to read")
     args = parser.parse_args()
 
     prefix = args.prefix.rstrip("/") + "/"
 
+    session = boto3.Session(profile_name=args.profile, region_name=args.region)
+
     if args.delete:
-        ssm = boto3.client("ssm", region_name=args.region)
+        ssm = session.client("ssm")
         paginator = ssm.get_paginator("get_parameters_by_path")
         names = []
         for page in paginator.paginate(Path=prefix, Recursive=True):
@@ -85,7 +88,7 @@ def main():
     print(f"{'Writing' if args.write else 'Would write'} {len(params)} parameters to {prefix}")
     print()
 
-    ssm = boto3.client("ssm", region_name=args.region) if args.write else None
+    ssm = session.client("ssm") if args.write else None
 
     for key, value in sorted(params.items()):
         full_key = f"{prefix}{key}"
