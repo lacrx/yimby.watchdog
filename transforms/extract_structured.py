@@ -294,10 +294,19 @@ def collect_all_sources():
 
 
 def needs_reextraction(source_path, out_path):
-    """Check if a source file is newer than its existing JSONL record."""
+    """Check if an existing extraction is empty/corrupt and needs redo.
+
+    Mtime comparison removed — S3 sync resets source mtimes, causing
+    thousands of phantom re-extractions. Use --force for intentional
+    full re-extraction.
+    """
     if not out_path.exists():
         return True
-    return source_path.stat().st_mtime > out_path.stat().st_mtime
+    try:
+        data = json.loads(out_path.read_text())
+        return not isinstance(data, dict)
+    except (json.JSONDecodeError, OSError):
+        return True
 
 
 def is_skippable(text):
