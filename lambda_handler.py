@@ -121,6 +121,29 @@ def run_scrape(agency_slug=None):
             args = Namespace(years=years, force=False, deep=deep, agency=slug)
             mod.cmd_fetch(args)
 
+            if platform == "escribe":
+                from transforms.split_packets import split_sandag_packet, has_split_marker, write_split_marker, MIN_PACKET_SIZE
+                for pkt in (agency_dir / "documents").glob("*-agenda-packet.txt"):
+                    if pkt.stat().st_size < MIN_PACKET_SIZE or has_split_marker(pkt):
+                        continue
+                    items = split_sandag_packet(pkt.read_text())
+                    if len(items) < 2:
+                        continue
+                    stem = pkt.stem
+                    item_files = []
+                    id_counts = {}
+                    for item_id, item_text in items:
+                        if item_id == "preamble":
+                            continue
+                        safe_id = item_id.replace(".", "-")
+                        id_counts[safe_id] = id_counts.get(safe_id, 0) + 1
+                        if id_counts[safe_id] > 1:
+                            safe_id = f"{safe_id}-{chr(96 + id_counts[safe_id])}"
+                        item_path = pkt.parent / f"{stem}-item-{safe_id}.txt"
+                        item_path.write_text(item_text)
+                        item_files.append(item_path)
+                    write_split_marker(pkt, len(items), item_files)
+
             doc_count_after = len(list((agency_dir / "documents").glob("*.txt")))
             new_count = doc_count_after - doc_count_before
 

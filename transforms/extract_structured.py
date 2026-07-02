@@ -329,8 +329,12 @@ def write_skip_marker(source_path, reason):
 
 
 def has_skip_marker(source_path):
-    """Check if source has been permanently marked as skip."""
-    return source_path.with_suffix(source_path.suffix + SKIP_MARKER).exists()
+    """Check if source has been permanently marked as skip or split."""
+    if source_path.with_suffix(source_path.suffix + SKIP_MARKER).exists():
+        return True
+    if source_path.with_suffix(source_path.suffix + ".split").exists():
+        return True
+    return False
 
 
 def cmd_extract(args):
