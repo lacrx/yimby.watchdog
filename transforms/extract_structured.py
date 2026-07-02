@@ -44,8 +44,6 @@ Schema:
   "body": "City Council | Planning Commission | NCTD Board | etc",
   "agency": "City of Oceanside | NCTD",
   "doc_type": "agenda | minutes | staff_report | transcript | agenda_packet",
-  "advocacy_score": "green | yellow | red | neutral",
-  "advocacy_reason": "one sentence justification",
   "votes": [
     {"item": "description", "result": "approved 4-1 | denied | tabled | continued", "yes": ["names"], "no": ["names"], "abstain": ["names"]}
   ],
@@ -57,17 +55,17 @@ Schema:
   ],
   "legal_flags": ["string — any potential state law violation, enforcement action, or litigation risk"],
   "council_positions": [
-    {"member": "name", "stance": "pro_housing | anti_housing | mixed | procedural", "evidence": "one sentence"}
+    {"member": "name", "action": "voted yes | voted no | abstained | moved | seconded | spoke for | spoke against | amended", "on": "item description", "evidence": "verbatim quote or factual description of what they did"}
   ],
-  "public_comments": ["notable comments, especially on housing/development"],
-  "key_quotes": ["direct quotes that reveal positions or are legally significant"],
+  "public_comments": ["public comments mentioning specific agenda items, policies, or legal standards"],
+  "key_quotes": ["direct quotes from officials or public — verbatim text only"],
   "procedural_only": false
 }
 
 Rules:
 - If the document is purely procedural (roll call, adjournment, consent calendar with nothing notable), set procedural_only: true and leave arrays empty.
 - Only include names that appear BY NAME in the document text. Never invent or guess names.
-- For advocacy_score: green = pro-housing/productive, yellow = mixed, red = anti-housing/obstructive, neutral = no housing relevance.
+- For council_positions: record what each named member DID (motion, vote, statement, question), not your assessment of their political orientation. Use exact words in evidence when available.
 - Empty arrays are fine — don't pad with empty objects.
 - Dates must be YYYY-MM-DD format.
 - Extract ALL votes, housing items, and dollar amounts — do not summarize or omit.
@@ -205,11 +203,6 @@ def _merge_records(records):
                     existing.append(item)
             merged[key] = existing
 
-        if r.get("advocacy_score") == "red":
-            merged["advocacy_score"] = "red"
-            merged["advocacy_reason"] = r.get("advocacy_reason", merged.get("advocacy_reason", ""))
-        elif r.get("advocacy_score") == "yellow" and merged.get("advocacy_score") not in ("red",):
-            merged["advocacy_score"] = "yellow"
         if not merged.get("date") and r.get("date"):
             merged["date"] = r["date"]
         if not merged.get("body") and r.get("body"):
@@ -480,7 +473,7 @@ def cmd_extract(args):
             out_path.write_text(json.dumps(record, indent=2, default=str))
             success += 1
             consecutive_failures = 0
-            print(f"  OK ({record.get('advocacy_score', '?')}, {len(text)} chars)")
+            print(f"  OK ({len(text)} chars, {len(record.get('votes',[]))}v {len(record.get('housing_items',[]))}h)")
         else:
             failed += 1
             consecutive_failures += 1
@@ -518,35 +511,32 @@ def cmd_stats(args):
     total_transcripts = len(list(TRANSCRIPTS_DIR.glob("*-transcript.txt"))) if TRANSCRIPTS_DIR.exists() else 0
     total_sources = total_docs + total_transcripts
 
-    scores = {"green": 0, "yellow": 0, "red": 0, "neutral": 0}
     total_votes = 0
     total_housing = 0
     total_legal = 0
     total_procedural = 0
+    total_with_positions = 0
 
     for jf in json_files:
         try:
             r = json.loads(jf.read_text())
-            score = r.get("advocacy_score", "neutral")
-            scores[score] = scores.get(score, 0) + 1
             total_votes += len(r.get("votes", []))
             total_housing += len(r.get("housing_items", []))
             total_legal += len(r.get("legal_flags", []))
             if r.get("procedural_only"):
                 total_procedural += 1
+            if r.get("council_positions"):
+                total_with_positions += 1
         except Exception:
             continue
 
     print(f"Structured records: {len(json_files)} / {total_sources} sources ({total_docs} docs, {total_transcripts} transcripts)")
-    print(f"\nAdvocacy scores:")
-    for score, count in sorted(scores.items(), key=lambda x: -x[1]):
-        bar = "█" * (count // 5) if count > 0 else ""
-        print(f"  {score:8s}: {count:4d} {bar}")
     print(f"\nTotals:")
-    print(f"  Votes recorded:    {total_votes}")
-    print(f"  Housing items:     {total_housing}")
-    print(f"  Legal flags:       {total_legal}")
-    print(f"  Procedural-only:   {total_procedural}")
+    print(f"  Votes recorded:      {total_votes}")
+    print(f"  Housing items:       {total_housing}")
+    print(f"  Legal flags:         {total_legal}")
+    print(f"  Council positions:   {total_with_positions}")
+    print(f"  Procedural-only:     {total_procedural}")
 
 
 def main():

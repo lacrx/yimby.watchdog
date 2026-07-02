@@ -223,7 +223,6 @@ def merge_records(meeting_id, records, doc_dates=None):
     doc_types = set()
     sources = []
     dates = []
-    scores = []
 
     # First pass: determine the meeting's canonical date via majority vote
     for r in records:
@@ -259,12 +258,9 @@ def merge_records(meeting_id, records, doc_dates=None):
             dates.append(record_date)
         if r.get("doc_type"):
             doc_types.add(r["doc_type"])
-        if r.get("advocacy_score") and date_matches:
-            scores.append(r["advocacy_score"])
         sources.append({
             "file": r.get("_file", r.get("_source", "")),
             "type": r.get("_source_type", r.get("doc_type", "")),
-            "advocacy_score": r.get("advocacy_score"),
             "date_match": date_matches,
         })
 
@@ -298,10 +294,6 @@ def merge_records(meeting_id, records, doc_dates=None):
     date = Counter(dates).most_common(1)[0][0] if dates else ""
     agency = Counter(agencies).most_common(1)[0][0] if agencies else "Unknown"
 
-    # Aggregate score: worst score wins (red > yellow > neutral > green)
-    score_priority = {"red": 0, "yellow": 1, "neutral": 2, "green": 3}
-    worst_score = min(scores, key=lambda s: score_priority.get(s, 99)) if scores else "neutral"
-
     return {
         "meeting_id": meeting_id,
         "date": date,
@@ -310,7 +302,6 @@ def merge_records(meeting_id, records, doc_dates=None):
         "doc_types": sorted(doc_types),
         "source_count": len(records),
         "sources": sources,
-        "advocacy_score": worst_score,
         "votes": deduped_votes,
         "housing_items": all_housing,
         "fiscal_items": all_fiscal,
@@ -389,7 +380,9 @@ def cmd_merge(args):
         }
 
         types = ", ".join(merged["doc_types"])
-        print(f"  {mid}: {len(records)} sources ({types}) → {merged['advocacy_score']}")
+        v = len(merged.get("votes", []))
+        h = len(merged.get("housing_items", []))
+        print(f"  {mid}: {len(records)} sources ({types}) → {v}v {h}h")
 
     save_state(state)
     rebuild_combined()
@@ -429,7 +422,8 @@ def cmd_stats(args):
     source_counts = defaultdict(int)
     multi_source = 0
     has_transcript = 0
-    scores = defaultdict(int)
+    total_votes = 0
+    total_housing = 0
 
     for jf in merged_files:
         try:
@@ -440,20 +434,19 @@ def cmd_stats(args):
                 multi_source += 1
             if "transcript" in r.get("doc_types", []):
                 has_transcript += 1
-            scores[r.get("advocacy_score", "neutral")] += 1
+            total_votes += len(r.get("votes", []))
+            total_housing += len(r.get("housing_items", []))
         except Exception:
             continue
 
     print(f"Total merged meetings: {len(merged_files)}")
     print(f"Multi-source meetings: {multi_source}")
     print(f"Meetings with transcript: {has_transcript}")
+    print(f"Total votes: {total_votes}")
+    print(f"Total housing items: {total_housing}")
     print(f"\nSources per meeting:")
     for count in sorted(source_counts.keys()):
         print(f"  {count} source(s): {source_counts[count]} meetings")
-    print(f"\nAdvocacy scores:")
-    for score in ["red", "yellow", "neutral", "green"]:
-        if scores[score]:
-            print(f"  {score}: {scores[score]}")
 
 
 def main():

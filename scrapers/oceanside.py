@@ -485,6 +485,15 @@ def cmd_fetch(args):
             if meeting_date and meeting_date < recency_cutoff:
                 skipped += 1
                 continue
+            # Recent meeting: skip if agenda/minutes already present and no new minutes URL
+            prev = state["meetings"].get(mid, {})
+            has_agenda = (DOCS_DIR / f"{mid}-agenda.pdf").exists() if m.get("agenda_url") else True
+            has_minutes = (DOCS_DIR / f"{mid}-minutes.pdf").exists() if m.get("minutes_url") else True
+            minutes_unchanged = prev.get("minutes_url") == m.get("minutes_url")
+            if has_agenda and has_minutes and minutes_unchanged:
+                skipped += 1
+                continue
+            state["meetings"].setdefault(mid, {})["minutes_url"] = m.get("minutes_url")
 
         print(f"\n{m['body']} — {m['date']} {m['time']}")
 
@@ -515,9 +524,23 @@ def cmd_fetch(args):
                 print(f"  Found {len(items)} agenda items")
 
                 if args.deep:
+                    deep_skipped = 0
+                    deep_new = 0
                     for item in items:
                         if not item.get("url"):
                             continue
+                        # Skip crawl if cached attachments all have PDFs on disk
+                        cached_atts = item.get("attachments")
+                        if cached_atts:
+                            item_id = item.get('item_id', 'x')
+                            att_slugs = [re.sub(r"[^\w]", "_", a["name"])[:40] for a in cached_atts]
+                            all_present = all(
+                                (DOCS_DIR / f"{mid}-{item_id}-{slug}.pdf").exists()
+                                for slug in att_slugs
+                            )
+                            if all_present:
+                                deep_skipped += 1
+                                continue
                         try:
                             attachments = fetch_legislation_attachments(item["url"])
                             item["attachments"] = attachments
@@ -528,9 +551,12 @@ def cmd_fetch(args):
                                     text = extract_text(att_path)
                                     if text:
                                         print(f"    Staff report: {att['name'][:50]} ({len(text)} chars)")
+                            deep_new += 1
                             time.sleep(0.5)
                         except Exception as e:
                             print(f"    Failed to fetch attachments for {item.get('title','?')[:40]}: {e}")
+                    if deep_skipped:
+                        print(f"  Skipped {deep_skipped} items (attachments already on disk)")
                     items_file.write_text(json.dumps(items, indent=2))
             except Exception as e:
                 print(f"  Failed to fetch items: {e}")
@@ -538,12 +564,13 @@ def cmd_fetch(args):
         state["meetings"][mid] = {
             "body": m["body"],
             "date": m["date"],
+            "minutes_url": m.get("minutes_url"),
             "fetched": datetime.now().isoformat(),
         }
         time.sleep(1)
 
     if skipped:
-        print(f"\nSkipped {skipped} previously fetched meetings older than 30 days")
+        print(f"\nSkipped {skipped} previously fetched meetings (unchanged)")
 
     state["last_fetch"] = datetime.now().isoformat()
     save_state(state)

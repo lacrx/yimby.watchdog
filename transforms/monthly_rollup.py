@@ -182,7 +182,6 @@ def merge_month(month, meetings, permits, intel):
     all_positions = []
     all_comments = []
     all_quotes = []
-    scores = {"green": 0, "yellow": 0, "red": 0, "neutral": 0}
     substantive_count = 0
 
     for r in meetings:
@@ -195,9 +194,6 @@ def merge_month(month, meetings, permits, intel):
             continue
         substantive_count += 1
 
-        score = r.get("advocacy_score", "neutral")
-        scores[score] = scores.get(score, 0) + 1
-
         all_votes.extend(r.get("votes", []))
         all_housing.extend(r.get("housing_items", []))
         all_fiscal.extend(r.get("fiscal_items", []))
@@ -206,19 +202,18 @@ def merge_month(month, meetings, permits, intel):
         all_comments.extend(r.get("public_comments", []))
         all_quotes.extend(r.get("key_quotes", []))
 
-    dominant_score = max(scores, key=scores.get) if substantive_count > 0 else "neutral"
-    red_pct = scores["red"] / substantive_count * 100 if substantive_count > 0 else 0
-
     digest = {
         "month": month,
         "meeting_count": len(meetings),
         "substantive_count": substantive_count,
         "bodies": sorted(bodies),
         "agencies": sorted(agencies),
-        "advocacy_summary": {
-            "dominant_score": dominant_score,
-            "breakdown": scores,
-            "red_pct": round(red_pct, 1),
+        "activity_summary": {
+            "meetings_with_votes": sum(1 for r in meetings if r.get("votes")),
+            "meetings_with_housing": sum(1 for r in meetings if r.get("housing_items")),
+            "total_votes": len(all_votes),
+            "total_housing_items": len(all_housing),
+            "total_legal_flags": len(all_legal),
         },
         "votes": all_votes,
         "housing_items": all_housing,
@@ -318,14 +313,8 @@ def cmd_rollup(args):
         out_path.write_text(json.dumps(digest, indent=2, default=str))
         built += 1
 
-        score_bar = ""
-        breakdown = digest["advocacy_summary"]["breakdown"]
-        if breakdown["red"]:
-            score_bar += f" 🔴{breakdown['red']}"
-        if breakdown["yellow"]:
-            score_bar += f" 🟡{breakdown['yellow']}"
-        if breakdown["green"]:
-            score_bar += f" 🟢{breakdown['green']}"
+        activity = digest["activity_summary"]
+        counts = f" ({activity['total_votes']}v {activity['total_housing_items']}h)"
 
         parts = [f"{digest['substantive_count']} meetings"]
         if permits:
@@ -333,7 +322,7 @@ def cmd_rollup(args):
         if intel:
             parts.append(f"{len(intel)} intel")
 
-        print(f"  {month}: {' + '.join(parts)}{score_bar}")
+        print(f"  {month}: {' + '.join(parts)}{counts}")
 
     print(f"\nBuilt {built}, skipped {skipped} (unchanged)")
 
@@ -356,8 +345,8 @@ def cmd_stats(args):
     total_meetings = 0
     total_permits = 0
 
-    print(f"{'Month':8s} {'Mtgs':>5s} {'Subst':>6s} {'Votes':>6s} {'Housing':>8s} {'Legal':>6s} {'Permits':>8s} {'Score':>8s}")
-    print("-" * 68)
+    print(f"{'Month':8s} {'Mtgs':>5s} {'Subst':>6s} {'Votes':>6s} {'Housing':>8s} {'Legal':>6s} {'Permits':>8s}")
+    print("-" * 60)
 
     for df in digests:
         d = json.loads(df.read_text())
@@ -366,7 +355,6 @@ def cmd_stats(args):
         legal = len(d.get("legal_flags", []))
         meetings = d.get("meeting_count", d.get("record_count", 0))
         subst = d.get("substantive_count", 0)
-        score = d.get("advocacy_summary", {}).get("dominant_score", "?")
         permits = d.get("permits", {}).get("total", 0)
 
         total_votes += votes
@@ -375,9 +363,9 @@ def cmd_stats(args):
         total_meetings += meetings
         total_permits += permits
 
-        print(f"{d['month']:8s} {meetings:5d} {subst:6d} {votes:6d} {housing:8d} {legal:6d} {permits:8d} {score:>8s}")
+        print(f"{d['month']:8s} {meetings:5d} {subst:6d} {votes:6d} {housing:8d} {legal:6d} {permits:8d}")
 
-    print("-" * 68)
+    print("-" * 60)
     print(f"{'TOTAL':8s} {total_meetings:5d} {'':6s} {total_votes:6d} {total_housing:8d} {total_legal:6d} {total_permits:8d}")
     print(f"\n{len(digests)} monthly digests")
 
