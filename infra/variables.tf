@@ -39,3 +39,9 @@ variable "lambda_timeout" {
   type        = number
   default     = 900
 }
+
+variable "ssm_prefix" {
+  description = "SSM Parameter Store prefix for jurisdiction config"
+  type        = string
+  default     = "/civic-monitor/"
+}

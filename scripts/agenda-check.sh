@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # agenda-check.sh — Lightweight Legistar agenda scanner for CCR trigger use.
-# Currently hardcoded for Oceanside — parameterization TODO.
+# Hardcoded for Oceanside — forks rewrite keywords/URL for their city.
 # Only needs curl + python3 stdlib. No pip deps, no local data dir.
 #
 # Usage: ./scripts/agenda-check.sh [--days N] [--quiet]

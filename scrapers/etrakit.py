@@ -3,7 +3,7 @@
 eTRAKiT building permit scraper.
 
 Enumerates building permits by ID pattern (BLDG{YY}-{NNNN}).
-Currently configured for Oceanside; reads permit config from agencies.yaml.
+Reads permit config (base URL, ID pattern) from agencies.yaml.
 
 Usage:
     python etrakit.py fetch                     # scan current year, resume from last

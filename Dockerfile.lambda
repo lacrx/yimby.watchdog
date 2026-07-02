@@ -5,7 +5,7 @@ RUN dnf install -y poppler-utils && dnf clean all
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY agencies.yaml civic_utils.py pipeline_preflight.py lambda_handler.py ./
+COPY agencies.yaml civic_utils.py config.py pipeline_preflight.py lambda_handler.py ./
 COPY scrapers/ scrapers/
 COPY transforms/triage.py transforms/meeting_merge.py transforms/monthly_rollup.py transforms/split_packets.py transforms/
 COPY lib/ lib/

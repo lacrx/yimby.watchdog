@@ -28,6 +28,12 @@ data "aws_iam_policy_document" "lambda_permissions" {
     ]
   }
 
+  # SSM Parameter Store — read jurisdiction config
+  statement {
+    actions   = ["ssm:GetParametersByPath"]
+    resources = ["arn:aws:ssm:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:parameter${var.ssm_prefix}*"]
+  }
+
   # CloudWatch Logs
   statement {
     actions = [

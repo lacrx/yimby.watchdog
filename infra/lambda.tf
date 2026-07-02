@@ -10,6 +10,8 @@ resource "aws_lambda_function" "watchdog_pipeline" {
     variables = {
       WATCHDOG_S3_BUCKET = aws_s3_bucket.watchdog_data.id
       WATCHDOG_DATA_DIR  = "/tmp/data"
+      SSM_PREFIX         = var.ssm_prefix
+      AWS_REGION_OVERRIDE = var.aws_region
     }
   }
 }
