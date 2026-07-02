@@ -31,37 +31,42 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from civic_utils import all_docs_dirs, all_meetings_dirs
 from transforms.triage import predict_relevance
+import config
 
 DATA_DIR = REPO_ROOT / "data"
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 STRUCTURED_DIR = DATA_DIR / "structured"
 
-EXTRACTION_PROMPT = """Extract structured data from this raw local government document. Return ONLY valid JSON, no markdown fencing, no explanation.
+_state_law_flags = config.get("extraction/state_law_flags",
+                              ["HAA", "SB330", "SB79", "SB35", "density_bonus", "housing_element"])
+_state_law_flags_str = " | ".join(_state_law_flags)
+
+EXTRACTION_PROMPT = f"""Extract structured data from this raw local government document. Return ONLY valid JSON, no markdown fencing, no explanation.
 
 Schema:
-{
+{{
   "meeting_id": "string — from filename or metadata",
   "date": "YYYY-MM-DD",
-  "body": "City Council | Planning Commission | NCTD Board | etc",
-  "agency": "City of Oceanside | NCTD",
+  "body": "string — the legislative body name from the document",
+  "agency": "string — the agency or jurisdiction name from the document",
   "doc_type": "agenda | minutes | staff_report | transcript | agenda_packet",
   "votes": [
-    {"item": "description", "result": "approved 4-1 | denied | tabled | continued", "yes": ["names"], "no": ["names"], "abstain": ["names"]}
+    {{"item": "description", "result": "approved 4-1 | denied | tabled | continued", "yes": ["names"], "no": ["names"], "abstain": ["names"]}}
   ],
   "housing_items": [
-    {"type": "zoning | density | permit | affordable | adu | transit_oriented | state_compliance", "description": "...", "address": "if mentioned", "units": null_or_number, "outcome": "approved | denied | continued | discussed", "state_law_flags": ["HAA | SB330 | SB79 | SB35 | density_bonus | housing_element"]}
+    {{"type": "zoning | density | permit | affordable | adu | transit_oriented | state_compliance", "description": "...", "address": "if mentioned", "units": null_or_number, "outcome": "approved | denied | continued | discussed", "state_law_flags": ["{_state_law_flags_str}"]}}
   ],
   "fiscal_items": [
-    {"description": "...", "amount": null_or_number, "type": "infrastructure | bond | contract | grant | fee"}
+    {{"description": "...", "amount": null_or_number, "type": "infrastructure | bond | contract | grant | fee"}}
   ],
   "legal_flags": ["string — any potential state law violation, enforcement action, or litigation risk"],
   "council_positions": [
-    {"member": "name", "action": "voted yes | voted no | abstained | moved | seconded | spoke for | spoke against | amended", "on": "item description", "evidence": "verbatim quote or factual description of what they did"}
+    {{"member": "name", "action": "voted yes | voted no | abstained | moved | seconded | spoke for | spoke against | amended", "on": "item description", "evidence": "verbatim quote or factual description of what they did"}}
   ],
   "public_comments": ["public comments mentioning specific agenda items, policies, or legal standards"],
   "key_quotes": ["direct quotes from officials or public — verbatim text only"],
   "procedural_only": false
-}
+}}
 
 Rules:
 - If the document is purely procedural (roll call, adjournment, consent calendar with nothing notable), set procedural_only: true and leave arrays empty.

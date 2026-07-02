@@ -1,0 +1,87 @@
+# Jurisdiction-specific configuration
+# Copy this to config.local.yaml and fill in your values.
+# Production deployments read from AWS SSM Parameter Store instead.
+
+identity:
+  org_name: "Your Org Name"
+  region_label: "Your Region, ST"          # e.g., "North San Diego County, CA"
+  state: "Your State"                       # e.g., "California"
+  primary_city: "Your City"                 # e.g., "Oceanside"
+  primary_city_slug: "your-city"            # lowercase, used as directory/key prefix
+
+advocacy:
+  lens: "YIMBY + Strong Towns"              # your analytical framework
+  lens_description: "Pro-housing, pro-density, transit-oriented"
+  advocate_role: "housing advocate"          # role used in LLM prompts
+
+# Council members, planning commissioners, and other officials to track.
+# These are used by yimby.analysis for leadership profiling and grading.
+# agency_group links officials to their body for comparative analysis.
+figures:
+  known_figures:
+    doe:
+      full_name: "Jane Doe"
+      title: "Mayor"
+      terms: "2022–present"
+      agency_group: "your-city-council"
+      aliases: ["doe", "mayor doe", "jane doe"]
+    # Add more officials...
+
+  agency_group_labels:
+    your-city-council: "Your City Council"
+    your-city-planning: "Your City Planning Commission"
+
+# RSS feeds and web pages to monitor for relevant news.
+# Tier 1 (direct_keywords) = immediate relevance, no LLM check needed.
+# Tier 2 (pattern_keywords) = topic match, LLM checks relevance to your jurisdiction.
+feeds:
+  rss_feeds:
+    - name: "Local Paper"
+      url: "https://localpaper.com/feed/"
+      tier: "journalism"
+    # Add more feeds...
+
+  web_pages:
+    - name: "State AG Housing"
+      url: "https://oag.ca.gov/housing"
+      tier: "state"
+
+  direct_keywords:
+    - "your city"
+    - "jane doe"                            # council member names
+    # Add project names, agency names, etc.
+
+  pattern_keywords:
+    - "housing accountability act"
+    - "builder's remedy"
+    # Add state law keywords relevant to your jurisdiction
+
+  relevance_context: |
+    Your city is currently:
+    - [Describe current housing/legal situation]
+    - [Key pending litigation or enforcement]
+    - [RHNA compliance status]
+
+# YouTube playlists for meeting video discovery
+videos:
+  playlists:
+    City Council: "PLxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# State law flags used in extraction prompt
+extraction:
+  state_law_flags:
+    - "HAA"
+    - "SB330"
+    # Add state-specific housing law abbreviations
+
+# Keywords used by yimby.analysis to filter relevant meeting records
+analysis:
+  relevance_keywords:
+    - "housing"
+    - "affordable"
+    - "density"
+    - "zoning"
+    - "transit"
+    - "parking"
+    - "budget"
+    # Add jurisdiction-specific project names, neighborhoods, etc.

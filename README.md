@@ -2,7 +2,7 @@
 
 An AI-augmented watchdog stack for monitoring municipal government. Built to give one person the legal knowledge, attention span, and time that holding local government accountable normally requires a full newsroom or advocacy organization to sustain.
 
-Currently monitoring **Oceanside, CA** and the regional agencies that govern it — but designed to be replicated for any California city with a Legistar portal.
+Designed to be forked and deployed for any jurisdiction. Configure your city, agencies, and advocacy lens — the scraper platform modules and extraction pipeline are generic.
 
 Modeled after [Listen Public](https://www.listenpublic.com/)'s approach to civic monitoring: ingest everything, structure it, make it queryable.
 
@@ -12,274 +12,256 @@ City councils make hundreds of decisions a year across dozens of meetings. Staff
 
 This stack does:
 
-1. **Scrapes** every meeting agenda, staff report, and attachment from Legistar portals (Oceanside, NCTD, SD County) and agency APIs (SANDAG Granicus, Coastal Commission)
+1. **Scrapes** every meeting agenda, staff report, and attachment from municipal portals (Legistar, Granicus, eScribe, CivicPlus, CivicClerk) and agency APIs
 2. **Fetches** building permits from eTRAKiT (housing-relevant types: SFD/duplex, multifamily, ADU)
-3. **Transcribes** meeting audio/video (YouTube, KOCT) using Whisper
+3. **Transcribes** meeting audio/video (YouTube) using Whisper
 4. **Extracts** structured records from every document — votes, motions, fiscal impacts, housing items — into machine-readable JSONL
 5. **Rolls up** all data sources (meetings + permits + intel) into independent monthly digests with content-hash change detection
-6. **Monitors** RSS feeds and web pages from housing enforcement orgs, state agencies, transit agencies, and local journalism for items relevant to the city
-7. **Archives** raw sources to S3, keeping only working data (text + structured records) local
+6. **Monitors** RSS feeds and web pages from housing enforcement orgs, state agencies, transit agencies, and local journalism for items relevant to your jurisdiction
+7. **Archives** raw sources to S3
 
 The output is structured data that turns years of meeting records into accountability tools. Downstream analysis (executive summaries, council member profiles, leadership grading) lives in `yimby.analysis`.
+
+## Architecture
+
+Split-mode pipeline — AWS Lambda handles scraping, local machine handles LLM extraction:
+
+```
+AWS Lambda (scheduled via EventBridge)
+  ├── Scrape all enabled agencies (agencies.yaml)
+  ├── Merge + rollup structured data
+  ├── Sync raw data to S3
+  └── Write S3 marker: pipeline/pending-extraction.json
+
+Local machine (cron every 5 min)
+  extract-watch
+  ├── Poll S3 for marker
+  ├── If found: download marker, delete from S3
+  └── Run extract-local
+        ├── Sync new docs from S3
+        ├── Extract via claude -p (subscription, not API)
+        └── Push structured records back to S3
+```
+
+## Configuration
+
+Jurisdiction-specific settings live in AWS SSM Parameter Store (production) or `config.local.yaml` (local dev). The `config.py` module handles loading and caching.
+
+### What's configurable
+
+| Setting | SSM Key | Example |
+|---------|---------|---------|
+| City name | `identity/primary_city` | Oceanside |
+| State | `identity/state` | California |
+| Region label | `identity/region_label` | North San Diego County, CA |
+| Advocacy lens | `advocacy/lens` | YIMBY + Strong Towns |
+| Council roster | `figures/known_figures` | JSON dict of officials |
+| RSS feeds | `feeds/rss_feeds` | JSON array of feed URLs |
+| Direct keywords | `feeds/direct_keywords` | Tier 1 keywords |
+| Relevance context | `feeds/relevance_context` | Current litigation/enforcement |
+| Video playlists | `videos/playlists` | YouTube playlist IDs |
+| State law flags | `extraction/state_law_flags` | HAA, SB330, SB79, ... |
+
+### What stays in files
+
+- `agencies.yaml` — agency registry (platform, base_url, bodies, enabled). Forks edit this directly.
+- `.env` — AWS bootstrap (region, SSM prefix, S3 bucket)
 
 ## Data Flow
 
 ```
 scrapers/
-  Legistar API ────────────────────────────┐
-    oceanside.py (Oceanside)               │
-    nctd.py (NCTD)                         │
-    sdcounty.py (SD County BOS)            │
-  SANDAG Granicus API                      │
-    sandag.py                              │
-  Coastal Commission State API             │
-    coastal.py                             │
-                                           ▼
-  YouTube/KOCT ──► discover_videos.py      data/documents/*.txt
-  eTRAKiT ──► oceanside.py permits ──► data/permits/*.jsonl
+  Platform modules:
+    legistar_html    (oceanside.py)        ─┐
+    legistar_odata   (sdcounty.py)          │
+    escribe          (sandag.py)            │
+    custom_html      (nctd.py)             ├──► data/{agency}/documents/*.txt
+    coastal_api      (coastal.py)           │
+    granicus         (granicus.py)           │
+    civicplus        (civicplus.py)          │
+    civicclerk       (carlsbad.py)          │
+    solana_drupal    (solana_beach.py)      ─┘
+
+  YouTube ──► discover_videos.py ──► data/transcribe-batch.json
+  eTRAKiT ──► etrakit.py ──► data/{agency}/permits/*.jsonl
   RSS/Web ──► intel_feed.py ──► data/intel/*.json
 
 transforms/
-         data/documents/*.txt  (pdftotext output)
-                    │
-                    ▼
-         extract_structured.py            ◄── claude -p per document
-                    │
-                    ▼
-         data/structured/*.json           ◄── one JSON per source doc
-                    │
-                    ▼
-         meeting_merge.py                 ◄── majority-vote date/agency
-                    │
-                    ▼
-         data/structured/meetings/*.json  ◄── one JSON per meeting
-                    │
-          ┌─────────┼──────────────────────────────┐
-          ▼         ▼                              ▼
-    meetings-   all-records.jsonl         monthly_rollup.py
-    combined.jsonl                     ◄── meetings + permits + intel
-                                      ◄── content-hash change detection
-                                           │
-                                           ▼
-                                  data/structured/monthly/*.json
+  documents/*.txt ──► extract_structured.py (claude -p) ──► structured/*.json
+  structured/*.json ──► meeting_merge.py ──► structured/meetings/*.json
+  meetings + permits + intel ──► monthly_rollup.py ──► structured/monthly/*.json
 
-S3 (yimby-watchdog-data bucket)
-  ├── archive/    PDFs + audio (durable archive)
-  ├── raw/        extracted text + transcripts
-  ├── structured/ records + meetings + monthly digests
-  ├── metadata/   meeting metadata per agency
-  └── operational/ permits + intel
+S3 (yimby-watchdog-data)
+  ├── raw/         extracted text per agency
+  ├── structured/  records + meetings + monthly digests
+  ├── pipeline/    pending-extraction marker
+  └── metadata/    meeting metadata
 ```
 
-## Nightly Pipeline
+## Pipeline Schedule
 
-Runs via cron at 1:00 AM. Three phases, prioritized so new meetings always get processed first:
+Lambda runs on EventBridge schedules (configurable in `infra/variables.tf`):
 
-```
-1:00 AM  Phase 1 — GATHER
-         ├── Fetch meetings (Oceanside, NCTD, SANDAG, SD County, CCC)
-         ├── Fetch building permits from eTRAKiT (current year, incremental)
-         ├── Check intel feeds (RSS, web pages)
-         ├── Discover new meeting videos
-         ├── Transcribe audio (if enabled)
-         └── Sync raw sources to S3
+| Time | What |
+|------|------|
+| 1:00 AM daily | Full pipeline: preflight → scrape all → merge + rollup |
+| 6:00 PM Tue-Fri | Evening catch: scrape + process (agendas often posted afternoon before meetings) |
 
-         Phase 2 — MERGE & ROLL UP
-         ├── Merge document records into per-meeting records
-         └── Rebuild stale monthly digests (content-hash detection)
-
-         Phase 3 — EXTRACT (remaining time until 4 AM)
-         ├── Structured extraction via claude -p (subscription, not API)
-         ├── Newest documents first (recent meetings get priority)
-         └── Hard cutoff at 4:00 AM
-
-4:00 AM  Sync structured data to S3. Pipeline doctor runs diagnostics.
-
-6:00 PM  Evening catch (Tue-Fri) — refetch + extract with no time limit.
-         Matches when cities typically post agendas for upcoming meetings.
-```
-
-Extraction is resumable — each document produces its own output file. The pipeline picks up where it left off the next run.
+After Lambda finishes, `extract-watch` detects the S3 marker within 5 minutes and starts `claude -p` extraction locally.
 
 ### Cron Setup
 
 ```bash
-# Nightly: fetch current year + extract until 4 AM
-0 1 * * * cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep --years 1 --extract-until 4 >> data/pipeline-cron.log 2>&1
-
-# Evening catch: Tue-Fri, no extraction time limit
-0 18 * * 2-5 cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep >> data/pipeline-cron.log 2>&1
+*/5 * * * * cd ~/repos/yimby.watchdog && ./extract-watch >> data/extract-watch.log 2>&1
 ```
 
-### Processing Modes
-
-| Mode | Summarizer | Transcriber | Cost | Use Case |
-|------|-----------|-------------|------|----------|
-| **local** | `claude -p` (subscription) | faster-whisper | $0 | Nightly cron (default) |
-| **hybrid** | `claude -p` (subscription) | Whisper API | ~$0.90/meeting | Better transcription quality |
-| **full** | Claude API (Opus) | Whisper API | ~$44/full run | Bulk backfill |
-
-### Pipeline Options
-
-| Flag | Effect |
-|------|--------|
-| `--deep` | Download staff reports (not just agendas/minutes) |
-| `--force` | Re-process already summarized/extracted documents |
-| `--years N` | How many years back to fetch (default: 1) |
-| `--transcribe` | Also transcribe meeting videos |
-| `--extract-until H` | Stop extraction at hour H (0-23) |
-
-### Initial Backfill
-
-For the first run, use `--years 5` or higher to pull historical meetings. This only needs to happen once — after that, `--years 1` keeps up with new meetings. Historical data is archived to S3 and doesn't need to be re-fetched.
+### Manual Pipeline Run
 
 ```bash
-# One-time backfill (will take several nights of extraction)
-./civic-pipeline local --deep --years 7
+# Full local run (scrape + extract, no Lambda)
+./civic-pipeline local --deep --years 1
 
-# After backfill completes, switch cron to --years 1
+# Just extraction
+./extract-local
+
+# Just one agency
+python scrapers/oceanside.py fetch --deep
 ```
 
-## Structured Data Layer
+## Supported Platforms
 
-Every raw source (PDF text, transcript) becomes a structured JSON record with typed fields:
+| Platform | Module | Used By |
+|----------|--------|---------|
+| Legistar HTML | `oceanside.py` | Any Legistar tenant |
+| Legistar OData | `sdcounty.py` | Legistar webapi instances |
+| eScribe | `sandag.py` | eScribe meeting portals |
+| Granicus | `granicus.py` | Granicus-hosted agendas |
+| CivicPlus | `civicplus.py` | CivicPlus portals |
+| CivicClerk | `carlsbad.py` | CivicClerk portals |
+| Coastal API | `coastal.py` | CA Coastal Commission |
+| Custom HTML | `nctd.py` | Custom scraper pattern |
 
-- `votes[]` — item, result, yes/no/abstain names
-- `housing_items[]` — type, units, outcome, state_law_flags
-- `fiscal_items[]` — description, amount, type
-- `legal_flags[]` — potential violations, enforcement actions
-- `council_positions[]` — member, stance, evidence
-Per-document records merge into per-meeting records (majority-vote date/agency selection), then roll up into monthly digests alongside permit data and intel feed items. Each month is independent — rebuilds only when its content hash changes.
+## Forking This
+
+To deploy for your own jurisdiction:
+
+### 1. Fork both repos
 
 ```bash
-# Check extraction progress
-python transforms/extract_structured.py --stats
-
-# Query with jq
-jq 'select(.council_positions[].member == "Joyce")' data/structured/all-records.jsonl
-
-# Check which months need rebuild
-python transforms/monthly_rollup.py --check
+git clone https://github.com/you/yimby.watchdog.git
+git clone https://github.com/you/yimby.analysis.git
 ```
 
-## What's Monitored
+### 2. Configure your agencies (`agencies.yaml`)
 
-**Agencies (5):**
-- City of Oceanside (Legistar) — 28 boards/commissions, 46 unique bodies
-- NCTD (Legistar) — Board of Directors, committees
-- SANDAG (Granicus) — Board, Regional Planning, Transportation, committees
-- San Diego County Board of Supervisors (Legistar OData) — BOS, Land Use
-- California Coastal Commission (state API) — permits and LCPs affecting Oceanside
+```yaml
+agencies:
+  your_city:
+    name: City of Springfield
+    platform: legistar_html
+    base_url: https://springfield.legistar.com
+    bodies:
+      - City Council
+      - Planning Commission
+    deep_fetch: true
+    lookback_months: 12
+    enabled: true
+```
 
-**Building Permits:** eTRAKiT scraper pulls SFD/duplex, multifamily, and ADU permits by year (2020-present). Rolled into monthly digests with unit estimates.
+### 3. Configure your jurisdiction (`config.local.yaml`)
 
-**External Sources (17+ feeds):** State agencies (HCD, Attorney General, CCC), enforcement orgs (CalHDF, YIMBY Law, Californians for Homeownership), regional transit (SANDAG, NCTD), legal analysis (Holland & Knight), journalism (Voice of San Diego, CalMatters, Circulate SD).
+```bash
+cp config.local.yaml.example config.local.yaml
+# Edit: city name, state, council roster, RSS feeds, advocacy lens
+```
 
-## Replicating This
+### 4. Set up AWS
 
-The stack works for any California city with a Legistar portal (most cities use one). The analysis layer — extraction, merge, rollups, summaries — is jurisdiction-agnostic.
+```bash
+cp .env.example .env
+# Edit: AWS_REGION, SSM_PREFIX, WATCHDOG_S3_BUCKET
 
-### What to change
+cd infra
+# Edit variables.tf: project name, bucket name
+terraform init && terraform apply
 
-1. **Add a scraper for your city.** Copy `scrapers/oceanside.py` and change the Legistar base URL and body names. The scraper pattern (fetch calendar → parse meetings → download PDFs → extract text) works for any Legistar instance.
+# Push config to SSM
+python scripts/seed_ssm.py --write
+```
 
-2. **Add your regional agencies.** Copy `scrapers/sandag.py` (Granicus API) or `scrapers/sdcounty.py` (Legistar OData) depending on what your regional agencies use. Wire them into `civic-pipeline`.
+### 5. First run
 
-3. **Update the intel feed.** `scrapers/intel_feed.py` monitors feeds relevant to Oceanside/San Diego. Replace local sources with your city's regional journalism and advocacy orgs. Keep statewide sources (HCD, CalHDF, YIMBY Law, AG, CalMatters).
+```bash
+# Fetch meetings
+./civic-pipeline local --deep --years 1
 
-4. **Point permits at your city.** `scrapers/oceanside.py permits` scrapes eTRAKiT. If your city uses a different permit portal, write a scraper that outputs the same JSONL format (`permit_no`, `type`, `status`, `applied`, `address`, `description`).
+# Extract structured records
+python transforms/extract_structured.py
 
-5. **Set up S3 (optional).** Set `WATCHDOG_S3_BUCKET` in `.env`. The pipeline syncs automatically — raw sources, structured records, monthly digests. Without it, everything stays local.
+# Merge + rollup
+python transforms/meeting_merge.py
+python transforms/monthly_rollup.py
+
+# Set up cron for extract-watch
+crontab -e
+```
 
 ### What you keep as-is
 
-- `transforms/extract_structured.py` — structured extraction prompt is jurisdiction-agnostic
+- `transforms/extract_structured.py` — extraction prompt is jurisdiction-agnostic
 - `transforms/meeting_merge.py` — merges by meeting_id, no city-specific logic
 - `transforms/monthly_rollup.py` — rolls up meetings + permits + intel by month
-- Policy knowledge base — CA housing law, fiscal analysis, crash data methodology (separate repo: `lacrx/policy-knowledge-docs`)
+- `config.py` — SSM/YAML loader
+- All platform scraper modules — generic per platform
 
-### What you need
+### Requirements
 
 - Python 3.10+
-- Claude Code CLI with active subscription (`claude -p` for structured extraction)
+- Claude Code CLI with active subscription (`claude -p` for extraction)
 - `pdftotext` (poppler-utils)
-- Python packages: `requests`, `feedparser`, `yt-dlp`
-- Optional: AWS CLI + S3 bucket (for archival backup)
-- Optional: `faster-whisper` (for zero-cost local transcription)
-- Optional: OpenAI API key (for Whisper API transcription in hybrid/full modes)
-
-### First run
-
-```bash
-# 1. Clone and set up
-git clone https://github.com/lacrx/yimby.watchdog.git
-cd yimby.watchdog
-python -m venv .venv && source .venv/bin/activate
-pip install requests feedparser yt-dlp
-
-# 2. Configure
-cp .env.example .env
-# Edit .env — set WATCHDOG_S3_BUCKET if using AWS, otherwise leave empty
-
-# 3. Fetch meetings (current year, with staff reports)
-python scrapers/oceanside.py fetch --deep
-
-# 4. Extract structured records (runs claude -p per document)
-python transforms/extract_structured.py
-
-# 5. Merge into per-meeting records
-python transforms/meeting_merge.py
-
-# 6. Build monthly digests (meetings + permits + intel)
-python transforms/monthly_rollup.py
-
-# 7. Set up nightly cron
-crontab -e
-# Add the two cron lines from the "Cron Setup" section above
-```
-
-The initial extraction takes time — `extract_structured.py` calls `claude -p` per document. For a city with 2,000+ documents, expect several nights of incremental processing. The pipeline is resumable; it picks up where it left off.
+- Python packages: `requests`, `feedparser`, `beautifulsoup4`, `lxml`, `pyyaml`, `yt-dlp`
+- AWS account with Terraform (for Lambda + S3 + SSM)
+- Optional: `faster-whisper` (for local transcription)
 
 ## Directory Structure
 
 ```
 yimby.watchdog/
-├── civic-pipeline              # Bash orchestrator (cron entry point)
-├── civic_utils.py              # Shared utilities (PDF download, text extraction, LLM calls)
-├── pipeline_doctor.py          # Self-healing pipeline diagnostics
-├── backfill-permits.sh         # One-time historical permit backfill
-├── scrapers/                   # Phase 1: agency fetchers
-│   ├── oceanside.py            # Oceanside Legistar scraper + eTRAKiT permits
-│   ├── nctd.py                 # NCTD Legistar scraper
-│   ├── sandag.py               # SANDAG Granicus scraper
-│   ├── sdcounty.py             # SD County BOS Legistar OData scraper
-│   ├── coastal.py              # CA Coastal Commission API scraper
-│   ├── intel_feed.py           # External source monitor (17+ feeds)
+├── civic-pipeline              # Bash orchestrator (manual/legacy runs)
+├── extract-watch               # Cron poller — detects new docs via S3 marker
+├── extract-local               # Runs claude -p extraction, syncs to S3
+├── lambda_handler.py           # AWS Lambda entry point
+├── civic_utils.py              # Shared utilities (PDF, text extraction, LLM)
+├── config.py                   # SSM/YAML config loader
+├── config.local.yaml           # Local dev config (gitignored)
+├── config.local.yaml.example   # Template for forks
+├── agencies.yaml               # Agency registry (platforms, URLs, bodies)
+├── pipeline_preflight.py       # Agency health checks
+├── scrapers/                   # Platform-specific fetchers
+│   ├── oceanside.py            # Legistar HTML
+│   ├── sdcounty.py             # Legistar OData
+│   ├── sandag.py               # eScribe
+│   ├── nctd.py                 # Custom HTML
+│   ├── coastal.py              # CA Coastal Commission API
+│   ├── granicus.py             # Granicus
+│   ├── civicplus.py            # CivicPlus
+│   ├── carlsbad.py             # CivicClerk
+│   ├── solana_beach.py         # Drupal-based
+│   ├── etrakit.py              # eTRAKiT permits
+│   ├── intel_feed.py           # RSS/web monitoring
 │   └── discover_videos.py      # YouTube video matching
-├── transforms/                 # Phase 2-3: merge, rollup, extract, transcribe
+├── transforms/                 # Extraction and rollup
 │   ├── extract_structured.py   # LLM → structured JSONL (claude -p)
-│   ├── meeting_merge.py        # Document → meeting merge (majority-vote)
-│   ├── monthly_rollup.py       # Monthly digest rollup (meetings + permits + intel)
-│   ├── transcribe.py           # Whisper API transcription
-│   └── transcribe_local.py     # Local Whisper transcription
-├── data/                       # All data (gitignored)
-│   ├── audio/                  # Downloaded meeting audio (pre-transcription)
-│   ├── coastal/                # Coastal Commission meeting data
-│   ├── cpra-templates/         # Public records act request templates
-│   ├── documents/              # Extracted text (.txt — PDFs archived to S3)
-│   ├── executive-summaries/    # Generated analysis (via yimby.analysis)
-│   ├── intel/                  # External feed hits
-│   ├── meetings/               # Per-meeting metadata + agenda items (Legistar)
-│   ├── nctd/                   # NCTD meeting data
-│   ├── permits/                # eTRAKiT permit JSONL (one file per year)
-│   ├── public-comments/        # Drafted public comments
-│   ├── sandag/                 # SANDAG meeting data
-│   ├── sdcounty/               # SD County BOS meeting data
-│   ├── structured/             # JSONL records + meetings + monthly digests
-│   ├── transcripts/            # Whisper transcription output (JSON)
-│   └── transport-safety-refs/  # Vision Zero / crash data references
-└── .claude/skills/
-    └── civic-pipeline/         # Pipeline operation guide
+│   ├── meeting_merge.py        # Document → meeting merge
+│   ├── monthly_rollup.py       # Monthly digest rollup
+│   ├── split_packets.py        # eScribe packet splitter
+│   └── triage.py               # Document relevance filter
+├── scripts/
+│   ├── seed_ssm.py             # Push config.local.yaml → SSM
+│   └── migrate_data_dirs.py    # Data directory migration
+├── infra/                      # Terraform (Lambda, S3, EventBridge, IAM)
+├── lib/                        # Storage utilities (S3 sync)
+└── data/                       # All data (gitignored)
 ```
 
 ## License

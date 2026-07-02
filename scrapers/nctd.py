@@ -33,6 +33,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from civic_utils import download_pdf, extract_text, save_json, load_json, agency_data_dir
+import config
 
 DATA_DIR = agency_data_dir("nctd")
 MEETINGS_DIR = DATA_DIR / "meetings"
@@ -42,7 +43,7 @@ STATE_FILE = DATA_DIR / "state.json"
 
 BOARD_AGENDA_URL = "https://gonctd.com/boardagenda/"
 
-WATCH_KEYWORDS = [
+DEFAULT_WATCH_KEYWORDS = [
     "housing", "TOD", "transit-oriented", "density", "affordable",
     "development", "zoning", "SANDAG", "LOSSAN", "Coaster", "Sprinter",
     "BREEZE", "frequency", "headway", "fare", "ridership",
@@ -50,7 +51,10 @@ WATCH_KEYWORDS = [
     "infrastructure", "budget", "capital", "bond",
     "active transportation", "bike", "pedestrian", "sidewalk",
     "parking", "climate", "electrification", "zero emission",
-    "Oceanside", "Carlsbad", "Vista", "San Marcos", "Escondido",
+]
+
+WATCH_KEYWORDS = DEFAULT_WATCH_KEYWORDS + [
+    config.get("identity/primary_city", "Oceanside"),
 ]
 
 

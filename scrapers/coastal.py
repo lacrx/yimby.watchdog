@@ -2,11 +2,11 @@
 """
 California Coastal Commission meeting monitor.
 
-Uses the CCC JSON API — filters for San Diego district and Oceanside items.
+Uses the CCC JSON API — filters for San Diego district and primary city items.
 
 Usage:
-    python coastal.py fetch [--years N]   # pull agendas, filter for Oceanside items
-    python coastal.py list                # list tracked meetings with Oceanside items
+    python coastal.py fetch [--years N]   # pull agendas, filter for primary city items
+    python coastal.py list                # list tracked meetings
 
 Requires: requests
 """
@@ -24,6 +24,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import requests
 
 from civic_utils import download_pdf, extract_text, save_json, load_json, agency_data_dir
+import config
 
 DATA_DIR = agency_data_dir("coastal")
 MEETINGS_DIR = DATA_DIR / "meetings"
@@ -32,8 +33,9 @@ STATE_FILE = DATA_DIR / "state.json"
 
 API_BASE = "https://api.coastal.ca.gov/agendas/v1"
 
+_primary_city = config.get("identity/primary_city", "Oceanside")
 WATCH_KEYWORDS = [
-    "Oceanside", "LCPA", "LCP Amendment",
+    _primary_city, "LCPA", "LCP Amendment",
     "North County", "San Luis Rey",
 ]
 
@@ -96,7 +98,7 @@ def find_relevant_items(agenda):
                         "blurb": blurb[:500] if blurb else "",
                         "result": result,
                         "assets": [{"name": a["name"], "url": a["url"]} for a in assets if a.get("url")],
-                        "is_oceanside": any(kw in combined for kw in ["Oceanside"]),
+                        "is_primary_city": _primary_city in combined,
                     })
 
                 for sub in cat.get("items", []):
@@ -113,7 +115,7 @@ def find_relevant_items(agenda):
                             "blurb": sub_blurb[:500] if sub_blurb else blurb[:500] if blurb else "",
                             "result": sub.get("result") or result,
                             "assets": [{"name": a["name"], "url": a["url"]} for a in sub.get("assets", []) if a.get("url")],
-                            "is_oceanside": any(kw in sub_combined for kw in ["Oceanside"]),
+                            "is_primary_city": _primary_city in sub_combined,
                         })
 
     return items
@@ -126,7 +128,7 @@ def cmd_fetch(args):
     now = datetime.now()
 
     total_items = 0
-    oceanside_items = 0
+    city_items = 0
 
     for year in range(min_year, now.year + 1):
         max_month = 12 if year < now.year else now.month
@@ -156,7 +158,7 @@ def cmd_fetch(args):
 
             items = find_relevant_items(agenda)
             meeting["sd_items"] = len(items)
-            meeting["oceanside_items"] = sum(1 for i in items if i.get("is_oceanside"))
+            meeting["city_items"] = sum(1 for i in items if i.get("is_primary_city"))
 
             meta_file = meeting_dir / "meeting.json"
             meta_file.write_text(json.dumps(meeting, indent=2))
@@ -165,12 +167,12 @@ def cmd_fetch(args):
             items_file.write_text(json.dumps(items, indent=2))
 
             total_items += len(items)
-            oceanside_items += meeting["oceanside_items"]
+            city_items += meeting["city_items"]
 
-            print(f"{len(items)} SD items, {meeting['oceanside_items']} Oceanside")
+            print(f"{len(items)} SD items, {meeting['city_items']} {_primary_city}")
 
             for item in items:
-                if not item.get("is_oceanside"):
+                if not item.get("is_primary_city"):
                     continue
                 for asset in item.get("assets", []):
                     url = asset.get("url", "")
@@ -192,7 +194,7 @@ def cmd_fetch(args):
                 "body": "CCC",
                 "date": f"{year}-{month:02d}",
                 "sd_items": len(items),
-                "oceanside_items": meeting["oceanside_items"],
+                "city_items": meeting["city_items"],
                 "fetched": now.isoformat(),
             }
 
@@ -200,7 +202,7 @@ def cmd_fetch(args):
 
     state["last_fetch"] = now.isoformat()
     save_state(state)
-    print(f"\nDone. {total_items} SD district items, {oceanside_items} Oceanside-specific.")
+    print(f"\nDone. {total_items} SD district items, {city_items} {_primary_city}-specific.")
 
 
 def cmd_list(args):
@@ -214,16 +216,16 @@ def cmd_list(args):
     for mid, info in sorted(state["meetings"].items(), key=lambda x: x[1].get("date", "")):
         date = info.get("date", "?")
         sd = info.get("sd_items", 0)
-        oc = info.get("oceanside_items", 0)
-        marker = " *** OCEANSIDE ***" if oc > 0 else ""
-        print(f"  {date}  CCC  [{sd} SD items, {oc} Oceanside]{marker}")
+        oc = info.get("city_items", 0)
+        marker = f" *** {_primary_city.upper()} ***" if oc > 0 else ""
+        print(f"  {date}  CCC  [{sd} SD items, {oc} {_primary_city}]{marker}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="California Coastal Commission monitor")
     sub = parser.add_subparsers(dest="command")
 
-    p_fetch = sub.add_parser("fetch", help="Pull CCC agendas, filter for SD/Oceanside items")
+    p_fetch = sub.add_parser("fetch", help="Pull CCC agendas, filter for SD district items")
     p_fetch.add_argument("--years", type=int, default=1, help="How many years back (default: 1)")
 
     sub.add_parser("list", help="List tracked meetings")

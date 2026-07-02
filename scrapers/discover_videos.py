@@ -5,10 +5,7 @@ Auto-discover meeting video URLs from YouTube playlists and NCTD meeting data.
 Matches YouTube videos to meeting IDs by date, populates transcribe-batch.json
 for the transcription pipeline.
 
-Sources:
-  - Oceanside City Council: YouTube playlist PLUunlla2QsxHz0ZCuVvsi-xwpm6tZiGMN
-  - Oceanside Planning Commission: YouTube playlist PLUunlla2QsxGU8lQ-GUqresB-pzfcXYhA
-  - NCTD Board: video_url field in meeting.json (scraped from gonctd.com)
+Sources loaded from config (videos/playlists) plus NCTD meeting.json video_url fields.
 
 Usage:
     python discover_videos.py                # discover new videos, update batch file
@@ -31,13 +28,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 from civic_utils import all_meetings_dirs, load_agencies, DATA_DIR
+import config
 TRANSCRIPTS_DIR = DATA_DIR / "transcripts"
 BATCH_FILE = DATA_DIR / "transcribe-batch.json"
 
-PLAYLISTS = {
+DEFAULT_PLAYLISTS = {
     "City Council": "PLUunlla2QsxHz0ZCuVvsi-xwpm6tZiGMN",
     "Planning Commission": "PLUunlla2QsxGU8lQ-GUqresB-pzfcXYhA",
 }
+PLAYLISTS = config.get("videos/playlists", DEFAULT_PLAYLISTS)
 
 # Bodies whose meetings always warrant transcription
 HIGH_PRIORITY_BODIES = {

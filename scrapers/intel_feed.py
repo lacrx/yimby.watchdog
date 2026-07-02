@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Intel feed monitor — checks RSS feeds and web pages for items relevant
-to Oceanside housing advocacy. Two-tier detection:
+to local housing advocacy. Two-tier detection:
 
-  Tier 1 (direct): Mentions Oceanside, NCTD, council members, or local projects
+  Tier 1 (direct): Mentions primary city, transit agencies, council members, or local projects
   Tier 2 (pattern): Legal theories, enforcement actions, or policy developments
-         that affect Oceanside's situation even if another city is named
+         that affect the jurisdiction even if another city is named
 
 Stores new items in data/intel/, summarizes hits via claude -p.
+Feed sources, keywords, and relevance context are configurable via config.local.yaml / SSM.
 
 Usage:
     python intel_feed.py                # check all feeds, flag relevant items
@@ -32,124 +33,58 @@ sys.path.insert(0, str(REPO_ROOT))
 import feedparser
 import requests
 from civic_utils import DATA_DIR
+import config
+
 INTEL_DIR = DATA_DIR / "intel"
 STATE_FILE = INTEL_DIR / "feed-state.json"
 
-USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) civics-intel/1.0"
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) yimby-watchdog/1.0"
 
 # ═══════════════════════════════════════════
-# FEED SOURCES
+# All feed sources, keywords, and relevance context
+# are loaded from config (SSM or config.local.yaml).
+# Defaults below are used if config is missing.
 # ═══════════════════════════════════════════
 
-RSS_FEEDS = [
-    {"name": "Voice of San Diego — Housing", "url": "https://voiceofsandiego.org/category/housing/feed/", "tier": "journalism"},
-    {"name": "Voice of San Diego — Main", "url": "https://voiceofsandiego.org/feed", "tier": "journalism"},
+_DEFAULT_RSS_FEEDS = [
     {"name": "CalMatters — Housing", "url": "https://calmatters.org/category/housing/feed/", "tier": "journalism"},
     {"name": "LAist", "url": "https://laist.com/rss-feed", "tier": "journalism"},
-    {"name": "The Real Deal — LA", "url": "https://therealdeal.com/la/feed", "tier": "journalism"},
-    {"name": "LAO Publications", "url": "https://lao.ca.gov/RSS", "tier": "state"},
     {"name": "CalHDF News", "url": "https://calhdf.org/category/news/feed/", "tier": "enforcement"},
     {"name": "California YIMBY Blog", "url": "https://cayimby.org/blog/feed/", "tier": "enforcement"},
-    {"name": "Holland & Knight — Breaking Ground", "url": "https://www.hklaw.com/en/insights/blogs/breaking-ground-west-coast-real-estate-and-land-use-blog/rss", "tier": "legal"},
-    {"name": "Cox Castle — Lay of the Land", "url": "https://landuse.coxcastle.com/feed/", "tier": "legal"},
-    {"name": "Circulate SD Blog", "url": "https://www.circulatesd.org/blog?format=rss", "tier": "enforcement"},
 ]
 
-WEB_PAGES = [
+_DEFAULT_WEB_PAGES = [
     {"name": "AG Housing Enforcement", "url": "https://oag.ca.gov/housing", "tier": "state"},
-    {"name": "AG Press Releases", "url": "https://oag.ca.gov/media/news", "tier": "state"},
     {"name": "HCD Enforcement", "url": "https://www.hcd.ca.gov/planning-and-community-development/housing-open-data-tools/housing-element-implementation-and-apr", "tier": "state"},
-    {"name": "CCC Current Agenda", "url": "https://www.coastal.ca.gov/mtgcurr.html", "tier": "state"},
     {"name": "YIMBY Law Press", "url": "https://www.yimbylaw.org/press", "tier": "enforcement"},
-    {"name": "SANDAG Board Calendar", "url": "https://www.sandag.org/meetings-and-events/board-of-directors", "tier": "regional"},
 ]
 
-# ═══════════════════════════════════════════
-# TIER 1: DIRECT MENTION KEYWORDS
-# ═══════════════════════════════════════════
+RSS_FEEDS = config.get("feeds/rss_feeds", _DEFAULT_RSS_FEEDS)
+WEB_PAGES = config.get("feeds/web_pages", _DEFAULT_WEB_PAGES)
+DIRECT_KEYWORDS = config.get("feeds/direct_keywords", [])
+PATTERN_KEYWORDS = config.get("feeds/pattern_keywords", [])
 
-DIRECT_KEYWORDS = [
-    # City and agencies
-    "oceanside", "city of oceanside", "oceansideca",
-    "nctd", "north county transit",
-    # Council members
-    "esther sanchez", "eric joyce", "peter weiss", "rick robinson",
-    "jimmy figueroa", "jaime figueroa",
-    # Projects and locations
-    "oceanside transit center", "otc",
-    "503 vista bella", "801 mission", "calavera hills",
-    "rodeway inn", "1103 n. coast highway", "1103 north coast",
-    "blocks 5 and 20", "seagaze", "712 seagaze",
-    # Specific to our CPRA / legal campaign
-    "oceanside tier", "oceanside sb 79", "oceanside phasing",
-]
+_primary_city = config.get("identity/primary_city", "the jurisdiction")
+_state = config.get("identity/state", "")
+_relevance_context = config.get("feeds/relevance_context", "")
 
-# ═══════════════════════════════════════════
-# TIER 2: PATTERN RELEVANCE TOPICS
-# Items about these topics involving ANY city
-# get a claude -p relevance check
-# ═══════════════════════════════════════════
+RELEVANCE_PROMPT = f"""You are a housing policy analyst monitoring news and enforcement actions for an advocate in {_primary_city}, {_state}.
 
-PATTERN_KEYWORDS = [
-    # SB 79 and transit density (any city)
-    "sb 79", "sb79", "transit-oriented development stop", "tod stop",
-    "tier classification", "tier 1 tod", "tier 2 tod",
-    "dedicated bus lane", "transit density",
-    "train count", "high-frequency commuter rail",
-    # Enforcement actions (any city — legal theories may apply)
-    "housing accountability act", "haa violation", "haa penalty",
-    "builder's remedy", "builders remedy",
-    "technical assistance letter", "notice of violation",
-    "housing element decertif", "housing element noncomplian",
-    "attorney general housing", "ag housing enforcement",
-    "hcd enforcement", "hcd referral",
-    # Coastal Act + housing (any city)
-    "coastal act housing", "coastal act density",
-    "lcp amendment", "coastal commission housing",
-    "density bonus coastal", "coastal zone housing",
-    # Legal outcomes (penalty amounts, settlements — establishes precedents)
-    "calhdf", "california housing defense",
-    "yimby law", "californians for homeownership",
-    "appeal bond housing", "haa attorney fees",
-    "$10,000 per unit", "$50,000 per unit",
-    # RHNA and compliance (any city in San Diego region)
-    "rhna san diego", "rhna progress",
-    "prohousing designation",
-    # Walking path / parcel exclusion tactics
-    "walking path", "walking distance sb",
-    "parcel exclusion", "site exclusion",
-    # Good Cause / rent control misclassification
-    "good cause eviction", "rent control sb 79",
-    "costa-hawkins sb 79",
-    # SANDAG map
-    "sandag tod", "sandag sb 79", "sandag transit",
-    "sprinter station", "coaster station",
-    "solana beach station",
-]
+{_relevance_context}
 
-RELEVANCE_PROMPT = """You are a housing policy analyst monitoring news and enforcement actions for an advocate in Oceanside, CA.
-
-Oceanside is currently:
-- Fighting SB 79 compliance (misclassified OTC as Tier 2 despite 130 trains/day; Tier 1 threshold is 72)
-- Using walking path fabrication, Good Cause/rent control misclassification, habitat exclusions, and Coastal Act shield to limit housing
-- Subject to CalHDF/CFH May 20, 2026 letter identifying 6 violations
-- Subject to six-org coalition SANDAG letter demanding Tier 1 designation (May 29, 2026)
-- Facing $55M-$249M estimated legal exposure across 4 litigation fronts
-- 11% lower-income RHNA progress at cycle midpoint
-
-Does this item affect Oceanside's legal exposure, advocacy strategy, or political landscape? Consider:
-- Does it establish legal precedent that applies to Oceanside's situation?
-- Does it signal enforcement action that could extend to Oceanside?
-- Does it involve a city using the same obstruction tactics Oceanside uses?
-- Does it change the political calculus for SB 79 compliance in San Diego County?
+Does this item affect {_primary_city}'s legal exposure, advocacy strategy, or political landscape? Consider:
+- Does it establish legal precedent that applies to {_primary_city}'s situation?
+- Does it signal enforcement action that could extend to {_primary_city}?
+- Does it involve a city using the same obstruction tactics {_primary_city} uses?
+- Does it change the political calculus for housing law compliance in the region?
 
 Respond with ONLY a JSON object:
-{
+{{
   "relevant": true/false,
   "relevance_score": 1-10,
   "reason": "one sentence explaining why this matters or doesn't",
   "action_items": ["what the advocate should do in response"] or []
-}
+}}
 
 Item to evaluate:
 """
@@ -176,7 +111,7 @@ def matches_keywords(text, keywords):
 
 
 def check_relevance_claude(title, summary, source):
-    """Ask claude -p whether a pattern-matched item is relevant to Oceanside."""
+    """Ask claude -p whether a pattern-matched item is relevant."""
     text = f"Source: {source}\nTitle: {title}\nContent: {summary[:3000]}"
     prompt = RELEVANCE_PROMPT + text
 
@@ -410,7 +345,7 @@ def cmd_stats(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Intel feed monitor for Oceanside housing advocacy")
+    parser = argparse.ArgumentParser(description="Intel feed monitor for civic housing advocacy")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be checked")
     parser.add_argument("--force", action="store_true", help="Re-check all items")
     parser.add_argument("--stats", action="store_true", help="Show intel feed stats")

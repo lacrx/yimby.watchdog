@@ -2,6 +2,21 @@
 
 This repo is the ETL/pipeline layer for civic monitoring. It scrapes meeting agendas, transcribes video, extracts structured data (JSONL), and manages the transcription backlog. It does NOT generate prose analysis or advocacy intelligence — that lives in `yimby.analysis`.
 
+## Architecture
+
+**Split-mode pipeline:** AWS Lambda scrapes on schedule → writes S3 marker → local machine polls for marker via `extract-watch` → runs `claude -p` extraction via `extract-local`.
+
+**Config:** Jurisdiction-specific settings (city name, council roster, feeds, advocacy lens) live in AWS SSM Parameter Store. Local dev uses `config.local.yaml` fallback. `agencies.yaml` is the structural scraper registry (platforms, URLs, bodies). See `config.py` for the loader.
+
+**Key files:**
+- `agencies.yaml` — agency registry (platform, base_url, enabled, bodies, lookback)
+- `config.py` — SSM/YAML config loader (cached, ~50 lines)
+- `config.local.yaml` — local dev config (gitignored)
+- `lambda_handler.py` — Lambda entry point, dispatches by platform
+- `extract-watch` — cron-driven S3 marker poller
+- `extract-local` — runs `claude -p` extraction, syncs results to S3
+- `civic-pipeline` — legacy local orchestrator (still works for manual runs)
+
 ## Related Projects
 - `yimby.analysis`: downstream analysis — executive summaries, council member profiles, leadership grading. Reads from this repo's `data/` directory
 - `stoside.data`: municipal fiscal intelligence, budget/CIP/vote history
