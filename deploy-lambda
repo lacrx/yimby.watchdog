@@ -1,0 +1,87 @@
+#!/bin/bash
+# Build, push, and deploy the Lambda container image.
+#
+# Usage:
+#   ./deploy-lambda              # build and deploy
+#   ./deploy-lambda --skip-build # push existing local image and update Lambda
+#
+# Requires: docker, aws CLI
+# Uses AWS profile: watchdog (assumes watchdog-deployer role)
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+AWS_ACCOUNT_ID="662460439248"
+AWS_REGION="us-west-2"
+AWS_PROFILE="watchdog"
+ECR_REPO="yimby-watchdog"
+LAMBDA_FUNCTION="yimby-watchdog-pipeline"
+DOCKERFILE="Dockerfile.lambda"
+IMAGE_TAG="$(git rev-parse --short HEAD)-$(date +%Y%m%d%H%M%S)"
+
+REPO_URI="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+IMAGE_URI="${REPO_URI}:${IMAGE_TAG}"
+
+SKIP_BUILD=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --skip-build) SKIP_BUILD=true; shift ;;
+        *)            echo "Usage: deploy-lambda [--skip-build]"; exit 1 ;;
+    esac
+done
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [deploy] $*"; }
+
+# ── Step 1: Build ──
+if [ "$SKIP_BUILD" = false ]; then
+    log "Building image from ${DOCKERFILE}..."
+    docker build -t "${ECR_REPO}:${IMAGE_TAG}" -f "${DOCKERFILE}" .
+else
+    log "Skipping build (--skip-build)"
+fi
+
+# ── Step 2: Authenticate to ECR ──
+log "Authenticating to ECR..."
+aws ecr get-login-password --region "${AWS_REGION}" --profile "${AWS_PROFILE}" \
+    | docker login --username AWS --password-stdin \
+      "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+# ── Step 3: Tag and push ──
+log "Tagging and pushing ${IMAGE_TAG}..."
+docker tag "${ECR_REPO}:${IMAGE_TAG}" "${IMAGE_URI}"
+docker push "${IMAGE_URI}"
+
+docker tag "${ECR_REPO}:${IMAGE_TAG}" "${REPO_URI}:latest"
+docker push "${REPO_URI}:latest"
+
+# ── Step 4: Update Lambda ──
+# AWS CLI v2.0.19 lacks --image-uri; use Python boto3 instead
+log "Updating Lambda function ${LAMBDA_FUNCTION}..."
+python3 - "${LAMBDA_FUNCTION}" "${IMAGE_URI}" "${AWS_REGION}" "${AWS_PROFILE}" <<'PYEOF'
+import sys, boto3, time
+
+function_name, image_uri, region, profile = sys.argv[1:5]
+session = boto3.Session(profile_name=profile, region_name=region)
+client = session.client("lambda")
+
+resp = client.update_function_code(
+    FunctionName=function_name,
+    ImageUri=image_uri,
+)
+print(f"  Update started: {resp['LastUpdateStatus']}")
+
+while True:
+    time.sleep(3)
+    cfg = client.get_function_configuration(FunctionName=function_name)
+    status = cfg.get("LastUpdateStatus", "Unknown")
+    if status == "Successful":
+        print(f"  Update complete. CodeSha256: {cfg['CodeSha256'][:12]}...")
+        break
+    elif status == "Failed":
+        print(f"  ERROR: {cfg.get('LastUpdateStatusReason', 'unknown')}")
+        sys.exit(1)
+    else:
+        print(f"  Status: {status}...")
+PYEOF
+
+log "Deploy complete: ${IMAGE_URI}"

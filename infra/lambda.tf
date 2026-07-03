@@ -14,6 +14,10 @@ resource "aws_lambda_function" "watchdog_pipeline" {
       AWS_REGION_OVERRIDE = var.aws_region
     }
   }
+
+  lifecycle {
+    ignore_changes = [image_uri]
+  }
 }
 
 # Log group auto-created by Lambda on first invocation.
