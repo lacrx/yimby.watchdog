@@ -184,20 +184,10 @@ def probe_coastal_api(cfg):
 
 
 def probe_carlsbad_cms(cfg):
+    from curl_cffi import requests as cffi_requests
     base = cfg.get("base_url", "").rstrip("/")
     url = f"{base}/city-hall/meetings-agendas"
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-    }
-    resp = requests.get(url, timeout=PROBE_TIMEOUT, headers=headers)
+    resp = cffi_requests.get(url, timeout=PROBE_TIMEOUT, impersonate="firefox")
     if resp.status_code != 200:
         return False, f"HTTP {resp.status_code} (Akamai WAF block)"
     if "Access Denied" in resp.text[:500]:
