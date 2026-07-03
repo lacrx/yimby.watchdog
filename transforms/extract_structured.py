@@ -160,6 +160,8 @@ def _call_claude(prompt, max_retries=2):
 
             try:
                 record = json.loads(output)
+                if isinstance(record, list):
+                    record = record[0] if len(record) == 1 else {"_chunks": record}
                 return record
             except json.JSONDecodeError as e:
                 if attempt < max_retries:
@@ -191,6 +193,11 @@ def _merge_records(records):
     if len(records) == 1:
         return records[0]
 
+    records = [r for r in records if isinstance(r, dict)]
+    if not records:
+        return None
+    if len(records) == 1:
+        return records[0]
     merged = records[0].copy()
     for r in records[1:]:
         for key in ["votes", "housing_items", "fiscal_items", "legal_flags",
@@ -251,6 +258,121 @@ def extract_structured(text, meeting_meta):
         time.sleep(1)
 
     return _merge_records(records)
+
+
+CHARS_PER_TOKEN = 4
+OPUS_INPUT_PER_MTOK = 15.0
+OPUS_OUTPUT_PER_MTOK = 75.0
+PROMPT_OVERHEAD_TOKENS = 800
+OUTPUT_TOKENS_EST = 1500
+TALLY_PATH = DATA_DIR / "pipeline" / "extraction-tally.jsonl"
+
+
+def cmd_tally(args):
+    """Log what incoming docs would cost at API rates, without extracting."""
+    from transforms.triage import predict_relevance
+    from collections import defaultdict
+
+    all_sources = collect_all_sources()
+    if not all_sources:
+        print("No sources found.")
+        return
+
+    agency_tally = defaultdict(lambda: {
+        "docs": 0, "need_llm": 0, "triage_skip": 0, "skip_marker": 0,
+        "skip_short": 0, "input_tokens": 0, "output_tokens_est": 0, "chunks": 0,
+    })
+
+    for source_type, sf in all_sources:
+        if source_type == "transcript":
+            agency = "transcripts"
+        elif sf.parent.name == "documents":
+            agency = sf.parent.parent.name
+        else:
+            agency = sf.parent.name
+
+        stem = sf.stem.replace("-transcript", "") if source_type == "transcript" else sf.stem
+        suffix = "-transcript" if source_type == "transcript" else ""
+        out_path = STRUCTURED_DIR / f"{stem}{suffix}.json"
+
+        if has_skip_marker(sf):
+            agency_tally[agency]["skip_marker"] += 1
+            continue
+
+        if out_path.exists():
+            try:
+                data = json.loads(out_path.read_text())
+                if isinstance(data, dict):
+                    continue
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        agency_tally[agency]["docs"] += 1
+
+        try:
+            text = sf.read_text()
+        except OSError:
+            agency_tally[agency]["skip_short"] += 1
+            continue
+
+        if is_skippable(text):
+            agency_tally[agency]["skip_short"] += 1
+            continue
+
+        extract, _ = predict_relevance(text, sf.name)
+        if not extract:
+            agency_tally[agency]["triage_skip"] += 1
+            continue
+
+        text_len = len(text)
+        if text_len <= CHUNK_SIZE:
+            n_chunks = 1
+        else:
+            n_chunks = (text_len // (CHUNK_SIZE - CHUNK_OVERLAP)) + 1
+
+        input_tokens = (text_len // CHARS_PER_TOKEN) + (PROMPT_OVERHEAD_TOKENS * n_chunks)
+        output_tokens = OUTPUT_TOKENS_EST * n_chunks
+
+        agency_tally[agency]["need_llm"] += 1
+        agency_tally[agency]["input_tokens"] += input_tokens
+        agency_tally[agency]["output_tokens_est"] += output_tokens
+        agency_tally[agency]["chunks"] += n_chunks
+
+    totals = {"docs": 0, "need_llm": 0, "triage_skip": 0, "input_tokens": 0,
+              "output_tokens_est": 0, "chunks": 0}
+    incoming = {}
+    for agency, t in sorted(agency_tally.items()):
+        if t["docs"] == 0 and t["skip_marker"] == 0:
+            continue
+        incoming[agency] = t
+        for k in totals:
+            totals[k] += t.get(k, 0)
+
+    input_cost = (totals["input_tokens"] / 1_000_000) * OPUS_INPUT_PER_MTOK
+    output_cost = (totals["output_tokens_est"] / 1_000_000) * OPUS_OUTPUT_PER_MTOK
+    est_cost = round(input_cost + output_cost, 4)
+
+    entry = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "incoming": incoming,
+        "totals": {**totals, "est_cost_usd": est_cost},
+    }
+
+    TALLY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(TALLY_PATH, "a") as f:
+        f.write(json.dumps(entry, default=str) + "\n")
+
+    print(f"=== Extraction Cost Tally — {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
+    print()
+    print(f"{'Agency':<15} {'New':>5} {'LLM':>5} {'Skip':>5} {'Tokens':>10} {'Chunks':>7}")
+    print("-" * 52)
+    for agency in sorted(incoming):
+        t = incoming[agency]
+        print(f"{agency:<15} {t['docs']:>5} {t['need_llm']:>5} {t['triage_skip']:>5} {t['input_tokens']:>10} {t['chunks']:>7}")
+    print("-" * 52)
+    print(f"{'TOTAL':<15} {totals['docs']:>5} {totals['need_llm']:>5} {totals['triage_skip']:>5} {totals['input_tokens']:>10} {totals['chunks']:>7}")
+    print(f"\nEstimated API cost (Opus 4.8): ${est_cost:.4f}")
+    print(f"Logged to {TALLY_PATH}")
 
 
 def rebuild_combined(structured_dir):
@@ -423,6 +545,10 @@ def cmd_extract(args):
             remaining = len(to_process) - i
             print(f"\nStopping at {datetime.now().strftime('%H:%M')} ({remaining} remaining, will resume next run)")
             break
+        if getattr(args, "limit", None) and success >= args.limit:
+            remaining = len(to_process) - i
+            print(f"\nLimit reached ({args.limit} extractions). {remaining} remaining, will resume next run.")
+            break
 
         label = f"[{source_type}]" if source_type == "transcript" else ""
         print(f"[{i+1}/{len(to_process)}] {sf.name} {label}")
@@ -581,10 +707,14 @@ def main():
     parser.add_argument("--stop-at", type=int, metavar="HOUR", help="Stop extraction at this hour (0-23). Resumes next run.")
     parser.add_argument("--meeting", action="append", metavar="ID", help="Only extract sources for these meeting IDs (repeatable)")
     parser.add_argument("--no-triage", action="store_true", help="Disable ML triage — extract all documents")
+    parser.add_argument("--tally", action="store_true", help="Log incoming doc counts and estimated API cost without extracting")
+    parser.add_argument("--limit", type=int, metavar="N", help="Stop after N successful extractions")
 
     args = parser.parse_args()
 
-    if args.stats:
+    if args.tally:
+        cmd_tally(args)
+    elif args.stats:
         cmd_stats(args)
     elif args.rebuild:
         STRUCTURED_DIR.mkdir(parents=True, exist_ok=True)
