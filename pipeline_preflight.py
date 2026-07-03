@@ -184,35 +184,28 @@ def probe_coastal_api(cfg):
 
 
 def probe_carlsbad_cms(cfg):
-    import subprocess
     base = cfg.get("base_url", "").rstrip("/")
     url = f"{base}/city-hall/meetings-agendas"
-    try:
-        result = subprocess.run([
-            "curl", "-s", "--compressed", "--max-time", str(PROBE_TIMEOUT),
-            "-H", "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
-            "-H", "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "-H", "Sec-Fetch-Dest: document",
-            "-H", "Sec-Fetch-Mode: navigate",
-            "-H", "Sec-Fetch-Site: none",
-            "-w", "\n%{http_code}",
-            url,
-        ], capture_output=True, text=True, timeout=PROBE_TIMEOUT + 5)
-        lines = result.stdout.strip().split("\n")
-        code = lines[-1] if lines else "0"
-        body = "\n".join(lines[:-1])
-        if code != "200":
-            return False, f"HTTP {code} (Akamai WAF block — curl TLS fingerprint may need updating)"
-        if "Access Denied" in body[:500]:
-            return False, "WAF soft-block (Access Denied in response body)"
-        if "-folder-" not in body:
-            return False, "no folder links found (page structure changed?)"
-        folder_count = body.count("-folder-")
-        return True, f"OK ({folder_count} folder links)"
-    except subprocess.TimeoutExpired:
-        return False, f"timeout after {PROBE_TIMEOUT}s"
-    except FileNotFoundError:
-        return False, "curl not found"
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
+    resp = requests.get(url, timeout=PROBE_TIMEOUT, headers=headers)
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code} (Akamai WAF block)"
+    if "Access Denied" in resp.text[:500]:
+        return False, "WAF soft-block (Access Denied in response body)"
+    if "-folder-" not in resp.text:
+        return False, "no folder links found (page structure changed?)"
+    folder_count = resp.text.count("-folder-")
+    return True, f"OK ({folder_count} folder links)"
 
 
 def probe_solana_drupal(cfg):
