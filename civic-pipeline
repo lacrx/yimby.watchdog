@@ -116,8 +116,8 @@ log "Starting civic pipeline (mode=$MODE)"
 # ═══════════════════════════════════════════
 
 log "Running preflight health checks..."
-python3 pipeline_preflight.py >> data/preflight.log 2>&1
-PREFLIGHT_RC=$?
+PREFLIGHT_RC=0
+python3 pipeline_preflight.py >> data/preflight.log 2>&1 || PREFLIGHT_RC=$?
 if [ "$PREFLIGHT_RC" -eq 2 ]; then
     log "PREFLIGHT ABORT: All agencies failing — likely network issue. Stopping pipeline."
     exit 1
@@ -277,6 +277,9 @@ if [ -n "${WATCHDOG_S3_BUCKET:-}" ]; then
             sync_to_s3 "archive/${SLUG}/documents/pdfs" "data/${SLUG}/documents" "STANDARD" --exclude "*.txt" --exclude "*.skip" --exclude "*.json"
             sync_to_s3 "raw/${SLUG}/documents/txt" "data/${SLUG}/documents" "STANDARD_IA" --exclude "*.pdf" --exclude "*.skip" --exclude "*.json"
         fi
+        if [ -f "data/${SLUG}/doc-index.json" ]; then
+            aws s3 cp "data/${SLUG}/doc-index.json" "s3://${WATCHDOG_S3_BUCKET}/raw/${SLUG}/doc-index.json" --quiet || true
+        fi
         if [ -d "data/${SLUG}/meetings" ]; then
             sync_to_s3 "metadata/${SLUG}/meetings" "data/${SLUG}/meetings" "STANDARD"
         fi
@@ -312,41 +315,56 @@ python3 transforms/monthly_rollup.py >> data/monthly-rollup.log 2>&1
 log "Monthly rollups done."
 
 # ═══════════════════════════════════════════
-# PHASE 3: EXTRACT — use remaining time for structured extraction
+# PHASE 3a: HOT EXTRACT — recent meetings, must complete
 # ═══════════════════════════════════════════
-# Processes unextracted docs (new and backfill) until hard cutoff.
-# Newest docs sort first so recent meetings get priority.
+# Documents from meetings in the last 14 days. No time limit — these
+# must always be processed. Failures are logged loudly.
 
 EXTRACT_BEFORE=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
-EXTRACT_TIMESTAMP=$(mktemp)
 
-if [ -n "$EXTRACT_CUTOFF" ]; then
-    log "Structured extraction until ${EXTRACT_CUTOFF}:00..."
-    python3 transforms/extract_structured.py --stop-at "$EXTRACT_CUTOFF" $FORCE >> data/structured-extraction.log 2>&1
-    log "Extraction done."
-else
-    log "Structured extraction (no time limit)..."
-    python3 transforms/extract_structured.py $FORCE >> data/structured-extraction.log 2>&1
-    log "Extraction done."
+log "Hot extraction (last 14 days)..."
+HOT_RC=0
+python3 transforms/extract_structured.py --queue hot $FORCE >> data/structured-extraction.log 2>&1 || HOT_RC=$?
+
+EXTRACT_AFTER_HOT=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
+HOT_EXTRACTIONS=$((EXTRACT_AFTER_HOT - EXTRACT_BEFORE))
+
+if [ "$HOT_RC" -ne 0 ]; then
+    log "WARNING: Hot extraction failed (exit $HOT_RC). Check data/structured-extraction.log"
 fi
-
-# Prose summaries removed — structured JSONL + monthly rollups are the
-# canonical data layer. Agents read JSONL directly.
+log "Hot extraction done: $HOT_EXTRACTIONS new."
 
 # ═══════════════════════════════════════════
-# PHASE 4: SUMMARY
+# PHASE 3b: COLD EXTRACT — backlog, time-bounded, optional
 # ═══════════════════════════════════════════
+# Only runs if hot succeeded and time remains. Oldest-first.
+# Failures are quiet — backlog can wait.
+
+if [ "$HOT_RC" -eq 0 ] && [ -n "$EXTRACT_CUTOFF" ]; then
+    CURRENT_HOUR=$(date +%H)
+    if [ "$CURRENT_HOUR" -lt "$EXTRACT_CUTOFF" ]; then
+        log "Cold extraction (backlog, until ${EXTRACT_CUTOFF}:00)..."
+        python3 transforms/extract_structured.py --queue cold --stop-at "$EXTRACT_CUTOFF" $FORCE \
+            >> data/structured-extraction.log 2>&1 || true
+        log "Cold extraction done."
+    else
+        log "No time remaining for cold extraction."
+    fi
+elif [ "$HOT_RC" -eq 0 ] && [ -z "$EXTRACT_CUTOFF" ]; then
+    log "Cold extraction (backlog, limit 50)..."
+    python3 transforms/extract_structured.py --queue cold --limit 50 $FORCE \
+        >> data/structured-extraction.log 2>&1 || true
+    log "Cold extraction done."
+fi
 
 EXTRACT_AFTER=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
 NEW_EXTRACTIONS=$((EXTRACT_AFTER - EXTRACT_BEFORE))
 
 if [ "$NEW_EXTRACTIONS" -gt 0 ]; then
-    log "New extractions: $NEW_EXTRACTIONS."
+    log "Extractions: $HOT_EXTRACTIONS hot + $((NEW_EXTRACTIONS - HOT_EXTRACTIONS)) cold = $NEW_EXTRACTIONS total."
 else
     log "No new extractions."
 fi
-
-rm -f "$EXTRACT_TIMESTAMP"
 
 # ── S3 sync: structured data ──
 if [ -n "${WATCHDOG_S3_BUCKET:-}" ]; then

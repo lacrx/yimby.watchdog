@@ -75,7 +75,7 @@ agencies:
       Traffic Safety & Mobility Commission: /city-hall/meetings-agendas/boards-commissions/traffic-mobility-commission
       Community-Police Engagement Commission: /city-hall/meetings-agendas/boards-commissions/community-police-engagement-commission
     deep_fetch: false
-    enabled: true  # WAF bypass via browser headers; fragile — preflight monitors
+    enabled: false  # Phase 1 NCC watcher — not yet active
 
   encinitas:
     name: City of Encinitas
@@ -86,7 +86,7 @@ agencies:
     lookback_months: 2
     bodies: []  # all bodies in view
     deep_fetch: false
-    enabled: true
+    enabled: false  # Phase 1 NCC watcher — not yet active
 
   solana_beach:
     name: City of Solana Beach
@@ -113,7 +113,7 @@ agencies:
         path: /en/government/public-meetings/citizen-commission-council-standing-committee-meetings
         body_prefix: null
     deep_fetch: false
-    enabled: true
+    enabled: false  # Phase 1 NCC watcher — not yet active
 
   del_mar:
     name: City of Del Mar
@@ -135,7 +135,7 @@ agencies:
       - Undergrounding Program Advisory Committee
       - Measure Q Citizen Oversight Committee
     deep_fetch: false
-    enabled: true
+    enabled: false  # Phase 1 NCC watcher — not yet active
 
   # ── Regional / Transit ────────────────────────────────────────────
 

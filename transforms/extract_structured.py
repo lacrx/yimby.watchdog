@@ -24,12 +24,12 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-from civic_utils import all_docs_dirs, all_meetings_dirs
+from civic_utils import all_docs_dirs, all_meetings_dirs, load_json, agency_data_dir, load_agencies
 from transforms.triage import predict_relevance
 import config
 
@@ -398,19 +398,54 @@ def rebuild_combined(structured_dir):
     return len(records)
 
 
-def collect_all_sources():
-    """Collect all raw source files: documents + transcripts."""
-    sources = []
+def load_doc_index():
+    """Load doc-index.json from all enabled agencies. Returns {filename: meeting_date}."""
+    index = {}
+    for slug in load_agencies(enabled_only=True):
+        idx_path = agency_data_dir(slug) / "doc-index.json"
+        if not idx_path.exists():
+            continue
+        try:
+            data = json.loads(idx_path.read_text())
+            for fname, info in data.get("documents", {}).items():
+                index[fname] = info.get("meeting_date", "")
+        except (json.JSONDecodeError, OSError):
+            continue
+    return index
 
-    # Raw document text (PDFs → pdftotext) — newest first so recent meetings get priority
+
+def collect_all_sources(queue=None, hot_days=14):
+    """Collect raw source files, optionally filtered by queue.
+
+    queue: None (all), "hot" (recent meetings), or "cold" (backlog).
+    hot_days: days back from today that counts as "hot" (default 14).
+    """
+    sources = []
+    doc_index = load_doc_index() if queue else {}
+    hot_cutoff = (datetime.now().date() - timedelta(days=hot_days)).isoformat()
+
     for ddir in all_docs_dirs():
         for f in sorted(ddir.glob("*.txt"), reverse=True):
+            if queue:
+                meeting_date = doc_index.get(f.name, "")
+                is_hot = meeting_date >= hot_cutoff if meeting_date else False
+
+                if queue == "hot" and not is_hot:
+                    continue
+                if queue == "cold" and is_hot:
+                    continue
+
             sources.append(("doc", f))
 
-    # Transcripts (audio → whisper)
-    if TRANSCRIPTS_DIR.exists():
-        for f in sorted(TRANSCRIPTS_DIR.glob("*-transcript.txt"), reverse=True):
-            sources.append(("transcript", f))
+    # Transcripts are always hot — expensive to produce, extract promptly
+    if queue != "cold":
+        if TRANSCRIPTS_DIR.exists():
+            for f in sorted(TRANSCRIPTS_DIR.glob("*-transcript.txt"), reverse=True):
+                sources.append(("transcript", f))
+
+    # Cold queue: oldest first to work through backlog systematically
+    if queue == "cold":
+        sources.reverse()
 
     return sources
 
@@ -477,10 +512,14 @@ def cmd_extract(args):
     """Extract structured records from all raw sources (documents + transcripts)."""
     STRUCTURED_DIR.mkdir(parents=True, exist_ok=True)
 
-    all_sources = collect_all_sources()
+    queue = getattr(args, "queue", None)
+    hot_days = getattr(args, "hot_days", 14)
+
+    all_sources = collect_all_sources(queue=queue, hot_days=hot_days)
 
     if not all_sources:
-        print("No source files found. Run fetch first.")
+        queue_label = f" ({queue})" if queue else ""
+        print(f"No source files found{queue_label}. Run fetch first.")
         return
 
     meeting_filter = set(args.meeting) if args.meeting else None
@@ -511,7 +550,26 @@ def cmd_extract(args):
 
     if args.dry_run:
         already = len(all_sources) - len(to_process) - skipped_markers
-        print(f"{len(to_process)} sources to process ({len(all_sources)} total, {already} already extracted)")
+        queue_label = f" [{queue.upper()}]" if queue else ""
+        print(f"{len(to_process)} sources to process{queue_label} ({len(all_sources)} total, {already} already extracted)")
+
+        if not queue:
+            doc_index = load_doc_index()
+            hot_cutoff = (datetime.now().date() - timedelta(days=hot_days)).isoformat()
+            hot_count = cold_count = unindexed = 0
+            for _, sf, _ in to_process:
+                meeting_date = doc_index.get(sf.name, "")
+                if not meeting_date:
+                    unindexed += 1
+                elif meeting_date >= hot_cutoff:
+                    hot_count += 1
+                else:
+                    cold_count += 1
+            print(f"  HOT (last {hot_days}d): {hot_count}")
+            print(f"  COLD (backlog):   {cold_count}")
+            if unindexed:
+                print(f"  Unindexed:        {unindexed}")
+
         docs = sum(1 for t, _, _ in to_process if t == "doc")
         transcripts = sum(1 for t, _, _ in to_process if t == "transcript")
         print(f"  {docs} documents, {transcripts} transcripts")
@@ -709,6 +767,8 @@ def main():
     parser.add_argument("--no-triage", action="store_true", help="Disable ML triage — extract all documents")
     parser.add_argument("--tally", action="store_true", help="Log incoming doc counts and estimated API cost without extracting")
     parser.add_argument("--limit", type=int, metavar="N", help="Stop after N successful extractions")
+    parser.add_argument("--queue", choices=["hot", "cold"], help="hot=recent meetings only, cold=backlog only")
+    parser.add_argument("--hot-days", type=int, default=14, help="Days back that counts as 'hot' (default: 14)")
 
     args = parser.parse_args()
 

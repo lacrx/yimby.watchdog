@@ -48,6 +48,8 @@ log "Syncing raw data from s3://$BUCKET/ ..."
 while IFS= read -r slug; do
     aws s3 sync "s3://$BUCKET/raw/$slug/documents/" "data/$slug/documents/" \
         --exclude "*.pdf" --exclude "*.skip" --quiet 2>/dev/null || true
+    aws s3 cp "s3://$BUCKET/raw/$slug/doc-index.json" "data/$slug/doc-index.json" \
+        --quiet 2>/dev/null || true
     aws s3 sync "s3://$BUCKET/raw/$slug/meetings/" "data/$slug/meetings/" \
         --quiet 2>/dev/null || true
 done < <(python3 -c "
@@ -65,20 +67,40 @@ aws s3 cp "s3://$BUCKET/pipeline/pending-extraction.json" data/pipeline/ --quiet
 # ── Step 2.5: Log cost tally before extraction ──
 python3 transforms/extract_structured.py --tally
 
-# ── Step 3: Run structured extraction via claude -p ──
+# ── Step 3a: Hot extraction — recent meetings, must complete ──
 EXTRACT_BEFORE=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
 
-if [ -n "$EXTRACT_CUTOFF" ]; then
-    log "Extracting until ${EXTRACT_CUTOFF}:00..."
-    python3 transforms/extract_structured.py --stop-at "$EXTRACT_CUTOFF" $FORCE
-else
-    log "Extracting (no time limit)..."
-    python3 transforms/extract_structured.py $FORCE
+log "Hot extraction (last 14 days)..."
+HOT_RC=0
+python3 transforms/extract_structured.py --queue hot $FORCE || HOT_RC=$?
+
+EXTRACT_AFTER_HOT=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
+HOT_EXTRACTIONS=$((EXTRACT_AFTER_HOT - EXTRACT_BEFORE))
+
+if [ "$HOT_RC" -ne 0 ]; then
+    log "WARNING: Hot extraction failed (exit $HOT_RC)"
+fi
+log "Hot extraction done: $HOT_EXTRACTIONS new."
+
+# ── Step 3b: Cold extraction — backlog, time-bounded ──
+if [ "$HOT_RC" -eq 0 ] && [ -n "$EXTRACT_CUTOFF" ]; then
+    CURRENT_HOUR=$(date +%H)
+    if [ "$CURRENT_HOUR" -lt "$EXTRACT_CUTOFF" ]; then
+        log "Cold extraction (backlog, until ${EXTRACT_CUTOFF}:00)..."
+        python3 transforms/extract_structured.py --queue cold --stop-at "$EXTRACT_CUTOFF" $FORCE || true
+        log "Cold extraction done."
+    else
+        log "No time remaining for cold extraction."
+    fi
+elif [ "$HOT_RC" -eq 0 ] && [ -z "$EXTRACT_CUTOFF" ]; then
+    log "Cold extraction (backlog, limit 50)..."
+    python3 transforms/extract_structured.py --queue cold --limit 50 $FORCE || true
+    log "Cold extraction done."
 fi
 
 EXTRACT_AFTER=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
 NEW_EXTRACTIONS=$((EXTRACT_AFTER - EXTRACT_BEFORE))
-log "$NEW_EXTRACTIONS new extractions."
+log "$NEW_EXTRACTIONS new extractions ($HOT_EXTRACTIONS hot)."
 
 # ── Step 4: Push structured data back to S3 ──
 if [ "$NEW_EXTRACTIONS" -gt 0 ]; then

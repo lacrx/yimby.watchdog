@@ -230,3 +230,73 @@ def load_json(path):
 def save_json(path, data):
     """Save data as formatted JSON."""
     Path(path).write_text(json.dumps(data, indent=2, default=str))
+
+
+def normalize_date(date_str):
+    """Normalize date string to YYYY-MM-DD."""
+    if not date_str:
+        return ""
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", str(date_str)):
+        return str(date_str)
+    if re.match(r"^\d{4}-\d{2}$", str(date_str)):
+        return str(date_str) + "-01"
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", str(date_str))
+    if m:
+        return f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+    return ""
+
+
+def _match_meeting_id(filename, meeting_ids):
+    """Find which meeting_id a document filename belongs to (prefix match)."""
+    for mid in sorted(meeting_ids, key=len, reverse=True):
+        if filename.startswith(mid + "-") or filename == mid + ".txt":
+            return mid
+    return None
+
+
+def _date_from_meeting_id(mid):
+    """Extract YYYY-MM-DD from meeting IDs like cb-body-20260623 or ccc-2022-02."""
+    m = re.search(r"(\d{4})(\d{2})(\d{2})$", mid)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    m = re.search(r"(\d{4}-\d{2})$", mid)
+    if m:
+        return m.group(1) + "-01"
+    return ""
+
+
+def rebuild_doc_index(slug, state, docs_dir):
+    """Build doc-index.json mapping document filenames to meeting dates.
+
+    Called at end of each scraper's cmd_fetch(). Uses meeting_id prefix
+    matching against on-disk .txt files.
+    """
+    meetings = state.get("meetings", {})
+    meeting_ids = list(meetings.keys())
+    documents = {}
+
+    docs_path = Path(docs_dir)
+    if not docs_path.exists():
+        return 0
+
+    for txt_file in docs_path.glob("*.txt"):
+        mid = _match_meeting_id(txt_file.name, meeting_ids)
+        if mid and mid in meetings:
+            m = meetings[mid]
+            date = normalize_date(m.get("date", ""))
+            if not date:
+                date = _date_from_meeting_id(mid)
+            if date:
+                documents[txt_file.name] = {
+                    "meeting_date": date,
+                    "body": m.get("body", ""),
+                }
+
+    index = {
+        "_generated": datetime.now().isoformat(timespec="seconds"),
+        "documents": documents,
+    }
+
+    index_path = agency_data_dir(slug) / "doc-index.json"
+    save_json(index_path, index)
+    return len(documents)

@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import requests
 from bs4 import BeautifulSoup
 
-from civic_utils import download_pdf, extract_text, save_json, load_json, parse_escribe_date, safe_filename, agency_data_dir
+from civic_utils import download_pdf, extract_text, save_json, load_json, parse_escribe_date, safe_filename, agency_data_dir, rebuild_doc_index
 
 DATA_DIR = agency_data_dir("sandag")
 MEETINGS_DIR = DATA_DIR / "meetings"
@@ -293,6 +293,7 @@ def cmd_fetch(args):
                 new += 1
 
     state["last_fetch"] = datetime.now().isoformat()
+    rebuild_doc_index("sandag", state, DOCS_DIR)
     save_state(state)
     print(f"\nDone. {total} meetings total, {new} new. Data in {DATA_DIR}")
 
