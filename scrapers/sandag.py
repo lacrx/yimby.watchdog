@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-SANDAG meeting monitor — fetches from eScribe platform for Board of Directors,
-Regional Planning Committee, and Transportation Committee meetings.
+eScribe meeting scraper — generic for any eScribe-hosted agency.
+
+Reads agency config from agencies.yaml. Fetches meeting listings via the
+eScribe JSON API, downloads agenda/minutes PDFs, extracts text.
 
 Usage:
-    python sandag.py fetch [--years N] [--deep]  # pull meetings + download documents
-    python sandag.py list                        # list all tracked meetings
-    python sandag.py search TERM                 # full-text search across documents
+    python sandag.py fetch --agency sandag [--years N] [--deep]
+    python sandag.py fetch [--years N] [--deep]   # defaults to sandag
+    python sandag.py list --agency sandag
 
 Requires: requests, beautifulsoup4, lxml, pdftotext (CLI)
 """
@@ -29,34 +31,27 @@ sys.path.insert(0, str(REPO_ROOT))
 import requests
 from bs4 import BeautifulSoup
 
-from civic_utils import download_pdf, extract_text, save_json, load_json, parse_escribe_date, safe_filename, agency_data_dir, rebuild_doc_index, log_discovery
+from civic_utils import (
+    download_pdf, extract_text, save_json, load_json, parse_escribe_date,
+    safe_filename, agency_data_dir, load_agencies, rebuild_doc_index,
+    cmd_list_meetings, log_discovery,
+)
 
-DATA_DIR = agency_data_dir("sandag")
-MEETINGS_DIR = DATA_DIR / "meetings"
-DOCS_DIR = DATA_DIR / "documents"
-STATE_FILE = DATA_DIR / "state.json"
-
-ESCRIBE_BASE = "https://pub-sandag.escribemeetings.com"
-PAST_MEETINGS_URL = f"{ESCRIBE_BASE}/MeetingsCalendarView.aspx/PastMeetings"
-
-BODIES = [
+SANDAG_BODIES = [
     "Board of Directors",
     "Regional Planning Committee",
     "Transportation Committee",
 ]
 
 
-def ensure_dirs():
-    for d in [MEETINGS_DIR, DOCS_DIR]:
+def _setup_dirs(slug):
+    data_dir = agency_data_dir(slug)
+    meetings_dir = data_dir / "meetings"
+    docs_dir = data_dir / "documents"
+    state_file = data_dir / "state.json"
+    for d in [meetings_dir, docs_dir]:
         d.mkdir(parents=True, exist_ok=True)
-
-
-def load_state():
-    return load_json(STATE_FILE) or {"last_fetch": None, "meetings": {}}
-
-
-def save_state(state):
-    save_json(STATE_FILE, state)
+    return data_dir, meetings_dir, docs_dir, state_file
 
 
 def create_session():
@@ -70,14 +65,14 @@ def create_session():
 
 
 
-def make_meeting_id(body_name, date_str):
-    """Generate deterministic meeting ID matching Granicus-era formula."""
+def make_meeting_id(slug, body_name, date_str):
+    """Generate deterministic meeting ID."""
     return hashlib.md5(
-        f"sandag-{body_name}-{date_str}".encode()
+        f"{slug}-{body_name}-{date_str}".encode()
     ).hexdigest()[:12]
 
 
-def extract_document_urls(meeting_data):
+def extract_document_urls(meeting_data, escribe_base):
     """Pull agenda, minutes, and video URLs from MeetingLinks."""
     links = meeting_data.get("MeetingLinks", [])
     agenda_url = None
@@ -106,7 +101,7 @@ def extract_document_urls(meeting_data):
             return None
         if u.startswith("http"):
             return u
-        return f"{ESCRIBE_BASE}/{u}"
+        return f"{escribe_base}/{u}"
 
     return {
         "agenda_url": full_url(agenda_url),
@@ -116,22 +111,22 @@ def extract_document_urls(meeting_data):
     }
 
 
-def normalize_meeting(api_meeting, body_name):
+def normalize_meeting(api_meeting, slug, agency_name, body_name, escribe_base):
     """Convert eScribe API meeting to standard meeting.json format."""
     dt = parse_escribe_date(api_meeting.get("Start", ""))
     if not dt:
         return None
 
     date_str = dt.strftime("%Y-%m-%d")
-    mid = make_meeting_id(body_name, date_str)
-    urls = extract_document_urls(api_meeting)
+    mid = make_meeting_id(slug, body_name, date_str)
+    urls = extract_document_urls(api_meeting, escribe_base)
 
     return {
         "id": mid,
-        "body": f"SANDAG {body_name}",
+        "body": f"{agency_name} {body_name}",
         "date": date_str,
         "date_display": api_meeting.get("FormattedStart", ""),
-        "agency": "SANDAG",
+        "agency": agency_name,
         "agenda_url": urls["agenda_url"],
         "minutes_url": urls["minutes_url"],
         "video_url": urls["video_url"],
@@ -140,13 +135,14 @@ def normalize_meeting(api_meeting, body_name):
     }
 
 
-def fetch_past_meetings(session, body_name, min_year):
+def fetch_past_meetings(session, escribe_base, slug, agency_name, body_name, min_year):
     """Paginate PastMeetings API, filter by year, skip cancelled."""
+    past_url = f"{escribe_base}/MeetingsCalendarView.aspx/PastMeetings"
     all_meetings = []
     page = 1
 
     while True:
-        resp = session.post(PAST_MEETINGS_URL, json={
+        resp = session.post(past_url, json={
             "type": body_name,
             "pageNumber": page,
         }, timeout=30)
@@ -166,7 +162,7 @@ def fetch_past_meetings(session, body_name, min_year):
             if year and year < min_year:
                 oldest_year = year
                 continue
-            normalized = normalize_meeting(m, body_name)
+            normalized = normalize_meeting(m, slug, agency_name, body_name, escribe_base)
             if normalized:
                 all_meetings.append(normalized)
             if year:
@@ -184,9 +180,9 @@ def fetch_past_meetings(session, body_name, min_year):
     return all_meetings
 
 
-def fetch_meeting_items(session, escribe_id):
+def fetch_meeting_items(session, escribe_base, escribe_id):
     """Fetch meeting page and extract agenda item attachments for --deep mode."""
-    url = f"{ESCRIBE_BASE}/Meeting.aspx?Id={escribe_id}&Agenda=PostAgenda&lang=English"
+    url = f"{escribe_base}/Meeting.aspx?Id={escribe_id}&Agenda=PostAgenda&lang=English"
     try:
         resp = session.get(url, timeout=30)
         resp.raise_for_status()
@@ -207,7 +203,7 @@ def fetch_meeting_items(session, escribe_id):
             name = link.get_text(strip=True) or "attachment"
             if href:
                 if not href.startswith("http"):
-                    href = f"{ESCRIBE_BASE}/{href}"
+                    href = f"{escribe_base}/{href}"
                 attachments.append({"name": name, "url": href})
 
         if attachments:
@@ -218,8 +214,19 @@ def fetch_meeting_items(session, escribe_id):
 
 
 def cmd_fetch(args):
-    ensure_dirs()
-    state = load_state()
+    agencies = load_agencies(enabled_only=False)
+    slug = getattr(args, "agency", None) or "sandag"
+    if slug not in agencies:
+        print(f"Unknown agency: {slug}")
+        sys.exit(1)
+
+    cfg = agencies[slug]
+    agency_name = cfg.get("name", slug)
+    escribe_base = cfg.get("base_url", "").rstrip("/")
+    bodies = cfg.get("bodies", SANDAG_BODIES)
+
+    data_dir, meetings_dir, docs_dir, state_file = _setup_dirs(slug)
+    state = load_json(state_file) or {"last_fetch": None, "meetings": {}}
     session = create_session()
 
     min_year = datetime.now().year - args.years + 1
@@ -228,15 +235,16 @@ def cmd_fetch(args):
     total = 0
     new = 0
 
-    for body_name in BODIES:
-        print(f"Fetching {body_name}...")
-        meetings = fetch_past_meetings(session, body_name, min_year)
-        print(f"  {len(meetings)} meetings since {min_year}")
+    print(f"Fetching {agency_name} meetings (eScribe)...")
+    for body_name in bodies:
+        print(f"  {body_name}...")
+        meetings = fetch_past_meetings(session, escribe_base, slug, agency_name, body_name, min_year)
+        print(f"    {len(meetings)} meetings since {min_year}")
         total += len(meetings)
 
         for m in meetings:
             mid = m["id"]
-            meeting_dir = MEETINGS_DIR / mid
+            meeting_dir = meetings_dir / mid
             meeting_dir.mkdir(exist_ok=True)
 
             meta_file = meeting_dir / "meeting.json"
@@ -245,41 +253,41 @@ def cmd_fetch(args):
             is_new = mid not in state.get("meetings", {})
 
             if m.get("agenda_url"):
-                pdf_path = DOCS_DIR / f"{mid}-agenda-packet.pdf"
-                txt_path = DOCS_DIR / f"{mid}-agenda-packet.txt"
+                pdf_path = docs_dir / f"{mid}-agenda-packet.pdf"
+                txt_path = docs_dir / f"{mid}-agenda-packet.txt"
                 if not txt_path.exists():
                     if is_new:
-                        print(f"  {m['date']} {body_name}: downloading agenda...")
+                        print(f"    {m['date']} {body_name}: downloading agenda...")
                     if download_pdf(m["agenda_url"], pdf_path, verify=False):
                         text = extract_text(pdf_path)
                         if text and is_new:
-                            print(f"    Extracted {len(text)} chars")
+                            print(f"      Extracted {len(text)} chars")
                     elif is_new:
-                        print(f"    Download failed")
+                        print(f"      Download failed")
                     time.sleep(0.5)
 
             if m.get("minutes_url"):
-                pdf_path = DOCS_DIR / f"{mid}-minutes.pdf"
-                txt_path = DOCS_DIR / f"{mid}-minutes.txt"
+                pdf_path = docs_dir / f"{mid}-minutes.pdf"
+                txt_path = docs_dir / f"{mid}-minutes.txt"
                 if not txt_path.exists():
                     if is_new:
-                        print(f"  {m['date']} {body_name}: downloading minutes...")
+                        print(f"    {m['date']} {body_name}: downloading minutes...")
                     if download_pdf(m["minutes_url"], pdf_path, verify=False):
                         text = extract_text(pdf_path)
                         if text and is_new:
-                            print(f"    Extracted {len(text)} chars")
+                            print(f"      Extracted {len(text)} chars")
                     time.sleep(0.5)
 
             if deep and m.get("escribe_id"):
-                items = fetch_meeting_items(session, m["escribe_id"])
+                items = fetch_meeting_items(session, escribe_base, m["escribe_id"])
                 for i, item in enumerate(items, 1):
                     for att in item["attachments"]:
                         fname = safe_filename(att["name"], max_len=60)
-                        pdf_path = DOCS_DIR / f"{mid}-{i:02d}-{fname}.pdf"
+                        pdf_path = docs_dir / f"{mid}-{i:02d}-{fname}.pdf"
                         txt_path = pdf_path.with_suffix(".txt")
                         if not txt_path.exists():
                             if is_new:
-                                print(f"    Item {i}: {att['name'][:60]}...")
+                                print(f"      Item {i}: {att['name'][:60]}...")
                             if download_pdf(att["url"], pdf_path, verify=False):
                                 extract_text(pdf_path)
                             time.sleep(0.5)
@@ -293,75 +301,35 @@ def cmd_fetch(args):
                 new += 1
 
     state["last_fetch"] = datetime.now().isoformat()
-    rebuild_doc_index("sandag", state, DOCS_DIR)
-    save_state(state)
-    log_discovery("sandag", meetings_found=total, meetings_new=new)
-    print(f"\nDone. {total} meetings total, {new} new. Data in {DATA_DIR}")
+    rebuild_doc_index(slug, state, docs_dir)
+    save_json(state_file, state)
+    log_discovery(slug, meetings_found=total, meetings_new=new)
+    print(f"\nDone. {total} meetings total, {new} new.")
 
 
 def cmd_list(args):
-    ensure_dirs()
-    state = load_state()
-
-    if not state.get("meetings"):
-        print("No meetings tracked. Run 'fetch' first.")
-        return
-
-    for mid, info in sorted(state["meetings"].items(), key=lambda x: x[1].get("date", "")):
-        body = info.get("body", "?")
-        date = info.get("date", "?")
-        has_packet = (DOCS_DIR / f"{mid}-agenda-packet.txt").exists()
-        has_minutes = (DOCS_DIR / f"{mid}-minutes.txt").exists()
-        flags = []
-        if has_packet:
-            flags.append("packet")
-        if has_minutes:
-            flags.append("minutes")
-        print(f"  {date:12s}  {body:40s}  [{', '.join(flags) or 'metadata only'}]")
-
-
-def cmd_search(args):
-    ensure_dirs()
-    query = " ".join(args.terms).lower()
-    hits = 0
-
-    for fpath in sorted(DOCS_DIR.glob("*.txt")):
-        if not fpath.stem.startswith(tuple(
-            m for m in (load_state().get("meetings", {}))
-        )):
-            continue
-        text = fpath.read_text()
-        if query not in text.lower():
-            continue
-        hits += 1
-        print(f"\n{'='*60}")
-        print(f"MATCH: {fpath.name}")
-        for i, line in enumerate(text.split("\n")):
-            if query in line.lower():
-                print(f"  L{i+1}: {line.strip()[:120]}")
-                break
-    print(f"\n{hits} file(s) matched '{query}'")
+    slug = getattr(args, "agency", None) or "sandag"
+    cmd_list_meetings(slug)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="SANDAG meeting monitor (eScribe)")
+    parser = argparse.ArgumentParser(description="eScribe meeting scraper")
     sub = parser.add_subparsers(dest="command")
 
-    p_fetch = sub.add_parser("fetch", help="Pull SANDAG meetings and download documents")
-    p_fetch.add_argument("--years", type=int, default=1, help="How many years back (default: 1)")
-    p_fetch.add_argument("--deep", action="store_true", help="Also download agenda item attachments")
+    p_fetch = sub.add_parser("fetch")
+    p_fetch.add_argument("--agency", default="sandag")
+    p_fetch.add_argument("--years", type=int, default=1)
+    p_fetch.add_argument("--deep", action="store_true")
 
-    sub.add_parser("list", help="List tracked meetings")
-
-    p_search = sub.add_parser("search", help="Full-text search")
-    p_search.add_argument("terms", nargs="+")
+    p_list = sub.add_parser("list")
+    p_list.add_argument("--agency", default="sandag")
 
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
         sys.exit(0)
 
-    {"fetch": cmd_fetch, "list": cmd_list, "search": cmd_search}[args.command](args)
+    {"fetch": cmd_fetch, "list": cmd_list}[args.command](args)
 
 
 if __name__ == "__main__":

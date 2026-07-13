@@ -154,7 +154,7 @@ while IFS='|' read -r SLUG PLATFORM NAME AGENCY_YEARS; do
             run_with_timeout "$NAME fetch" python3 scrapers/sdcounty.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
             ;;
         escribe)
-            run_with_timeout "$NAME fetch" python3 scrapers/sandag.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            run_with_timeout "$NAME fetch" python3 scrapers/sandag.py fetch --agency "$SLUG" --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
             ;;
         custom_html)
             run_with_timeout "$NAME fetch" python3 scrapers/nctd.py fetch >> "$LOG_FILE" 2>&1

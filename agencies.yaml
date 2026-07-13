@@ -188,9 +188,128 @@ agencies:
     bodies:
       - City Council
     deep_fetch: false
+    enabled: false  # "new CivicPlus" JS-rendered format, scraper needs update
+
+  vista:
+    name: City of Vista
+    region: north_county_inland
+    platform: legistar_html
+    base_url: https://vista.legistar.com
+    lookback_months: 2
+    bodies:
+      - City Council
+    deep_fetch: false
+    enabled: false  # Granicus stopped 2021, Legistar returns "Invalid parameters" — needs investigation
+
+  # ── South County / East County / Central ──────────────────────────
+
+  chula_vista:
+    name: City of Chula Vista
+    region: south_county
+    platform: escribe
+    base_url: https://pub-chulavista.escribemeetings.com
+    lookback_months: 2
+    bodies:
+      - City Council Meeting
+      - Planning Commission - Regular Meeting
+    deep_fetch: false
     enabled: true
-    forward_only: true
-    enabled_date: "2026-07-13"
+    tally_only: true
+
+  national_city:
+    name: City of National City
+    region: south_county
+    platform: escribe
+    base_url: https://pub-nationalcity.escribemeetings.com
+    lookback_months: 2
+    bodies:
+      - Regular City Council Meeting
+    deep_fetch: false
+    enabled: true
+    tally_only: true
+
+  imperial_beach:
+    name: City of Imperial Beach
+    region: south_county
+    platform: escribe
+    base_url: https://pub-imperialbeach.escribemeetings.com
+    lookback_months: 2
+    bodies:
+      - City Council Regular Meeting
+    deep_fetch: false
+    enabled: true
+    tally_only: true
+
+  la_mesa:
+    name: City of La Mesa
+    region: east_county
+    platform: escribe
+    base_url: https://pub-lamesa.escribemeetings.com
+    lookback_months: 2
+    bodies:
+      - City Council
+      - Planning Commission
+    deep_fetch: false
+    enabled: true
+    tally_only: true
+
+  san_diego:
+    name: City of San Diego
+    region: central
+    platform: granicus
+    base_url: https://sandiego.granicus.com
+    view_id: 3
+    lookback_months: 2
+    bodies: []
+    deep_fetch: false
+    enabled: true
+    tally_only: true
+
+  # ── Deferred (new scrapers needed) ────────────────────────────────
+
+  el_cajon:
+    name: City of El Cajon
+    region: east_county
+    platform: granicus
+    base_url: https://elcajon.granicus.com
+    lookback_months: 2
+    bodies: []
+    deep_fetch: false
+    enabled: false  # no standard Granicus subdomain, needs investigation
+
+  coronado:
+    name: City of Coronado
+    region: south_county
+    platform: primegov
+    base_url: https://coronado.primegov.com
+    lookback_months: 2
+    bodies:
+      - City Council
+      - Planning Commission
+    deep_fetch: false
+    enabled: false  # PrimeGov — new platform, scraper needed
+
+  santee:
+    name: City of Santee
+    region: east_county
+    platform: custom_html
+    base_url: https://www.cityofsanteeca.gov
+    lookback_months: 2
+    bodies:
+      - City Council
+    deep_fetch: false
+    enabled: false  # custom PDF-based site, scraper needed
+
+  lemon_grove:
+    name: City of Lemon Grove
+    region: east_county
+    platform: custom_html
+    base_url: https://events.lemongrove.ca.gov
+    lookback_months: 2
+    bodies:
+      - City Council
+    deep_fetch: false
+    enabled: false  # custom events portal, scraper needed
 
   # ── Regional / Transit ────────────────────────────────────────────
 

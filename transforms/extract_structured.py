@@ -557,8 +557,11 @@ def collect_all_sources(queue=None, hot_days=14):
             continue
 
         is_forward_only = cfg.get("forward_only", False)
+        is_tally_only = cfg.get("tally_only", False)
         enabled_date = cfg.get("enabled_date", "")
 
+        if is_tally_only and queue:
+            continue
         if queue == "cold" and is_forward_only:
             continue
 
