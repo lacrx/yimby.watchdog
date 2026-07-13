@@ -277,6 +277,82 @@ def count_remaining():
     return remaining
 
 
+def build_autofix_prompt(findings, extraction_log_lines, pipeline_log_lines):
+    """Build a prompt for claude -p to diagnose and fix pipeline issues."""
+    # Gather recent error context
+    error_context = []
+    for line in extraction_log_lines[-50:]:
+        line = line.strip()
+        if any(kw in line for kw in ["Error", "FAILED", "Traceback", "not found", "Module"]):
+            error_context.append(line)
+
+    for line in pipeline_log_lines[-50:]:
+        line = line.strip()
+        if any(kw in line for kw in ["failed", "WARNING", "Error", "not found"]):
+            error_context.append(line)
+
+    # Identify files likely involved
+    involved_files = set()
+    for line in error_context:
+        # Extract file paths from tracebacks
+        match = re.search(r'File "([^"]+)"', line)
+        if match:
+            involved_files.add(match.group(1))
+        # Common script references
+        for script in ["extract-backlog", "extract-local", "civic-pipeline",
+                       "extract_structured.py", "meeting_merge.py", "monthly_rollup.py"]:
+            if script in line:
+                if "/" not in script:
+                    involved_files.add(str(REPO_ROOT / "transforms" / script) if ".py" in script else str(REPO_ROOT / script))
+                else:
+                    involved_files.add(script)
+
+    # Read involved files for context
+    file_contents = {}
+    for fpath in list(involved_files)[:3]:
+        try:
+            content = Path(fpath).read_text()
+            if len(content) > 5000:
+                content = content[:5000] + "\n... (truncated)"
+            file_contents[fpath] = content
+        except Exception:
+            pass
+
+    prompt_parts = [
+        "You are a pipeline maintenance agent. The civic monitoring pipeline had errors on its last run.",
+        "Your job: diagnose the root cause and fix it by editing the relevant files.",
+        "",
+        "## Findings (unresolved)",
+        "",
+    ]
+    for f in findings:
+        prompt_parts.append(f"- {f}")
+
+    prompt_parts.append("")
+    prompt_parts.append("## Error log context (recent)")
+    prompt_parts.append("")
+    for line in error_context[-30:]:
+        prompt_parts.append(f"  {line}")
+
+    if file_contents:
+        prompt_parts.append("")
+        prompt_parts.append("## Involved files")
+        for fpath, content in file_contents.items():
+            prompt_parts.append(f"\n### {fpath}")
+            prompt_parts.append(f"```\n{content}\n```")
+
+    prompt_parts.append("")
+    prompt_parts.append("## Instructions")
+    prompt_parts.append("")
+    prompt_parts.append("1. Diagnose the root cause of each finding.")
+    prompt_parts.append("2. Fix the issue by editing the relevant file(s).")
+    prompt_parts.append("3. If you cannot fix it (e.g., needs human auth, external service down), explain what's wrong and what the human should do.")
+    prompt_parts.append(f"4. Working directory: {REPO_ROOT}")
+    prompt_parts.append("5. Do not run the full pipeline — just fix the code/config issue.")
+
+    return "\n".join(prompt_parts)
+
+
 def diagnose(dry_run=False):
     """Run full diagnosis and apply safe fixes."""
     now = datetime.now()
@@ -462,6 +538,51 @@ def diagnose(dry_run=False):
             diagnosis["findings"].append(finding)
             print(f"  FINDING: {finding}")
 
+    # ─── Finding: Extraction script crash ───
+
+    traceback_lines = [l.strip() for l in ext_lines if "Traceback" in l or "Error:" in l or "TypeError:" in l]
+    if traceback_lines:
+        last_tb = traceback_lines[-1][:150]
+        finding = f"Extraction script crashed: {last_tb}"
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+
+    # ─── Finding + Fix: Null-date structured records ───
+
+    null_date_records = []
+    skip_files = {"extraction-state.json", "meetings-state.json", "document-dates.json"}
+    for json_file in sorted(STRUCTURED_DIR.glob("*.json")):
+        if json_file.name in skip_files:
+            continue
+        try:
+            record = json.loads(json_file.read_text())
+            if not isinstance(record, dict) or "votes" not in record:
+                continue
+            if record.get("date") is None:
+                null_date_records.append(json_file)
+        except (json.JSONDecodeError, Exception):
+            continue
+
+    if null_date_records:
+        finding = f"{len(null_date_records)} structured record(s) have null date"
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+
+        if not dry_run:
+            for json_file in null_date_records:
+                date_m = re.search(r'(\d{4}-\d{2}-\d{2})', json_file.name)
+                if date_m:
+                    record = json.loads(json_file.read_text())
+                    record["date"] = date_m.group(1)
+                    json_file.write_text(json.dumps(record, indent=2, default=str))
+                    fix = f"Set date={date_m.group(1)} on '{json_file.name}' (inferred from filename)"
+                    diagnosis["fixes_applied"].append(fix)
+                    print(f"  FIX: {fix}")
+                else:
+                    diagnosis["recommendations"].append(
+                        f"Record '{json_file.name}' has null date and no date in filename — needs manual fix"
+                    )
+
     # ─── Finding: Stalled pipeline ───
 
     if pipe_errors["zero_extraction_runs"] >= 3:
@@ -488,6 +609,136 @@ def diagnose(dry_run=False):
         finding = f"Pipeline was terminated/killed on: {', '.join(pipe_errors['terminated_phases'])}"
         diagnosis["findings"].append(finding)
         print(f"  FINDING: {finding}")
+
+    # ─── Retry failed phases ───
+
+    RETRYABLE_PHASES = {
+        "meeting merge": ("python3", "transforms/meeting_merge.py"),
+        "monthly rollup": ("python3", "transforms/monthly_rollup.py"),
+    }
+
+    if not dry_run and pipe_errors["failed_phases"]:
+        print()
+        for failed_line in pipe_errors["failed_phases"]:
+            for phase_name, cmd in RETRYABLE_PHASES.items():
+                if phase_name.replace(" ", "").lower() in failed_line.replace(" ", "").lower():
+                    print(f"  RETRY: {phase_name} (failed earlier this run)...")
+                    try:
+                        result = subprocess.run(
+                            list(cmd),
+                            capture_output=True, text=True, timeout=300,
+                            cwd=str(REPO_ROOT),
+                        )
+                        if result.returncode == 0:
+                            fix = f"Retried {phase_name} — succeeded"
+                            diagnosis["fixes_applied"].append(fix)
+                            print(f"  FIX: {fix}")
+                        else:
+                            err_tail = (result.stderr or result.stdout or "")[-200:]
+                            finding = f"Retry of {phase_name} failed again: {err_tail}"
+                            diagnosis["findings"].append(finding)
+                            print(f"  RETRY FAILED: {phase_name} — {err_tail}")
+                    except subprocess.TimeoutExpired:
+                        diagnosis["findings"].append(f"Retry of {phase_name} timed out (5min)")
+                        print(f"  RETRY TIMEOUT: {phase_name}")
+                    break
+
+    # ─── Auto-fix via claude -p ───
+
+    AUTOFIX_TRIGGERS = [
+        "crashed", "CLI not found", "command not found",
+        "ModuleNotFoundError", "ImportError", "TypeError",
+        "RETRY FAILED",
+    ]
+    AUTOFIX_SKIP = ["authentication is broken", "rate-limited"]
+
+    unresolved = [f for f in diagnosis["findings"] if f not in [fix.split(" — ")[0] for fix in diagnosis["fixes_applied"]]]
+    autofix_eligible = (
+        unresolved
+        and any(trigger in f for f in unresolved for trigger in AUTOFIX_TRIGGERS)
+        and not any(skip in f for f in unresolved for skip in AUTOFIX_SKIP)
+    )
+
+    if dry_run and autofix_eligible:
+        autofix_prompt = build_autofix_prompt(unresolved, ext_lines, pipe_lines)
+        print(f"\n  AUTOFIX (dry-run): Would run claude -p with {len(unresolved)} finding(s)")
+        print(f"  Prompt ({len(autofix_prompt)} chars):")
+        for line in autofix_prompt.split("\n")[:15]:
+            print(f"    {line}")
+        print("    ...")
+
+    should_autofix = autofix_eligible and not dry_run
+
+    # Cooldown: don't retry if last run also auto-fixed the same findings
+    if should_autofix and DIAGNOSIS_LOG.exists():
+        try:
+            last_diag = None
+            with open(DIAGNOSIS_LOG) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            last_diag = json.loads(line)
+                        except json.JSONDecodeError:
+                            pass
+            if last_diag and last_diag.get("autofix_ran"):
+                last_unresolved = set(last_diag.get("autofix_findings", []))
+                current_unresolved = set(unresolved)
+                if current_unresolved & last_unresolved:
+                    print("\n  AUTOFIX COOLDOWN: Same findings persisted after last auto-fix. Skipping.")
+                    diagnosis["recommendations"].append(
+                        "Auto-fix already attempted for these findings — needs manual investigation"
+                    )
+                    should_autofix = False
+        except Exception:
+            pass
+
+    if should_autofix:
+        autofix_prompt = build_autofix_prompt(unresolved, ext_lines, pipe_lines)
+        print(f"\n  AUTOFIX: Running claude -p to diagnose and fix ({len(unresolved)} unresolved finding(s))...")
+
+        autofix_log = DATA_DIR / "doctor-autofix.log"
+        start_time = time.time()
+        try:
+            result = subprocess.run(
+                ["claude", "-p"],
+                input=autofix_prompt,
+                capture_output=True, text=True,
+                timeout=900,
+                cwd=str(REPO_ROOT),
+            )
+            elapsed = time.time() - start_time
+            response = result.stdout or result.stderr or "(no output)"
+
+            with open(autofix_log, "a") as f:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"[{now.isoformat()}] Auto-fix attempt ({elapsed:.0f}s)\n")
+                f.write(f"Findings: {json.dumps(unresolved)}\n")
+                f.write(f"Exit code: {result.returncode}\n")
+                f.write(f"Response:\n{response}\n")
+
+            if result.returncode == 0:
+                fix = f"Auto-fix ran successfully ({elapsed:.0f}s)"
+                diagnosis["fixes_applied"].append(fix)
+                print(f"  AUTOFIX DONE: {fix}")
+            else:
+                print(f"  AUTOFIX FAILED (exit {result.returncode}, {elapsed:.0f}s)")
+                diagnosis["findings"].append(f"Auto-fix failed (exit {result.returncode})")
+
+            diagnosis["autofix_ran"] = True
+            diagnosis["autofix_findings"] = unresolved
+            diagnosis["autofix_duration_s"] = round(elapsed)
+
+        except subprocess.TimeoutExpired:
+            elapsed = time.time() - start_time
+            print(f"  AUTOFIX TIMEOUT ({elapsed:.0f}s)")
+            diagnosis["findings"].append("Auto-fix timed out (15min)")
+            diagnosis["autofix_ran"] = True
+            diagnosis["autofix_findings"] = unresolved
+            diagnosis["autofix_duration_s"] = round(elapsed)
+        except FileNotFoundError:
+            print("  AUTOFIX SKIPPED: claude CLI not in PATH")
+            diagnosis["recommendations"].append("claude CLI not available for auto-fix")
 
     # ─── Self-evaluation: check if previous fixes worked ───
 
