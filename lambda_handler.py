@@ -39,6 +39,10 @@ PLATFORM_SCRAPER = {
     "carlsbad_cms": "scrapers.carlsbad",
     "solana_drupal": "scrapers.solana_beach",
     "municode": "scrapers.municode",
+    "primegov": "scrapers.primegov",
+    "lemon_grove_events": "scrapers.lemon_grove",
+    "santee_cms": "scrapers.santee",
+    "elcajon_cms": "scrapers.elcajon",
 }
 
 

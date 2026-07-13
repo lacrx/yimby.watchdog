@@ -180,6 +180,18 @@ while IFS='|' read -r SLUG PLATFORM NAME AGENCY_YEARS; do
         municode)
             run_with_timeout "$NAME fetch" python3 scrapers/municode.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
             ;;
+        primegov)
+            run_with_timeout "$NAME fetch" python3 scrapers/primegov.py fetch --agency "$SLUG" --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        lemon_grove_events)
+            run_with_timeout "$NAME fetch" python3 scrapers/lemon_grove.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        santee_cms)
+            run_with_timeout "$NAME fetch" python3 scrapers/santee.py fetch $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
+        elcajon_cms)
+            run_with_timeout "$NAME fetch" python3 scrapers/elcajon.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
         *)
             log "  $NAME: unknown platform '$PLATFORM', skipping."
             ;;

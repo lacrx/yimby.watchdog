@@ -270,12 +270,14 @@ agencies:
   el_cajon:
     name: City of El Cajon
     region: east_county
-    platform: granicus
-    base_url: https://elcajon.granicus.com
+    platform: elcajon_cms
+    base_url: https://www.elcajon.gov
     lookback_months: 2
-    bodies: []
+    bodies:
+      - City Council
     deep_fetch: false
-    enabled: false  # no standard Granicus subdomain, needs investigation
+    enabled: true
+    tally_only: true
 
   coronado:
     name: City of Coronado
@@ -287,29 +289,32 @@ agencies:
       - City Council
       - Planning Commission
     deep_fetch: false
-    enabled: false  # PrimeGov — new platform, scraper needed
+    enabled: true
+    tally_only: true
 
   santee:
     name: City of Santee
     region: east_county
-    platform: custom_html
+    platform: santee_cms
     base_url: https://www.cityofsanteeca.gov
     lookback_months: 2
     bodies:
       - City Council
     deep_fetch: false
-    enabled: false  # custom PDF-based site, scraper needed
+    enabled: true
+    tally_only: true
 
   lemon_grove:
     name: City of Lemon Grove
     region: east_county
-    platform: custom_html
+    platform: lemon_grove_events
     base_url: https://events.lemongrove.ca.gov
     lookback_months: 2
     bodies:
       - City Council
     deep_fetch: false
-    enabled: false  # custom events portal, scraper needed
+    enabled: true
+    tally_only: true
 
   # ── Regional / Transit ────────────────────────────────────────────
 
