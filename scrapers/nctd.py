@@ -32,7 +32,7 @@ sys.path.insert(0, str(REPO_ROOT))
 import requests
 from bs4 import BeautifulSoup
 
-from civic_utils import download_pdf, extract_text, save_json, load_json, agency_data_dir, rebuild_doc_index
+from civic_utils import download_pdf, extract_text, save_json, load_json, agency_data_dir, rebuild_doc_index, log_discovery
 import config
 
 DATA_DIR = agency_data_dir("nctd")
@@ -206,6 +206,7 @@ def cmd_fetch(args):
     state["last_fetch"] = datetime.now().isoformat()
     rebuild_doc_index("nctd", state, DOCS_DIR)
     save_state(state)
+    log_discovery("nctd", meetings_found=len(meetings))
     print(f"\nDone. Data stored in {DATA_DIR}")
 
 

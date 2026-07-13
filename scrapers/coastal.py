@@ -23,7 +23,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import requests
 
-from civic_utils import download_pdf, extract_text, save_json, load_json, agency_data_dir, rebuild_doc_index
+from civic_utils import download_pdf, extract_text, save_json, load_json, agency_data_dir, rebuild_doc_index, log_discovery
 import config
 
 DATA_DIR = agency_data_dir("coastal")
@@ -203,6 +203,7 @@ def cmd_fetch(args):
     state["last_fetch"] = now.isoformat()
     rebuild_doc_index("coastal", state, DOCS_DIR)
     save_state(state)
+    log_discovery("coastal", meetings_found=total_items, meetings_new=city_items)
     print(f"\nDone. {total_items} SD district items, {city_items} {_primary_city}-specific.")
 
 

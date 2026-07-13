@@ -34,7 +34,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import requests
 from bs4 import BeautifulSoup
-from civic_utils import agency_data_dir, rebuild_doc_index
+from civic_utils import agency_data_dir, rebuild_doc_index, log_discovery
 
 ENV_FILE = REPO_ROOT / ".env"
 if ENV_FILE.exists():
@@ -431,6 +431,7 @@ def cmd_fetch(args):
     state["last_fetch"] = datetime.now().isoformat()
     rebuild_doc_index("oceanside", state, DOCS_DIR)
     save_state(state)
+    log_discovery("oceanside", meetings_found=len(meetings), meetings_new=len(meetings) - skipped)
     print(f"\nDone. Data stored in {DATA_DIR}")
 
 

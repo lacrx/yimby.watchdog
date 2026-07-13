@@ -300,3 +300,21 @@ def rebuild_doc_index(slug, state, docs_dir):
     index_path = agency_data_dir(slug) / "doc-index.json"
     save_json(index_path, index)
     return len(documents)
+
+
+DISCOVERY_LOG = DATA_DIR / "pipeline" / "discovery.jsonl"
+
+
+def log_discovery(agency, meetings_found=0, meetings_new=0, docs_new=0, docs_unchanged=0):
+    """Log scraper discovery stats for cost projection."""
+    entry = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "agency": agency,
+        "meetings_found": meetings_found,
+        "meetings_new": meetings_new,
+        "docs_new": docs_new,
+        "docs_unchanged": docs_unchanged,
+    }
+    DISCOVERY_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(DISCOVERY_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")

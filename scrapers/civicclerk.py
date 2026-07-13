@@ -29,7 +29,7 @@ import requests
 
 from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
-    load_agencies, agency_data_dir,
+    load_agencies, agency_data_dir, log_discovery,
 )
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) yimby-watchdog/1.0"
@@ -253,6 +253,7 @@ def cmd_fetch(args):
 
     state["last_fetch"] = datetime.now().isoformat()
     save_json(state_file, state)
+    log_discovery(slug, meetings_new=new_count, docs_new=doc_count)
     print(f"\nDone. {new_count} new meetings, {doc_count} documents extracted.")
 
 
