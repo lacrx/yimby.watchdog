@@ -32,7 +32,7 @@ from bs4 import BeautifulSoup
 from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
     load_agencies, agency_data_dir, USER_AGENT,
-    safe_filename, cmd_list_meetings,
+    safe_filename, cmd_list_meetings, rebuild_doc_index, log_discovery,
 )
 
 GRAN_NS = "https://www.granicus.com/schema/rss-supplements"
@@ -268,7 +268,9 @@ def cmd_fetch(args):
         time.sleep(1)
 
     state["last_fetch"] = datetime.now().isoformat()
+    rebuild_doc_index(slug, state, docs_dir)
     save_json(state_file, state)
+    log_discovery(slug, meetings_new=new_count, docs_new=doc_count)
     print(f"\nDone. {new_count} new meetings, {doc_count} documents extracted.")
 
 

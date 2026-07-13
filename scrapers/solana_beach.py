@@ -35,7 +35,7 @@ from bs4 import BeautifulSoup
 from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
     load_agencies, agency_data_dir, USER_AGENT,
-    parse_escribe_date, cmd_list_meetings,
+    parse_escribe_date, cmd_list_meetings, rebuild_doc_index, log_discovery,
 )
 
 SLUG = "solana_beach"
@@ -395,7 +395,9 @@ def cmd_fetch(args):
         }
 
     state["last_fetch"] = datetime.now().isoformat()
+    rebuild_doc_index("solana_beach", state, docs_dir)
     save_json(state_file, state)
+    log_discovery("solana_beach", meetings_new=new_count, docs_new=doc_count)
     print(f"\nDone. {new_count} new meetings, {doc_count} documents extracted.")
 
 

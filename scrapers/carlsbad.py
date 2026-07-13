@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from bs4 import BeautifulSoup
 
-from civic_utils import extract_text, save_json, load_json, agency_data_dir, load_agencies, cmd_list_meetings
+from civic_utils import extract_text, save_json, load_json, agency_data_dir, load_agencies, cmd_list_meetings, rebuild_doc_index, log_discovery
 
 SLUG = "carlsbad"
 BASE_URL = "https://www.carlsbadca.gov"
@@ -284,7 +284,9 @@ def cmd_fetch(args):
             time.sleep(1)
 
     state["last_fetch"] = datetime.now().isoformat()
+    rebuild_doc_index("carlsbad", state, docs_dir)
     save_json(state_file, state)
+    log_discovery("carlsbad", meetings_new=new_count, docs_new=doc_count)
     print(f"\nDone. {new_count} new meetings, {doc_count} documents extracted.")
 
 

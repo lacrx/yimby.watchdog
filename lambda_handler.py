@@ -38,6 +38,7 @@ PLATFORM_SCRAPER = {
     "civicclerk": "scrapers.civicclerk",
     "carlsbad_cms": "scrapers.carlsbad",
     "solana_drupal": "scrapers.solana_beach",
+    "municode": "scrapers.municode",
 }
 
 

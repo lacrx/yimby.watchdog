@@ -75,7 +75,9 @@ agencies:
       Traffic Safety & Mobility Commission: /city-hall/meetings-agendas/boards-commissions/traffic-mobility-commission
       Community-Police Engagement Commission: /city-hall/meetings-agendas/boards-commissions/community-police-engagement-commission
     deep_fetch: false
-    enabled: false  # Phase 1 NCC watcher — not yet active
+    enabled: true
+    forward_only: true
+    enabled_date: "2026-07-13"
 
   encinitas:
     name: City of Encinitas
@@ -86,7 +88,9 @@ agencies:
     lookback_months: 2
     bodies: []  # all bodies in view
     deep_fetch: false
-    enabled: false  # Phase 1 NCC watcher — not yet active
+    enabled: true
+    forward_only: true
+    enabled_date: "2026-07-13"
 
   solana_beach:
     name: City of Solana Beach
@@ -113,7 +117,9 @@ agencies:
         path: /en/government/public-meetings/citizen-commission-council-standing-committee-meetings
         body_prefix: null
     deep_fetch: false
-    enabled: false  # Phase 1 NCC watcher — not yet active
+    enabled: true
+    forward_only: true
+    enabled_date: "2026-07-13"
 
   del_mar:
     name: City of Del Mar
@@ -135,7 +141,56 @@ agencies:
       - Undergrounding Program Advisory Committee
       - Measure Q Citizen Oversight Committee
     deep_fetch: false
-    enabled: false  # Phase 1 NCC watcher — not yet active
+    enabled: true
+    forward_only: true
+    enabled_date: "2026-07-13"
+
+  # ── North County Inland ────────────────────────────────────────────
+
+  san_marcos:
+    name: City of San Marcos
+    region: north_county_inland
+    platform: granicus
+    base_url: https://sanmarcos.granicus.com
+    view_id: 3
+    lookback_months: 2
+    bodies: []
+    deep_fetch: false
+    enabled: true
+    forward_only: true
+    enabled_date: "2026-07-13"
+
+  escondido:
+    name: City of Escondido
+    region: north_county_inland
+    platform: municode
+    base_url: https://escondido-ca.municodemeetings.com
+    lookback_months: 2
+    bodies:
+      - City Council
+      - Planning Commission
+      - Building Advisory and Appeals Board
+      - Historic Preservation Commission
+      - Library Board of Trustees
+      - Public Art Commission
+      - Transportation Commission
+    deep_fetch: false
+    enabled: true
+    forward_only: true
+    enabled_date: "2026-07-13"
+
+  poway:
+    name: City of Poway
+    region: north_county_inland
+    platform: civicplus
+    base_url: https://poway.org
+    lookback_months: 2
+    bodies:
+      - City Council
+    deep_fetch: false
+    enabled: true
+    forward_only: true
+    enabled_date: "2026-07-13"
 
   # ── Regional / Transit ────────────────────────────────────────────
 
