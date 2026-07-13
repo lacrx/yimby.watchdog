@@ -10,6 +10,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")"
+export PATH="$HOME/.local/bin:$PATH"
 source .venv/bin/activate
 [ -f .env ] && set -a && source .env && set +a
 unset ANTHROPIC_API_KEY  # extraction uses claude -p, not paid API

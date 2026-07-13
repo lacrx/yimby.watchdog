@@ -29,7 +29,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-from civic_utils import all_docs_dirs, all_meetings_dirs, load_json, agency_data_dir, load_agencies
+from civic_utils import all_docs_dirs, all_meetings_dirs, load_json, agency_data_dir, agency_docs_dir, load_agencies
 from transforms.triage import predict_relevance
 import config
 
@@ -375,21 +375,144 @@ def cmd_tally(args):
     print(f"Logged to {TALLY_PATH}")
 
 
+DISCOVERY_LOG = DATA_DIR / "pipeline" / "discovery.jsonl"
+
+
+def cmd_cost_report(args):
+    """Project monthly API cost from discovery rate + triage pass rate."""
+    from collections import defaultdict
+    from datetime import timedelta
+
+    now = datetime.now()
+    lookback = timedelta(days=30)
+    cutoff = (now - lookback).isoformat()
+
+    # Load discovery history (publication rate)
+    discovery_by_agency = defaultdict(list)
+    if DISCOVERY_LOG.exists():
+        for line in open(DISCOVERY_LOG):
+            try:
+                entry = json.loads(line.strip())
+                if entry.get("ts", "") >= cutoff:
+                    discovery_by_agency[entry["agency"]].append(entry)
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    # Load tally history (triage + token data)
+    tally_entries = []
+    if TALLY_PATH.exists():
+        for line in open(TALLY_PATH):
+            try:
+                entry = json.loads(line.strip())
+                if entry.get("ts", "") >= cutoff:
+                    tally_entries.append(entry)
+            except (json.JSONDecodeError, KeyError):
+                continue
+
+    # Compute per-agency stats
+    print(f"=== Cost Projection Report — {now.strftime('%Y-%m-%d')} ===")
+    print(f"    (Based on last 30 days of data)")
+    print()
+
+    # From discovery: publication rate
+    pub_rates = {}
+    for agency, entries in sorted(discovery_by_agency.items()):
+        total_new = sum(e.get("meetings_new", 0) for e in entries)
+        total_docs = sum(e.get("docs_new", 0) for e in entries)
+        n_runs = len(entries)
+        days_spanned = max(1, (now - datetime.fromisoformat(entries[0]["ts"])).days)
+        pub_rates[agency] = {
+            "meetings_new_total": total_new,
+            "docs_new_total": total_docs,
+            "runs": n_runs,
+            "days": days_spanned,
+            "meetings_per_week": round(total_new / days_spanned * 7, 1),
+            "docs_per_week": round(total_docs / days_spanned * 7, 1) if total_docs else None,
+        }
+
+    # From tally: triage pass rate + avg tokens per doc
+    triage_stats = {}
+    if tally_entries:
+        latest = tally_entries[-1]
+        for agency, data in latest.get("incoming", {}).items():
+            docs = data.get("docs", 0) + data.get("skip_marker", 0)
+            need_llm = data.get("need_llm", 0)
+            triage_skip = data.get("triage_skip", 0)
+            tokens = data.get("input_tokens", 0)
+            triage_stats[agency] = {
+                "total_pending": docs,
+                "need_llm": need_llm,
+                "triage_skip": triage_skip,
+                "triage_pass_rate": round(need_llm / max(1, need_llm + triage_skip), 2),
+                "avg_input_tokens": round(tokens / max(1, need_llm)),
+            }
+
+    # Combine into projection
+    all_agencies = sorted(set(list(pub_rates.keys()) + list(triage_stats.keys())))
+
+    print(f"{'Agency':<16} {'New/wk':>7} {'Triage%':>8} {'Tok/doc':>8} {'$/month':>9}")
+    print("-" * 52)
+
+    total_monthly = 0
+    for agency in all_agencies:
+        pr = pub_rates.get(agency, {})
+        ts = triage_stats.get(agency, {})
+
+        docs_per_week = pr.get("docs_per_week") or pr.get("meetings_per_week", 0) * 3
+        triage_rate = ts.get("triage_pass_rate", 0.9)
+        avg_tokens = ts.get("avg_input_tokens", 15000)
+
+        llm_docs_per_month = docs_per_week * 4.33 * triage_rate
+        input_cost = (llm_docs_per_month * avg_tokens / 1_000_000) * OPUS_INPUT_PER_MTOK
+        output_cost = (llm_docs_per_month * OUTPUT_TOKENS_EST / 1_000_000) * OPUS_OUTPUT_PER_MTOK
+        monthly_cost = input_cost + output_cost
+        total_monthly += monthly_cost
+
+        print(f"{agency:<16} {docs_per_week:>7.1f} {triage_rate*100:>7.0f}% {avg_tokens:>8,} ${monthly_cost:>8.2f}")
+
+    print("-" * 52)
+    print(f"{'TOTAL':<16} {'':>7} {'':>8} {'':>8} ${total_monthly:>8.2f}")
+    print()
+    print(f"  Annualized: ${total_monthly * 12:,.0f}/yr")
+    print()
+
+    if not discovery_by_agency:
+        print("  NOTE: No discovery data yet. Run scrapers to start collecting publication rates.")
+        print("        Projection above uses tally backlog data only (not ongoing rate).")
+
+    # Log report
+    report = {
+        "ts": now.isoformat(timespec="seconds"),
+        "pub_rates": pub_rates,
+        "triage_stats": triage_stats,
+        "projected_monthly_usd": round(total_monthly, 2),
+        "projected_annual_usd": round(total_monthly * 12, 2),
+    }
+    report_path = DATA_DIR / "pipeline" / "cost-report.jsonl"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(report_path, "a") as f:
+        f.write(json.dumps(report, default=str) + "\n")
+    print(f"  Logged to {report_path}")
+
+
 def rebuild_combined(structured_dir):
     """Rebuild the combined JSONL file from individual records."""
     jsonl_path = structured_dir / "all-records.jsonl"
     records = []
 
+    skip_files = {"extraction-state.json", "meetings-state.json", "document-dates.json"}
     for json_file in sorted(structured_dir.glob("*.json")):
-        if json_file.name == "extraction-state.json":
+        if json_file.name in skip_files:
             continue
         try:
             record = json.loads(json_file.read_text())
+            if not isinstance(record, dict) or "votes" not in record:
+                continue
             records.append(record)
         except (json.JSONDecodeError, Exception):
             continue
 
-    records.sort(key=lambda r: r.get("date", ""))
+    records.sort(key=lambda r: r.get("date") or "")
     with open(jsonl_path, "w") as f:
         for r in records:
             f.write(json.dumps(r, default=str) + "\n")
@@ -419,21 +542,39 @@ def collect_all_sources(queue=None, hot_days=14):
 
     queue: None (all), "hot" (recent meetings), or "cold" (backlog).
     hot_days: days back from today that counts as "hot" (default 14).
+
+    forward_only agencies use enabled_date as cutoff instead of hot_days,
+    and are excluded from cold queue entirely.
     """
     sources = []
+    agencies = load_agencies(enabled_only=True)
     doc_index = load_doc_index() if queue else {}
     hot_cutoff = (datetime.now().date() - timedelta(days=hot_days)).isoformat()
 
-    for ddir in all_docs_dirs():
+    for slug, cfg in agencies.items():
+        ddir = agency_docs_dir(slug)
+        if not ddir.exists():
+            continue
+
+        is_forward_only = cfg.get("forward_only", False)
+        enabled_date = cfg.get("enabled_date", "")
+
+        if queue == "cold" and is_forward_only:
+            continue
+
         for f in sorted(ddir.glob("*.txt"), reverse=True):
             if queue:
                 meeting_date = doc_index.get(f.name, "")
-                is_hot = meeting_date >= hot_cutoff if meeting_date else False
 
-                if queue == "hot" and not is_hot:
-                    continue
-                if queue == "cold" and is_hot:
-                    continue
+                if is_forward_only:
+                    if not meeting_date or meeting_date < enabled_date:
+                        continue
+                else:
+                    is_hot = meeting_date >= hot_cutoff if meeting_date else False
+                    if queue == "hot" and not is_hot:
+                        continue
+                    if queue == "cold" and is_hot:
+                        continue
 
             sources.append(("doc", f))
 
@@ -769,10 +910,13 @@ def main():
     parser.add_argument("--limit", type=int, metavar="N", help="Stop after N successful extractions")
     parser.add_argument("--queue", choices=["hot", "cold"], help="hot=recent meetings only, cold=backlog only")
     parser.add_argument("--hot-days", type=int, default=14, help="Days back that counts as 'hot' (default: 14)")
+    parser.add_argument("--cost-report", action="store_true", help="Project monthly API cost from discovery + tally history")
 
     args = parser.parse_args()
 
-    if args.tally:
+    if args.cost_report:
+        cmd_cost_report(args)
+    elif args.tally:
         cmd_tally(args)
     elif args.stats:
         cmd_stats(args)

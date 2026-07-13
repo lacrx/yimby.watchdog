@@ -1,0 +1,70 @@
+#!/bin/bash
+# Backlog extraction — cold queue only. No scraping, no merging.
+# Separate from civic-pipeline. Run on its own schedule.
+#
+#   ./extract-backlog --extract-until 4    # grind backlog until 4 AM
+#   ./extract-backlog --limit 10           # extract 10 backlog docs
+#   ./extract-backlog --dry-run            # show queue without extracting
+#
+# Cron:
+#   30 1 * * *  cd ~/repos/yimby.watchdog && ./extract-backlog --extract-until 4 >> data/backlog-extraction.log 2>&1
+
+set -euo pipefail
+cd "$(dirname "$0")"
+export PATH="$HOME/.local/bin:$PATH"
+source .venv/bin/activate
+[ -f .env ] && set -a && source .env && set +a
+unset ANTHROPIC_API_KEY
+
+PIDFILE="data/.backlog.pid"
+if [ -f "$PIDFILE" ]; then
+    OLD_PID=$(cat "$PIDFILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [backlog] Already running (PID $OLD_PID). Exiting."
+        exit 0
+    fi
+    rm -f "$PIDFILE"
+fi
+echo $$ > "$PIDFILE"
+trap 'rm -f "$PIDFILE"' EXIT
+
+FORCE=""
+EXTRACT_ARGS=""
+DRY_RUN=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force)          FORCE="--force"; shift ;;
+        --extract-until)  EXTRACT_ARGS="$EXTRACT_ARGS --stop-at $2"; shift 2 ;;
+        --limit)          EXTRACT_ARGS="$EXTRACT_ARGS --limit $2"; shift 2 ;;
+        --dry-run)        DRY_RUN="--dry-run"; shift ;;
+        *)                echo "Usage: extract-backlog [--force] [--extract-until H] [--limit N] [--dry-run]"; exit 1 ;;
+    esac
+done
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [backlog] $*"
+}
+
+log "Starting backlog extraction..."
+
+python3 transforms/extract_structured.py --tally >> data/structured-extraction.log 2>&1 || true
+
+EXTRACT_BEFORE=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
+
+python3 transforms/extract_structured.py --queue cold $EXTRACT_ARGS $FORCE $DRY_RUN \
+    >> data/structured-extraction.log 2>&1 || true
+
+EXTRACT_AFTER=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
+NEW_EXTRACTIONS=$((EXTRACT_AFTER - EXTRACT_BEFORE))
+
+log "Cold extraction done: $NEW_EXTRACTIONS new."
+
+if [ "$NEW_EXTRACTIONS" -gt 0 ] && [ -n "${WATCHDOG_S3_BUCKET:-}" ]; then
+    log "Syncing structured data to S3..."
+    aws s3 sync data/structured/ "s3://${WATCHDOG_S3_BUCKET}/structured/" \
+        --exclude "*.log" --exclude "*.skip" --quiet 2>/dev/null || true
+    log "S3 sync done."
+fi
+
+log "Done."

@@ -14,11 +14,12 @@
 #   --force             Re-process already summarized/extracted documents
 #   --years N           How many years back to fetch (default: 1)
 #   --transcribe        Also transcribe meeting videos
-#   --extract-until H   Stop extraction at hour H (0-23). Omit for no time limit.
+#   --hot-only          Extract recent meetings only (skip backlog). Use for forward-facing cron.
+#   --extract-until H   Stop cold extraction at hour H (0-23). Ignored with --hot-only.
 #
-# Cron:
-#   0 1 * * *   cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep --extract-until 4
-#   0 18 * * 2-5 cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep
+# Cron (forward-facing only — backlog extraction is a separate job via extract-backlog):
+#   0 1 * * *    cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep --hot-only
+#   0 18 * * 2-5 cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep --hot-only
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -72,6 +73,7 @@ FORCE=""
 YEARS="1"
 TRANSCRIBE=""
 EXTRACT_CUTOFF=""
+HOT_ONLY=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -80,6 +82,7 @@ while [[ $# -gt 0 ]]; do
         --years)          YEARS="$2"; shift 2 ;;
         --transcribe)     TRANSCRIBE="1"; shift ;;
         --extract-until)  EXTRACT_CUTOFF="$2"; shift 2 ;;
+        --hot-only)       HOT_ONLY="1"; shift ;;
         *)                echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -174,6 +177,9 @@ while IFS='|' read -r SLUG PLATFORM NAME AGENCY_YEARS; do
         solana_drupal)
             run_with_timeout "$NAME fetch" python3 scrapers/solana_beach.py fetch $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
             ;;
+        municode)
+            run_with_timeout "$NAME fetch" python3 scrapers/municode.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
         *)
             log "  $NAME: unknown platform '$PLATFORM', skipping."
             ;;
@@ -185,7 +191,7 @@ cfg = yaml.safe_load(open('agencies.yaml'))
 for slug, a in cfg['agencies'].items():
     if a.get('enabled', True):
         lb = a.get('lookback_months')
-        years = f'{lb / 12:.2f}' if lb else ''
+        years = str(-(-lb // 12)) if lb else ''
         print(f\"{slug}|{a['platform']}|{a.get('name', slug)}|{years}\")
 ")
 
@@ -306,12 +312,16 @@ fi
 
 # ── 2a: Merge per-document records into per-meeting records ──
 log "Merging per-meeting records..."
-python3 transforms/meeting_merge.py >> data/meeting-merge.log 2>&1
+MERGE_RC=0
+python3 transforms/meeting_merge.py >> data/meeting-merge.log 2>&1 || MERGE_RC=$?
+if [ "$MERGE_RC" -ne 0 ]; then
+    log "WARNING: Meeting merge failed (exit $MERGE_RC). Continuing pipeline."
+fi
 log "Meeting merge done."
 
 # ── 2b: Monthly rollups (auto-detects stale months) ──
 log "Building monthly digests..."
-python3 transforms/monthly_rollup.py >> data/monthly-rollup.log 2>&1
+python3 transforms/monthly_rollup.py >> data/monthly-rollup.log 2>&1 || log "WARNING: Monthly rollup failed. Continuing pipeline."
 log "Monthly rollups done."
 
 # ═══════════════════════════════════════════
@@ -319,6 +329,8 @@ log "Monthly rollups done."
 # ═══════════════════════════════════════════
 # Documents from meetings in the last 14 days. No time limit — these
 # must always be processed. Failures are logged loudly.
+
+python3 transforms/extract_structured.py --tally >> data/structured-extraction.log 2>&1 || true
 
 EXTRACT_BEFORE=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
 
@@ -340,7 +352,9 @@ log "Hot extraction done: $HOT_EXTRACTIONS new."
 # Only runs if hot succeeded and time remains. Oldest-first.
 # Failures are quiet — backlog can wait.
 
-if [ "$HOT_RC" -eq 0 ] && [ -n "$EXTRACT_CUTOFF" ]; then
+if [ -n "$HOT_ONLY" ]; then
+    log "Skipping cold extraction (--hot-only)."
+elif [ "$HOT_RC" -eq 0 ] && [ -n "$EXTRACT_CUTOFF" ]; then
     CURRENT_HOUR=$(date +%H)
     if [ "$CURRENT_HOUR" -lt "$EXTRACT_CUTOFF" ]; then
         log "Cold extraction (backlog, until ${EXTRACT_CUTOFF}:00)..."

@@ -275,10 +275,20 @@ def merge_records(meeting_id, records, doc_dates=None):
         all_legal.extend(r.get("legal_flags", []))
         all_comments.extend(r.get("public_comments", []))
 
-    # Deduplicate strings
-    all_legal = list(dict.fromkeys(all_legal))
-    all_comments = list(dict.fromkeys(all_comments))
-    all_quotes = list(dict.fromkeys(all_quotes))
+    # Deduplicate — items may be strings or dicts
+    def _dedup(items):
+        seen = set()
+        out = []
+        for item in items:
+            key = json.dumps(item, sort_keys=True) if isinstance(item, dict) else item
+            if key not in seen:
+                seen.add(key)
+                out.append(item)
+        return out
+
+    all_legal = _dedup(all_legal)
+    all_comments = _dedup(all_comments)
+    all_quotes = _dedup(all_quotes)
 
     # Deduplicate votes by item description
     seen_votes = set()
