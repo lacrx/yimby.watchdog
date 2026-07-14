@@ -269,9 +269,22 @@ TALLY_PATH = DATA_DIR / "pipeline" / "extraction-tally.jsonl"
 
 
 def cmd_tally(args):
-    """Log what incoming docs would cost at API rates, without extracting."""
+    """Tally forward-facing document volume across all agencies.
+
+    Counts docs from meetings within each agency's lookback window (default 2mo).
+    Use --tally-all to count everything regardless of date.
+    Apples-to-apples comparison for cost projection.
+    """
     from transforms.triage import predict_relevance
     from collections import defaultdict
+
+    tally_all = getattr(args, "tally_all", False)
+    agencies_cfg = load_agencies(enabled_only=True)
+    doc_index = load_doc_index()
+
+    if not tally_all:
+        window_months = 2
+        cutoff = (datetime.now().date() - timedelta(days=window_months * 30)).isoformat()
 
     all_sources = collect_all_sources()
     if not all_sources:
@@ -290,6 +303,13 @@ def cmd_tally(args):
             agency = sf.parent.parent.name
         else:
             agency = sf.parent.name
+
+        if not tally_all and source_type != "transcript":
+            meeting_date = doc_index.get(sf.name, "")
+            if meeting_date and meeting_date < cutoff:
+                continue
+            if not meeting_date:
+                continue
 
         stem = sf.stem.replace("-transcript", "") if source_type == "transcript" else sf.stem
         suffix = "-transcript" if source_type == "transcript" else ""
@@ -351,9 +371,11 @@ def cmd_tally(args):
     input_cost = (totals["input_tokens"] / 1_000_000) * OPUS_INPUT_PER_MTOK
     output_cost = (totals["output_tokens_est"] / 1_000_000) * OPUS_OUTPUT_PER_MTOK
     est_cost = round(input_cost + output_cost, 4)
+    monthly_cost = round(est_cost / 2, 4) if not tally_all else None
 
     entry = {
         "ts": datetime.now().isoformat(timespec="seconds"),
+        "mode": "all" if tally_all else "forward",
         "incoming": incoming,
         "totals": {**totals, "est_cost_usd": est_cost},
     }
@@ -362,16 +384,19 @@ def cmd_tally(args):
     with open(TALLY_PATH, "a") as f:
         f.write(json.dumps(entry, default=str) + "\n")
 
-    print(f"=== Extraction Cost Tally — {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
+    window_label = "ALL TIME" if tally_all else "last 2 months"
+    print(f"=== Forward Tally ({window_label}) — {datetime.now().strftime('%Y-%m-%d %H:%M')} ===")
     print()
-    print(f"{'Agency':<15} {'New':>5} {'LLM':>5} {'Skip':>5} {'Tokens':>10} {'Chunks':>7}")
-    print("-" * 52)
+    print(f"{'Agency':<18} {'Docs':>5} {'LLM':>5} {'Skip':>5} {'Tokens':>10} {'Chunks':>7}")
+    print("-" * 55)
     for agency in sorted(incoming):
         t = incoming[agency]
-        print(f"{agency:<15} {t['docs']:>5} {t['need_llm']:>5} {t['triage_skip']:>5} {t['input_tokens']:>10} {t['chunks']:>7}")
-    print("-" * 52)
-    print(f"{'TOTAL':<15} {totals['docs']:>5} {totals['need_llm']:>5} {totals['triage_skip']:>5} {totals['input_tokens']:>10} {totals['chunks']:>7}")
+        print(f"{agency:<18} {t['docs']:>5} {t['need_llm']:>5} {t['triage_skip']:>5} {t['input_tokens']:>10} {t['chunks']:>7}")
+    print("-" * 55)
+    print(f"{'TOTAL':<18} {totals['docs']:>5} {totals['need_llm']:>5} {totals['triage_skip']:>5} {totals['input_tokens']:>10} {totals['chunks']:>7}")
     print(f"\nEstimated API cost (Opus 4.8): ${est_cost:.4f}")
+    if monthly_cost:
+        print(f"Estimated monthly rate: ${monthly_cost:.2f}/mo")
     print(f"Logged to {TALLY_PATH}")
 
 
@@ -909,7 +934,8 @@ def main():
     parser.add_argument("--stop-at", type=int, metavar="HOUR", help="Stop extraction at this hour (0-23). Resumes next run.")
     parser.add_argument("--meeting", action="append", metavar="ID", help="Only extract sources for these meeting IDs (repeatable)")
     parser.add_argument("--no-triage", action="store_true", help="Disable ML triage — extract all documents")
-    parser.add_argument("--tally", action="store_true", help="Log incoming doc counts and estimated API cost without extracting")
+    parser.add_argument("--tally", action="store_true", help="Forward-facing tally (last 2mo) for cost projection")
+    parser.add_argument("--tally-all", action="store_true", help="Tally all docs regardless of date (backlog + forward)")
     parser.add_argument("--limit", type=int, metavar="N", help="Stop after N successful extractions")
     parser.add_argument("--queue", choices=["hot", "cold"], help="hot=recent meetings only, cold=backlog only")
     parser.add_argument("--hot-days", type=int, default=14, help="Days back that counts as 'hot' (default: 14)")
@@ -919,7 +945,7 @@ def main():
 
     if args.cost_report:
         cmd_cost_report(args)
-    elif args.tally:
+    elif args.tally or args.tally_all:
         cmd_tally(args)
     elif args.stats:
         cmd_stats(args)
