@@ -83,6 +83,8 @@ Document text:
 SKIP_MARKER = ".skip"  # written next to source file to permanently skip un-extractable docs
 CHUNK_SIZE = 60000     # chars per chunk (leaves room for prompt + schema in context)
 CHUNK_OVERLAP = 2000   # overlap between chunks to avoid splitting mid-sentence
+MAX_FAIL_RETRIES = 3   # auto-skip after this many extraction failures
+FAILURE_STATE_FILE = None  # set in cmd_extract() after STRUCTURED_DIR is available
 
 
 def get_meeting_meta(doc_path):
@@ -109,8 +111,9 @@ class AuthError(Exception):
 
 
 def _call_claude(prompt, max_retries=2):
-    """Call claude -p with retries. Returns parsed JSON or None.
+    """Call claude -p with retries. Returns (record, error_category) tuple.
 
+    On success: (dict, None). On failure: (None, "timeout"|"empty_output"|"json_parse"|"exit_code").
     Raises RateLimitHit on session/rate limits and AuthError on 401/403.
     Uses subscription auth only — ANTHROPIC_API_KEY is stripped to avoid
     burning API credits on batch extraction.
@@ -142,7 +145,7 @@ def _call_claude(prompt, max_retries=2):
                     print(f"  stderr: {result.stderr[:300]}")
                 if result.stdout:
                     print(f"  stdout: {result.stdout[:300]}")
-                return None
+                return None, "exit_code"
 
             output = result.stdout.strip()
             if not output:
@@ -151,7 +154,7 @@ def _call_claude(prompt, max_retries=2):
                     time.sleep(5)
                     continue
                 print(f"  claude -p returned empty output")
-                return None
+                return None, "empty_output"
 
             if output.startswith("```"):
                 output = output.split("\n", 1)[1] if "\n" in output else output
@@ -162,7 +165,7 @@ def _call_claude(prompt, max_retries=2):
                 record = json.loads(output)
                 if isinstance(record, list):
                     record = record[0] if len(record) == 1 else {"_chunks": record}
-                return record
+                return record, None
             except json.JSONDecodeError as e:
                 if attempt < max_retries:
                     print(f"  JSON parse error, retrying ({attempt+1}/{max_retries})...")
@@ -170,20 +173,20 @@ def _call_claude(prompt, max_retries=2):
                     continue
                 print(f"  JSON parse error: {e}")
                 print(f"  Raw output ({len(result.stdout)} chars): {result.stdout[:500]}")
-                return None
+                return None, "json_parse"
 
         except FileNotFoundError:
             print("  claude CLI not found.")
-            return None
+            return None, "exit_code"
         except subprocess.TimeoutExpired:
             if attempt < max_retries:
                 print(f"  timed out, retrying ({attempt+1}/{max_retries})...")
                 time.sleep(10)
                 continue
             print("  claude -p timed out (300s)")
-            return None
+            return None, "timeout"
 
-    return None
+    return None, "unknown"
 
 
 def _merge_records(records):
@@ -227,7 +230,10 @@ def _merge_records(records):
 
 
 def extract_structured(text, meeting_meta):
-    """Extract structured JSON from document text, chunking if large."""
+    """Extract structured JSON from document text, chunking if large.
+
+    Returns (record, error_category) tuple. error_category is None on success.
+    """
     meta_context = ""
     if meeting_meta:
         meta_context = f"\nMeeting metadata: {json.dumps(meeting_meta, default=str)}\n"
@@ -250,14 +256,20 @@ def extract_structured(text, meeting_meta):
     print(f"  Chunking: {len(text):,} chars → {len(chunks)} chunks", flush=True)
 
     records = []
+    last_error = None
     for ci, chunk in enumerate(chunks):
         prompt = EXTRACTION_PROMPT + meta_context + "\n" + chunk
-        record = _call_claude(prompt)
+        record, err = _call_claude(prompt)
         if record:
             records.append(record)
+        elif err:
+            last_error = err
         time.sleep(1)
 
-    return _merge_records(records)
+    merged = _merge_records(records)
+    if merged:
+        return merged, None
+    return None, last_error or "unknown"
 
 
 CHARS_PER_TOKEN = 4
@@ -677,6 +689,40 @@ def has_skip_marker(source_path):
     return False
 
 
+def _failure_state_path():
+    return STRUCTURED_DIR / "extraction-failures.json"
+
+
+def load_failure_state():
+    path = _failure_state_path()
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_failure_state(state):
+    _failure_state_path().write_text(json.dumps(state, indent=2, default=str))
+
+
+def record_failure(state, filename, error_category, queue=None):
+    entry = state.get(filename, {})
+    entry["fail_count"] = entry.get("fail_count", 0) + 1
+    if "first_failed" not in entry:
+        entry["first_failed"] = datetime.now().isoformat()
+    entry["last_failed"] = datetime.now().isoformat()
+    entry["last_error"] = error_category or "unknown"
+    if queue:
+        entry["queue"] = queue
+    state[filename] = entry
+
+
+def clear_failure(state, filename):
+    state.pop(filename, None)
+
+
 def cmd_extract(args):
     """Extract structured records from all raw sources (documents + transcripts)."""
     STRUCTURED_DIR.mkdir(parents=True, exist_ok=True)
@@ -752,6 +798,7 @@ def cmd_extract(args):
     if use_triage:
         print("  Triage enabled (rule-based substantive filter)")
 
+    failure_state = load_failure_state()
     stop_hour = getattr(args, "stop_at", None)
     print(f"Extracting structured data: {len(to_process)} sources to process")
     if stop_hour:
@@ -759,6 +806,7 @@ def cmd_extract(args):
     success = 0
     failed = 0
     skipped = 0
+    failure_skipped = 0
     triage_skipped = 0
     consecutive_failures = 0
     auth_failure_count = 0
@@ -776,6 +824,17 @@ def cmd_extract(args):
             remaining = len(to_process) - i
             print(f"\nLimit reached ({args.limit} extractions). {remaining} remaining, will resume next run.")
             break
+
+        prior = failure_state.get(sf.name, {})
+        if prior.get("fail_count", 0) >= MAX_FAIL_RETRIES:
+            last_err = prior.get("last_error", "unknown")
+            write_skip_marker(sf, "repeated_failure")
+            clear_failure(failure_state, sf.name)
+            failure_skipped += 1
+            print(f"[{i+1}/{len(to_process)}] {sf.name}")
+            print(f"  Auto-skipped: failed {prior['fail_count']} times (last: {last_err})")
+            i += 1
+            continue
 
         label = f"[{source_type}]" if source_type == "transcript" else ""
         print(f"[{i+1}/{len(to_process)}] {sf.name} {label}")
@@ -800,7 +859,7 @@ def cmd_extract(args):
 
         meta = get_meeting_meta(sf)
         try:
-            record = extract_structured(text, meta)
+            record, error_cat = extract_structured(text, meta)
         except AuthError as e:
             auth_failure_count += 1
 
@@ -858,11 +917,14 @@ def cmd_extract(args):
             out_path.write_text(json.dumps(record, indent=2, default=str))
             success += 1
             consecutive_failures = 0
+            clear_failure(failure_state, sf.name)
             print(f"  OK ({len(text)} chars, {len(record.get('votes',[]))}v {len(record.get('housing_items',[]))}h)")
         else:
             failed += 1
             consecutive_failures += 1
-            print(f"  FAILED")
+            record_failure(failure_state, sf.name, error_cat, queue=queue)
+            fc = failure_state[sf.name]["fail_count"]
+            print(f"  FAILED ({error_cat or 'unknown'}, attempt {fc}/{MAX_FAIL_RETRIES})")
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 remaining = len(to_process) - i - 1
@@ -875,8 +937,11 @@ def cmd_extract(args):
         time.sleep(1)
         i += 1
 
+    save_failure_state(failure_state)
+
     triage_msg = f", {triage_skipped} triage-skipped" if triage_skipped else ""
-    print(f"\nDone. {success} extracted, {failed} failed, {skipped} permanently skipped{triage_msg}.")
+    fail_skip_msg = f", {failure_skipped} auto-skipped (repeated failures)" if failure_skipped else ""
+    print(f"\nDone. {success} extracted, {failed} failed, {skipped} permanently skipped{fail_skip_msg}{triage_msg}.")
 
     if success > 0:
         rebuild_combined(STRUCTURED_DIR)

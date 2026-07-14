@@ -387,6 +387,16 @@ def diagnose(dry_run=False):
     # 6. Check auth
     auth_status = check_auth_health()
 
+    # 7. Load extraction failure state
+    failure_state_path = STRUCTURED_DIR / "extraction-failures.json"
+    failure_state = {}
+    if failure_state_path.exists():
+        try:
+            failure_state = json.loads(failure_state_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    failing_files = {k: v for k, v in failure_state.items() if v.get("fail_count", 0) >= 2}
+
     # ─── Report ───
 
     diagnosis["stats"] = {
@@ -396,6 +406,7 @@ def diagnose(dry_run=False):
         "last_productive_run": pipe_errors["last_productive_run"],
         "blocking_files": len(blockers),
         "oversized_files": len(oversized),
+        "failing_extractions": len(failing_files),
         "timed_out_phases": len(pipe_errors["timed_out_phases"]),
         "overlapping_runs": len(pipe_errors["overlapping_runs"]),
         "command_not_found": len(pipe_errors["command_not_found"]),
@@ -403,6 +414,7 @@ def diagnose(dry_run=False):
 
     print(f"  Remaining files:     {len(remaining)}")
     print(f"  Auth status:         {auth_status}")
+    print(f"  Failing extractions: {len(failing_files)}")
     print(f"  Last productive run: {pipe_errors['last_productive_run'] or 'unknown'}")
     print(f"  Zero-extraction runs: {pipe_errors['zero_extraction_runs']} (recent)")
     print()
@@ -467,6 +479,20 @@ def diagnose(dry_run=False):
                     fix = f"Skipped '{fpath.name}' — {size:,} bytes, non-meeting content"
                     diagnosis["fixes_applied"].append(fix)
                     print(f"  FIX: {fix}")
+
+    # ─── Finding: Repeatedly failing extractions ───
+
+    if failing_files:
+        for fname, info in sorted(failing_files.items(), key=lambda x: -x[1].get("fail_count", 0)):
+            fc = info.get("fail_count", 0)
+            last_err = info.get("last_error", "unknown")
+            finding = f"Extraction failing: '{fname}' — {fc} attempts, last error: {last_err}"
+            diagnosis["findings"].append(finding)
+            print(f"  FINDING: {finding}")
+        if any(v.get("fail_count", 0) >= 3 for v in failing_files.values()):
+            diagnosis["recommendations"].append(
+                "Files with 3+ failures will be auto-skipped on next extraction run"
+            )
 
     # ─── Finding: Auth broken ───
 
