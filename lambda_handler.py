@@ -70,6 +70,9 @@ def run_preflight():
 
     results = {}
     for slug, cfg in agencies.items():
+        if cfg.get("local_only"):
+            results[slug] = {"ok": None, "detail": "local_only (skipped in Lambda)"}
+            continue
         ok, detail = pipeline_preflight.check_agency(slug, cfg, health, verbose=False)
         results[slug] = {"ok": ok, "detail": detail}
 

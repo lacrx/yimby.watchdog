@@ -243,6 +243,88 @@ def probe_custom_html(cfg):
     return True, f"OK ({len(resp.text)} bytes)"
 
 
+def probe_municode(cfg):
+    base = cfg.get("base_url", "").rstrip("/")
+    resp = requests.get(f"{base}/", timeout=PROBE_TIMEOUT,
+                        headers={"User-Agent": USER_AGENT})
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    meeting_count = len(re.findall(r'/bc-[^/]+/page/', resp.text))
+    return True, f"OK ({meeting_count} meeting links)"
+
+
+def probe_laserfiche(cfg):
+    repo = cfg.get("laserfiche_repo", "")
+    browse_id = cfg.get("laserfiche_browse_id", "")
+    if not repo:
+        return False, "no laserfiche_repo configured"
+    url = f"https://portal.laserfiche.com/Portal/Browse.aspx?repo={repo}"
+    if browse_id:
+        url += f"&id={browse_id}"
+    resp = requests.get(url, timeout=PROBE_TIMEOUT,
+                        headers={"User-Agent": USER_AGENT})
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    if "LaserficheWebLink" not in resp.text and "angular" not in resp.text.lower():
+        return False, "unexpected page content"
+    return True, f"OK (session established)"
+
+
+def probe_elcajon_cms(cfg):
+    from curl_cffi import requests as cffi_requests
+    url = "https://www.elcajon.gov/your-government/city-meetings-with-agendas-and-minutes-575/-toggle-allpast"
+    resp = cffi_requests.get(url, timeout=PROBE_TIMEOUT, impersonate="firefox")
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    if "Access Denied" in resp.text[:500]:
+        return False, "WAF blocked"
+    m = re.search(r"of\s+(\d+)\s+items", resp.text)
+    total = m.group(1) if m else "?"
+    return True, f"OK ({total} past events)"
+
+
+def probe_primegov(cfg):
+    base = cfg.get("base_url", "").rstrip("/")
+    import datetime as dt
+    year = dt.datetime.now().year
+    url = f"{base}/api/v2/PublicPortal/ListArchivedMeetings?year={year}"
+    resp = requests.get(url, timeout=PROBE_TIMEOUT,
+                        headers={"User-Agent": USER_AGENT})
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    try:
+        data = resp.json()
+        return True, f"OK ({len(data)} meetings in {year})"
+    except Exception:
+        return False, "response is not JSON"
+
+
+def probe_santee_cms(cfg):
+    from curl_cffi import requests as cffi_requests
+    base = cfg.get("base_url", "").rstrip("/")
+    url = f"{base}/departments/city-clerk/agendas-minutes"
+    resp = cffi_requests.get(url, timeout=PROBE_TIMEOUT, impersonate="firefox")
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    if "Access Denied" in resp.text[:500]:
+        return False, "WAF blocked"
+    doc_count = len(re.findall(r'\.pdf|showpublisheddocument', resp.text, re.I))
+    return True, f"OK ({doc_count} doc links)"
+
+
+def probe_lemon_grove_events(cfg):
+    base = cfg.get("base_url", "").rstrip("/")
+    url = f"{base}/council"
+    resp = requests.get(url, timeout=PROBE_TIMEOUT,
+                        headers={"User-Agent": USER_AGENT})
+    if resp.status_code != 200:
+        return False, f"HTTP {resp.status_code}"
+    detail_count = resp.text.count("/Detail/")
+    if detail_count == 0:
+        return False, "no event detail links found"
+    return True, f"OK ({detail_count} event links)"
+
+
 PROBES = {
     "legistar_html": probe_legistar_html,
     "legistar_odata": probe_legistar_odata,
@@ -254,6 +336,12 @@ PROBES = {
     "carlsbad_cms": probe_carlsbad_cms,
     "solana_drupal": probe_solana_drupal,
     "custom_html": probe_custom_html,
+    "municode": probe_municode,
+    "laserfiche": probe_laserfiche,
+    "elcajon_cms": probe_elcajon_cms,
+    "primegov": probe_primegov,
+    "santee_cms": probe_santee_cms,
+    "lemon_grove_events": probe_lemon_grove_events,
 }
 
 
