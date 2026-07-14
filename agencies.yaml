@@ -182,24 +182,36 @@ agencies:
   poway:
     name: City of Poway
     region: north_county_inland
-    platform: civicplus
-    base_url: https://poway.org
+    platform: laserfiche
+    base_url: https://portal.laserfiche.com
+    laserfiche_repo: r-23018445
+    laserfiche_browse_id: 10494
     lookback_months: 2
     bodies:
       - City Council
+    body_folders:
+      City Council: 10494
     deep_fetch: false
-    enabled: false  # "new CivicPlus" JS-rendered format, scraper needs update
+    enabled: true
+    tally_only: true
 
   vista:
     name: City of Vista
     region: north_county_inland
-    platform: legistar_html
-    base_url: https://vista.legistar.com
+    platform: laserfiche
+    base_url: https://portal.laserfiche.com
+    laserfiche_repo: r-3f0b2553
+    laserfiche_browse_id: 49714
     lookback_months: 2
     bodies:
       - City Council
+      - Planning Commission
+    body_folders:
+      City Council: 49714
+      Planning Commission: 292972
     deep_fetch: false
-    enabled: false  # Granicus stopped 2021, Legistar returns "Invalid parameters" — needs investigation
+    enabled: true
+    tally_only: true
 
   # ── South County / East County / Central ──────────────────────────
 

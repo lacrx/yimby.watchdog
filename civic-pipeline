@@ -192,6 +192,9 @@ while IFS='|' read -r SLUG PLATFORM NAME AGENCY_YEARS; do
         elcajon_cms)
             run_with_timeout "$NAME fetch" python3 scrapers/elcajon.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
             ;;
+        laserfiche)
+            run_with_timeout "$NAME fetch" python3 scrapers/laserfiche.py fetch --agency "$SLUG" --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            ;;
         *)
             log "  $NAME: unknown platform '$PLATFORM', skipping."
             ;;

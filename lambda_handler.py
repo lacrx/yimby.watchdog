@@ -43,6 +43,7 @@ PLATFORM_SCRAPER = {
     "lemon_grove_events": "scrapers.lemon_grove",
     "santee_cms": "scrapers.santee",
     "elcajon_cms": "scrapers.elcajon",
+    "laserfiche": "scrapers.laserfiche",
 }
 
 
