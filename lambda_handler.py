@@ -105,6 +105,10 @@ def run_scrape(agency_slug=None):
     new_docs = []
 
     for slug, cfg in agencies.items():
+        if cfg.get("local_only"):
+            results[slug] = {"status": "skipped", "reason": "local_only (WAF-blocked from Lambda)"}
+            continue
+
         platform = cfg.get("platform", "")
         module_name = PLATFORM_SCRAPER.get(platform)
         if not module_name:

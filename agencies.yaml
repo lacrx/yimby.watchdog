@@ -16,6 +16,8 @@
 # lookback_months: overrides pipeline --years for this agency.
 #   Omit for full historical lookback (Oceanside).
 #   Set to 2-3 for forward-only monitoring of new cities.
+#
+# local_only: true — Akamai WAF blocks AWS IPs. Lambda skips; civic-pipeline scrapes locally.
 
 agencies:
 
@@ -78,6 +80,7 @@ agencies:
     enabled: true
     forward_only: true
     enabled_date: "2026-07-13"
+    local_only: true
 
   encinitas:
     name: City of Encinitas
@@ -277,7 +280,7 @@ agencies:
     enabled: true
     tally_only: true
 
-  # ── Deferred (new scrapers needed) ────────────────────────────────
+  # ── East County / South County (WAF-sensitive or limited) ─────────
 
   el_cajon:
     name: City of El Cajon
@@ -287,9 +290,11 @@ agencies:
     lookback_months: 2
     bodies:
       - City Council
+      - Planning Commission
     deep_fetch: false
     enabled: true
     tally_only: true
+    local_only: true
 
   coronado:
     name: City of Coronado
@@ -315,6 +320,7 @@ agencies:
     deep_fetch: false
     enabled: true
     tally_only: true
+    local_only: true
 
   lemon_grove:
     name: City of Lemon Grove
