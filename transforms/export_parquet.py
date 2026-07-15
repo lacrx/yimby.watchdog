@@ -40,6 +40,31 @@ APR_FILE = REFERENCE_DIR / "hcd-apr-oceanside.json"
 STOSIDE_BUCKET = os.environ.get("STOSIDE_BUCKET", "stoside-data")
 STOSIDE_PROFILE = os.environ.get("AWS_PROFILE", "civic")
 STOSIDE_REGION = "us-east-1"
+PARCELS_CACHE = EXPORTS_DIR / "parcels.parquet"
+
+
+def load_parcel_addresses():
+    """Download parcels.parquet from S3 (cached) and build APN→address index."""
+    import pyarrow.parquet as pq
+
+    if not PARCELS_CACHE.exists():
+        print("  Downloading parcels.parquet from S3...", flush=True)
+        import boto3
+        session = boto3.Session(profile_name=STOSIDE_PROFILE, region_name=STOSIDE_REGION)
+        s3 = session.client("s3")
+        PARCELS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(STOSIDE_BUCKET, "data/parcels.parquet", str(PARCELS_CACHE))
+
+    table = pq.read_table(PARCELS_CACHE, columns=["apn", "address", "street"])
+    apns = table.column("apn").to_pylist()
+    nums = table.column("address").to_pylist()
+    streets = table.column("street").to_pylist()
+    index = {}
+    for apn, num, st in zip(apns, nums, streets):
+        if apn and num and st:
+            index[apn] = f"{num} {st}"
+    print(f"  Parcel address index: {len(index)} APNs with addresses")
+    return index
 
 
 def parse_date(date_str):
@@ -92,7 +117,7 @@ def load_projects():
     return index, projects
 
 
-def build_permits_table(permits, project_index):
+def build_permits_table(permits, project_index, parcel_addrs):
     """Build column-oriented dict for permits Parquet table."""
     columns = {
         "permit_no": [],
@@ -107,11 +132,13 @@ def build_permits_table(permits, project_index):
         "issued": [],
         "apn": [],
         "owner": [],
+        "address": [],
         "zone_code": [],
         "is_downtown": [],
         "project_id": [],
     }
 
+    resolved = 0
     for p in permits:
         columns["permit_no"].append(p.get("permit_no", ""))
         columns["year"].append(p.get("_year", 0))
@@ -123,12 +150,20 @@ def build_permits_table(permits, project_index):
         columns["applied"].append(parse_date(p.get("applied", "")))
         columns["approved"].append(parse_date(p.get("approved", "")))
         columns["issued"].append(parse_date(p.get("issued", "")))
-        columns["apn"].append(p.get("apn", "") or "")
+        apn = p.get("apn", "") or ""
+        columns["apn"].append(apn)
         columns["owner"].append(p.get("owner", "") or "")
+        addr = p.get("address", "") or ""
+        if not addr and apn and apn in parcel_addrs:
+            addr = parcel_addrs[apn]
+            resolved += 1
+        columns["address"].append(addr)
         columns["zone_code"].append(p.get("zone_code", "") or "")
         columns["is_downtown"].append(bool(p.get("is_downtown")))
         columns["project_id"].append(project_index.get(p.get("permit_no", ""), ""))
 
+    if resolved:
+        print(f"  Permits: {resolved} addresses resolved via parcel APN join")
     return columns
 
 
@@ -212,11 +247,12 @@ def build_apr_table():
     return columns
 
 
-def build_housing_projects_table():
+def build_housing_projects_table(parcel_addrs=None):
     """Build column-oriented dict for unified housing projects Parquet table."""
     if not HOUSING_FILE.exists():
         return None
 
+    parcel_addrs = parcel_addrs or {}
     data = json.loads(HOUSING_FILE.read_text())
     projects = data.get("projects", [])
     columns = {
@@ -233,12 +269,18 @@ def build_housing_projects_table():
         "apr_tracking_ids": [], "meeting_mention_count": [],
     }
 
+    resolved = 0
     for p in projects:
         columns["project_id"].append(p.get("project_id", ""))
         columns["project_name"].append(p.get("project_name", ""))
         columns["agency"].append(p.get("agency", ""))
-        columns["address"].append(p.get("address", "") or "")
-        columns["apn"].append(p.get("apn", "") or "")
+        addr = p.get("address", "") or ""
+        apn = p.get("apn", "") or ""
+        if not addr and apn and apn in parcel_addrs:
+            addr = parcel_addrs[apn]
+            resolved += 1
+        columns["address"].append(addr)
+        columns["apn"].append(apn)
         columns["latitude"].append(p.get("latitude") or 0.0)
         columns["longitude"].append(p.get("longitude") or 0.0)
         columns["is_downtown"].append(bool(p.get("is_downtown")))
@@ -274,6 +316,8 @@ def build_housing_projects_table():
 
         columns["meeting_mention_count"].append(len(src.get("meeting_mentions", [])))
 
+    if resolved:
+        print(f"  Housing projects: {resolved} addresses resolved via parcel APN join")
     return columns
 
 
@@ -384,16 +428,23 @@ def cmd_export(args):
     downtown = sum(1 for p in permits if p.get("is_downtown"))
     print(f"  {with_apn} with APN, {with_zone} with zone, {downtown} downtown")
 
+    print("Loading parcel addresses...", flush=True)
+    try:
+        parcel_addrs = load_parcel_addresses()
+    except Exception as e:
+        print(f"  WARNING: Could not load parcels: {e}")
+        parcel_addrs = {}
+
     apr_cols = build_apr_table()
     apr_count = len(apr_cols["year"]) if apr_cols else 0
-    housing_cols = build_housing_projects_table()
+    housing_cols = build_housing_projects_table(parcel_addrs)
     housing_count = len(housing_cols["project_id"]) if housing_cols else 0
     planning_cols = build_planning_projects_table()
     planning_count = len(planning_cols["project_no"]) if planning_cols else 0
 
     if args.dry_run:
         print("\n[dry run] Would export:")
-        print(f"  permits.parquet: {len(permits)} rows × 15 columns")
+        print(f"  permits.parquet: {len(permits)} rows × 16 columns")
         print(f"  permit_projects.parquet: {len(projects)} rows × 11 columns")
         print(f"  apr_filings.parquet: {apr_count} rows × 22 columns")
         print(f"  housing_projects.parquet: {housing_count} rows × 26 columns")
@@ -401,7 +452,7 @@ def cmd_export(args):
         return
 
     print("\nExporting Parquet...", flush=True)
-    permits_cols = build_permits_table(permits, project_index)
+    permits_cols = build_permits_table(permits, project_index, parcel_addrs)
     permits_table = export_parquet(permits_cols, EXPORTS_DIR / "permits.parquet")
     print(f"  permits.parquet: {permits_table.num_rows} rows, {(EXPORTS_DIR / 'permits.parquet').stat().st_size:,} bytes")
 
