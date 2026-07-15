@@ -40,6 +40,10 @@ python scrapers/etrakit.py fetch
 python scrapers/etrakit.py fetch --year 2025    # specific year
 python scrapers/etrakit.py fetch --full          # full rescan
 
+# Fetch planning projects (development plans, density bonus, CUPs, etc)
+python scrapers/etrakit.py projects
+python scrapers/etrakit.py projects --year 2025
+
 # Run extraction on new documents
 python transforms/extract_structured.py
 
@@ -63,12 +67,12 @@ data/{agency_slug}/
   documents/          # Raw scraped text (agendas, staff reports)
   doc-index.json      # Document metadata index
   state.json          # Scraper state (last-seen markers)
-  permits/            # Building permits (eTRAKit JSONL, Oceanside only)
+  permits/            # Building permits + planning projects (eTRAKit JSONL, Oceanside only)
 data/structured/      # Extracted JSONL (meetings-combined, all-records)
 data/transcripts/     # Whisper transcription output
 ```
 
-Permits are standalone structured data (type, description, status, dates) — they do NOT go through `claude -p` extraction. Meeting documents do.
+Permits and planning projects are standalone structured data (type, description, status, dates) — they do NOT go through `claude -p` extraction. Meeting documents do. Building permits use `etrakit-permits-{year}.jsonl`, planning projects use `etrakit-projects-{year}.jsonl`.
 
 ## Platform Scraper Modules
 

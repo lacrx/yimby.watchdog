@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-eTRAKiT building permit scraper.
+eTRAKiT building permit and planning project scraper.
 
 Enumerates building permits by ID pattern (BLDG{YY}-{NNNN}).
+Enumerates planning projects by prefix (D{YY}-, RD{YY}-, DB{YY}-, etc).
 Reads permit config (base URL, ID pattern) from agencies.yaml.
 
 Usage:
@@ -11,6 +12,8 @@ Usage:
     python etrakit.py fetch --full              # full rescan
     python etrakit.py fetch --agency oceanside  # explicit agency
     python etrakit.py enrich --year 2026        # re-fetch housing permits with extended fields
+    python etrakit.py projects                  # scan planning projects for current year
+    python etrakit.py projects --year 2024      # specific year
 
 Requires: requests, beautifulsoup4, pyyaml
 """
@@ -47,6 +50,8 @@ INFILL_TYPES = HOUSING_TYPES | {
     "BLD COMMERCIAL PME",
 }
 
+PROJECT_PREFIXES = ["D", "RD", "DB", "ZA", "CUP", "RC", "RRP", "SC", "GPA", "EXT", "TPM", "H"]
+
 
 def fetch_permit(session, base_url, permit_no, enrich=False):
     """Fetch a single permit by direct URL. Returns dict or None."""
@@ -63,13 +68,9 @@ def fetch_permit(session, base_url, permit_no, enrich=False):
         return None
 
     addr = ""
-    for span in soup.find_all("span"):
-        sid = span.get("id", "")
-        if "Addr" in sid and "Lbl" not in sid and "City" not in sid:
-            txt = span.get_text(strip=True)
-            if txt and txt != "Address:":
-                addr = txt
-                break
+    addr_link = soup.find("a", id=lambda x: x and "hlSiteAddress" in str(x))
+    if addr_link:
+        addr = addr_link.get_text(strip=True)
 
     result = {
         "permit_no": permit_no,
@@ -81,9 +82,15 @@ def fetch_permit(session, base_url, permit_no, enrich=False):
         "approved": label("lblPermitApprovedDate"),
         "issued": label("lblPermitIssuedDate"),
         "address": addr,
-        "apn": label("lblPermitAPN"),
-        "owner": label("lblPermitOwner"),
+        "apn": "",
+        "owner": "",
     }
+
+    apn_link = soup.find("a", href=lambda x: x and "parcel.aspx?activityNo=" in str(x))
+    if apn_link:
+        apn_text = apn_link.get_text(strip=True)
+        if apn_text:
+            result["apn"] = apn_text
 
     if enrich:
         result.update(_extract_enriched(soup))
@@ -150,6 +157,73 @@ def _extract_enriched(soup):
         extra["linked_parent"] = linked_parents
 
     return extra
+
+
+def fetch_project(session, base_url, project_no):
+    """Fetch a single planning project by direct URL. Returns dict or None."""
+    url = f"{base_url}/Search/project.aspx?activityNo={project_no}"
+    resp = session.get(url, timeout=30)
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    def label(suffix):
+        el = soup.find("span", id=lambda x: x and x.endswith(suffix) and "Lbl" not in x)
+        return el.get_text(strip=True) if el else ""
+
+    ptype = label("lblProjectType")
+    if not ptype:
+        return None
+
+    addr_link = soup.find("a", id=lambda x: x and "hlSiteAddress" in str(x))
+    addr = addr_link.get_text(strip=True) if addr_link else ""
+
+    apn = ""
+    apn_link = soup.find("a", href=lambda x: x and "parcel.aspx?activityNo=" in str(x))
+    if apn_link:
+        apn_text = apn_link.get_text(strip=True)
+        if apn_text:
+            apn = apn_text
+
+    return {
+        "project_no": project_no,
+        "type": ptype,
+        "status": label("lblProjectStatus"),
+        "name": label("lblProjectName"),
+        "description": label("lblProjectDesc"),
+        "applied": label("lblProjectAppliedDate"),
+        "approved": label("lblProjectApprovedDate"),
+        "address": addr,
+        "apn": apn,
+        "planner": label("lblProjectPlanner"),
+    }
+
+
+def search_project_numbers(session, base_url, prefix):
+    """Search eTRAKit projects by prefix via Telerik AJAX postback. Returns list of project numbers."""
+    search_url = f"{base_url}/Search/project.aspx"
+    resp = session.get(search_url, timeout=15)
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    form_data = {}
+    for inp in soup.find_all("input"):
+        name = inp.get("name")
+        if name:
+            form_data[name] = inp.get("value", "")
+    for sel in soup.find_all("select"):
+        name = sel.get("name")
+        if name:
+            selected = sel.find("option", selected=True)
+            form_data[name] = selected["value"] if selected else ""
+
+    form_data["__EVENTTARGET"] = "ctl00$cplMain$btnSearch"
+    form_data["__EVENTARGUMENT"] = ""
+    form_data["ctl00$cplMain$ddSearchBy"] = "Project_Main.PROJECT_NO"
+    form_data["ctl00$cplMain$ddSearchOper"] = "BEGINS WITH"
+    form_data["ctl00$cplMain$txtSearchString"] = prefix
+    form_data.pop("ctl00$cplMain$btnSearch", None)
+
+    resp2 = session.post(search_url, data=form_data, timeout=30)
+    escaped = re.escape(prefix)
+    return sorted(set(re.findall(rf'{escaped}\d{{5}}', resp2.text)))
 
 
 def _make_session():
@@ -439,8 +513,88 @@ def cmd_backfill_apn(args):
     print(f"\nTotal: {total_backfilled} APNs backfilled")
 
 
+def cmd_projects(args):
+    """Fetch planning projects by enumerating known prefixes."""
+    agencies = load_agencies(enabled_only=False)
+    agency_slug = args.agency
+    config = agencies.get(agency_slug)
+    if not config or "permits" not in config:
+        print(f"No permit config for agency '{agency_slug}'")
+        sys.exit(1)
+
+    permit_config = config["permits"]
+    base_url = permit_config["base_url"]
+    data_dir = agency_data_dir(agency_slug)
+    permits_dir = data_dir / "permits"
+    permits_dir.mkdir(parents=True, exist_ok=True)
+
+    year = args.year
+    yy = year % 100
+    out_file = permits_dir / f"etrakit-projects-{year}.jsonl"
+
+    existing = {}
+    if out_file.exists() and not args.full:
+        with open(out_file) as f:
+            for line in f:
+                if line.strip():
+                    p = json.loads(line)
+                    existing[p["project_no"]] = p
+        if existing:
+            print(f"Loaded {len(existing)} existing projects for {year}")
+
+    session = _make_session()
+    prefixes = args.prefixes.split(",") if args.prefixes else PROJECT_PREFIXES
+
+    all_project_nos = []
+    for pfx in prefixes:
+        search_prefix = f"{pfx}{yy:02d}-"
+        try:
+            proj_nos = search_project_numbers(session, base_url, search_prefix)
+        except Exception as e:
+            print(f"  Error searching {search_prefix}: {e}", flush=True)
+            proj_nos = []
+        if proj_nos:
+            print(f"  {search_prefix}: {len(proj_nos)} projects found")
+        all_project_nos.extend(proj_nos)
+        time.sleep(0.3)
+
+    new_nos = [pno for pno in all_project_nos if pno not in existing]
+    print(f"\nTotal: {len(all_project_nos)} projects, {len(new_nos)} new to fetch")
+
+    new_results = {}
+    for i, pno in enumerate(new_nos):
+        try:
+            detail = fetch_project(session, base_url, pno)
+        except Exception as e:
+            print(f"  Error on {pno}: {e}", flush=True)
+            time.sleep(5)
+            continue
+
+        if detail:
+            new_results[pno] = detail
+            print(f"  {pno:16s}  {detail['type']:25s}  {detail['status']:20s}  {detail['address'][:30]:30s}  {detail['description'][:40]}", flush=True)
+
+        time.sleep(args.delay)
+
+        if (i + 1) % 50 == 0:
+            print(f"  ...{i + 1}/{len(new_nos)} fetched", flush=True)
+            time.sleep(2)
+
+    merged = {**existing, **new_results}
+    with open(out_file, "w") as f:
+        for pno in sorted(merged):
+            f.write(json.dumps(merged[pno]) + "\n")
+
+    print(f"\n{len(new_results)} new projects, {len(merged)} total for {year}")
+
+    type_counts = Counter(p["type"] for p in merged.values())
+    print("\nBy type:")
+    for t, c in type_counts.most_common():
+        print(f"  {t}: {c}")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="eTRAKiT building permit scraper")
+    parser = argparse.ArgumentParser(description="eTRAKiT permit and project scraper")
     sub = parser.add_subparsers(dest="command")
 
     fetch_p = sub.add_parser("fetch", help="Scan for new permits")
@@ -459,6 +613,13 @@ def main():
     enrich_p.add_argument("--all-types", action="store_true", help="Enrich all types")
     enrich_p.add_argument("--delay", type=float, default=1.0, help="Seconds between requests")
 
+    proj_p = sub.add_parser("projects", help="Fetch planning projects by prefix enumeration")
+    proj_p.add_argument("--agency", default="oceanside", help="Agency slug")
+    proj_p.add_argument("--year", type=int, default=datetime.now().year, help="Year to scan")
+    proj_p.add_argument("--full", action="store_true", help="Full rescan (ignore existing)")
+    proj_p.add_argument("--prefixes", type=str, default="", help="Comma-separated prefixes (default: all)")
+    proj_p.add_argument("--delay", type=float, default=1.0, help="Seconds between requests")
+
     bfill_p = sub.add_parser("backfill-apn", help="Re-fetch permits missing APNs")
     bfill_p.add_argument("--agency", default="oceanside", help="Agency slug")
     bfill_p.add_argument("--year", type=int, default=0, help="Specific year (default: all years)")
@@ -474,6 +635,8 @@ def main():
         cmd_fetch(args)
     elif args.command == "enrich":
         cmd_enrich(args)
+    elif args.command == "projects":
+        cmd_projects(args)
     elif args.command == "backfill-apn":
         cmd_backfill_apn(args)
     else:
