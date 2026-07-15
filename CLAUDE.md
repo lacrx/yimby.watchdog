@@ -1,3 +1,7 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # Agent Instructions
 
 This repo is the ETL/pipeline layer for civic monitoring. It scrapes meeting agendas, transcribes video, extracts structured data (JSONL), and manages the transcription backlog. It does NOT generate prose analysis or advocacy intelligence — that lives in `yimby.analysis`.
@@ -16,6 +20,61 @@ This repo is the ETL/pipeline layer for civic monitoring. It scrapes meeting age
 - `extract-watch` — cron-driven S3 marker poller
 - `extract-local` — runs `claude -p` extraction, syncs results to S3
 - `civic-pipeline` — legacy local orchestrator (still works for manual runs)
+- `civic_utils.py` — shared utilities (PDF extraction, text processing, agency helpers)
+- `lib/storage.py` — storage abstraction (local filesystem or S3 via `WATCHDOG_S3_BUCKET`)
+
+## Common Commands
+
+```bash
+# Activate venv (required for all commands)
+source .venv/bin/activate
+
+# Run full pipeline locally (legacy orchestrator)
+./civic-pipeline local --deep --years 1
+
+# Run pipeline with extraction cap (ALWAYS use --extract-until for manual runs)
+./civic-pipeline local --extract-until 20
+
+# Fetch building permits (incremental, current year)
+python scrapers/etrakit.py fetch
+python scrapers/etrakit.py fetch --year 2025    # specific year
+python scrapers/etrakit.py fetch --full          # full rescan
+
+# Run extraction on new documents
+python transforms/extract_structured.py
+
+# Merge documents into meetings, then roll up
+python transforms/meeting_merge.py
+python transforms/monthly_rollup.py
+
+# Pipeline health checks
+python pipeline_preflight.py
+python pipeline_doctor.py
+
+# Deploy Lambda (after changing lambda_handler, scrapers, or agencies.yaml)
+./deploy-lambda
+```
+
+## Data Layout
+
+All data lives in `data/` (gitignored). Structure per agency:
+```
+data/{agency_slug}/
+  documents/          # Raw scraped text (agendas, staff reports)
+  doc-index.json      # Document metadata index
+  state.json          # Scraper state (last-seen markers)
+  permits/            # Building permits (eTRAKit JSONL, Oceanside only)
+data/structured/      # Extracted JSONL (meetings-combined, all-records)
+data/transcripts/     # Whisper transcription output
+```
+
+Permits are standalone structured data (type, description, status, dates) — they do NOT go through `claude -p` extraction. Meeting documents do.
+
+## Platform Scraper Modules
+
+Each scraper in `scrapers/` implements a platform adapter. `lambda_handler.py` dispatches by the `platform` field in `agencies.yaml`. Supported platforms: `legistar_html`, `legistar_odata`, `escribe`, `civicplus`, `civicclerk`, `granicus`, `carlsbad_cms`, `laserfiche`, `primegov`, custom HTML.
+
+`civic_utils.py` provides shared helpers: `load_agencies()`, `agency_data_dir()`, PDF-to-text, content hashing.
 
 ## Related Projects
 - `yimby.analysis`: downstream analysis — executive summaries, council member profiles, leadership grading. Reads from this repo's `data/` directory

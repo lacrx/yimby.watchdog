@@ -233,6 +233,22 @@ for slug, a in cfg['agencies'].items():
         print(f\"{slug}|{a.get('name', slug)}\")
 ")
 
+# ── 1c.1: Enrich new infill permits (contacts, site info, linked activities) ──
+while IFS='|' read -r SLUG NAME; do
+    log "Enriching $NAME infill permits ($CURRENT_YEAR)..."
+    if run_with_timeout "$NAME enrich" python3 scrapers/etrakit.py enrich --agency "$SLUG" --year "$CURRENT_YEAR" --infill --delay 1.5 >> "data/${SLUG}/permits/enrich.log" 2>&1; then
+        log "$NAME permit enrichment done."
+    else
+        log "$NAME permit enrichment failed — continuing pipeline."
+    fi
+done < <(python3 -c "
+import yaml
+cfg = yaml.safe_load(open('agencies.yaml'))
+for slug, a in cfg['agencies'].items():
+    if a.get('enabled', True) and a.get('permits'):
+        print(f\"{slug}|{a.get('name', slug)}\")
+")
+
 # ── 1d: Discover new meeting videos ──
 log "Discovering new meeting videos..."
 run_with_timeout "Video discovery" python3 scrapers/discover_videos.py >> data/video-discovery.log 2>&1
@@ -334,7 +350,12 @@ if [ "$MERGE_RC" -ne 0 ]; then
 fi
 log "Meeting merge done."
 
-# ── 2b: Monthly rollups (auto-detects stale months) ──
+# ── 2b: Group permits into projects ──
+log "Building permit project groupings..."
+python3 transforms/permit_projects.py >> data/permit-projects.log 2>&1 || log "WARNING: Permit project grouping failed. Continuing pipeline."
+log "Permit project grouping done."
+
+# ── 2c: Monthly rollups (auto-detects stale months) ──
 log "Building monthly digests..."
 python3 transforms/monthly_rollup.py >> data/monthly-rollup.log 2>&1 || log "WARNING: Monthly rollup failed. Continuing pipeline."
 log "Monthly rollups done."

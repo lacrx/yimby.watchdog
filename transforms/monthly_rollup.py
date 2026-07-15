@@ -8,7 +8,7 @@ extraction, new permit, new intel item) triggers a rebuild for that month only.
 
 Data sources:
   1. Meeting records  — data/structured/meetings/*.json (merged per-meeting)
-  2. Building permits — data/permits/etrakit-permits-*.jsonl
+  2. Building permits — data/{agency}/permits/etrakit-permits-*.jsonl
   3. Intel feed       — data/intel/intel-*.json
 
 Usage:
@@ -30,17 +30,22 @@ from datetime import datetime
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+from civic_utils import load_agencies, agency_data_dir
+
 DATA_DIR = REPO_ROOT / "data"
 STRUCTURED_DIR = DATA_DIR / "structured"
 MERGED_DIR = STRUCTURED_DIR / "meetings"
 MONTHLY_DIR = STRUCTURED_DIR / "monthly"
 MONTHLY_JSONL = STRUCTURED_DIR / "monthly-digests.jsonl"
-PERMITS_DIR = DATA_DIR / "permits"
 INTEL_DIR = DATA_DIR / "intel"
 
 HOUSING_PERMIT_TYPES = {
     "BLD SFD OR DUPLEX", "BLD MULTI FAMILY", "BLD ACCESSORY DWELLING",
 }
+
+PROJECTS_FILE = STRUCTURED_DIR / "permit-projects.json"
 
 
 def parse_date_to_month(date_str):
@@ -83,24 +88,31 @@ def load_meetings_by_month():
 
 
 def load_permits_by_month():
-    """Load building permits, grouped by month. Only housing-relevant types."""
+    """Load building permits from all agencies, grouped by month. Only housing-relevant types."""
     by_month = defaultdict(list)
-    for pf in sorted(PERMITS_DIR.glob("etrakit-permits-*.jsonl")):
-        try:
-            with open(pf) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    r = json.loads(line)
-                    ptype = r.get("type", "")
-                    if ptype not in HOUSING_PERMIT_TYPES:
-                        continue
-                    month = parse_date_to_month(r.get("applied", ""))
-                    if month:
-                        by_month[month].append(r)
-        except (json.JSONDecodeError, Exception):
+    agencies = load_agencies(enabled_only=True)
+    for slug, cfg in agencies.items():
+        if "permits" not in cfg:
             continue
+        permits_dir = agency_data_dir(slug) / "permits"
+        if not permits_dir.exists():
+            continue
+        for pf in sorted(permits_dir.glob("etrakit-permits-*.jsonl")):
+            try:
+                with open(pf) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        r = json.loads(line)
+                        ptype = r.get("type", "")
+                        if ptype not in HOUSING_PERMIT_TYPES:
+                            continue
+                        month = parse_date_to_month(r.get("applied", ""))
+                        if month:
+                            by_month[month].append(r)
+            except (json.JSONDecodeError, Exception):
+                continue
     return by_month
 
 
@@ -149,6 +161,22 @@ def deduplicate(items):
     return result
 
 
+def load_projects():
+    """Load permit projects index. Returns dict: permit_no → project record."""
+    if not PROJECTS_FILE.exists():
+        return {}, []
+    try:
+        data = json.loads(PROJECTS_FILE.read_text())
+        projects = data.get("projects", [])
+        index = {}
+        for proj in projects:
+            for pno in proj.get("permits", []):
+                index[pno] = proj
+        return index, projects
+    except (json.JSONDecodeError, Exception):
+        return {}, []
+
+
 def summarize_permits(permits):
     """Summarize permits into counts by type and status."""
     by_type = Counter()
@@ -171,7 +199,7 @@ def summarize_permits(permits):
     }
 
 
-def merge_month(month, meetings, permits, intel):
+def merge_month(month, meetings, permits, intel, project_index=None):
     """Merge all data sources for a month into one digest."""
     bodies = set()
     agencies = set()
@@ -225,7 +253,29 @@ def merge_month(month, meetings, permits, intel):
     }
 
     if permits:
-        digest["permits"] = summarize_permits(permits)
+        permit_summary = summarize_permits(permits)
+        if project_index:
+            active_projects = {}
+            for p in permits:
+                proj = project_index.get(p.get("permit_no"))
+                if proj and proj["project_id"] not in active_projects:
+                    entry = {
+                        "project_name": proj["project_name"],
+                        "estimated_units": proj["estimated_units"],
+                        "permits_this_month": 0,
+                    }
+                    if proj.get("owner") and proj.get("source") != "type_aggregate":
+                        entry["owner"] = proj["owner"]
+                    active_projects[proj["project_id"]] = entry
+                if proj:
+                    active_projects[proj["project_id"]]["permits_this_month"] += 1
+            if active_projects:
+                permit_summary["projects"] = sorted(
+                    active_projects.values(),
+                    key=lambda x: x["permits_this_month"],
+                    reverse=True,
+                )
+        digest["permits"] = permit_summary
 
     if intel:
         digest["intel"] = [
@@ -275,6 +325,7 @@ def cmd_rollup(args):
     meetings_by_month = load_meetings_by_month()
     permits_by_month = load_permits_by_month()
     intel_by_month = load_intel_by_month()
+    project_index, _ = load_projects()
 
     all_months = sorted(set(
         list(meetings_by_month.keys()) +
@@ -285,7 +336,8 @@ def cmd_rollup(args):
     m_count = sum(len(v) for v in meetings_by_month.values())
     p_count = sum(len(v) for v in permits_by_month.values())
     i_count = sum(len(v) for v in intel_by_month.values())
-    print(f"Loaded {m_count} meetings, {p_count} permits, {i_count} intel items across {len(all_months)} months")
+    proj_str = f", {len(project_index)} permit→project mappings" if project_index else ""
+    print(f"Loaded {m_count} meetings, {p_count} permits, {i_count} intel items across {len(all_months)} months{proj_str}")
 
     if args.month:
         if args.month not in all_months:
@@ -301,7 +353,7 @@ def cmd_rollup(args):
         permits = permits_by_month.get(month, [])
         intel = intel_by_month.get(month, [])
 
-        digest = merge_month(month, meetings, permits, intel)
+        digest = merge_month(month, meetings, permits, intel, project_index)
 
         out_path = MONTHLY_DIR / f"{month}.json"
         if out_path.exists() and not args.force and not args.month:
@@ -387,6 +439,7 @@ def main():
         meetings_by_month = load_meetings_by_month()
         permits_by_month = load_permits_by_month()
         intel_by_month = load_intel_by_month()
+        project_index, _ = load_projects()
         all_months = sorted(set(
             list(meetings_by_month.keys()) +
             list(permits_by_month.keys()) +
@@ -399,6 +452,7 @@ def main():
                 meetings_by_month.get(month, []),
                 permits_by_month.get(month, []),
                 intel_by_month.get(month, []),
+                project_index,
             )
             out_path = MONTHLY_DIR / f"{month}.json"
             if not out_path.exists():
