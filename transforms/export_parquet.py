@@ -41,6 +41,7 @@ STOSIDE_BUCKET = os.environ.get("STOSIDE_BUCKET", "stoside-data")
 STOSIDE_PROFILE = os.environ.get("AWS_PROFILE", "civic")
 STOSIDE_REGION = "us-east-1"
 PARCELS_CACHE = EXPORTS_DIR / "parcels.parquet"
+ZONING_FILE = REFERENCE_DIR / "parcel-zoning.json"
 
 
 def load_parcel_addresses():
@@ -65,6 +66,15 @@ def load_parcel_addresses():
             index[apn] = f"{num} {st}"
     print(f"  Parcel address index: {len(index)} APNs with addresses")
     return index
+
+
+def load_parcel_zoning():
+    """Load APN→zone_code index from parcel-zoning.json."""
+    if not ZONING_FILE.exists():
+        return {}
+    data = json.loads(ZONING_FILE.read_text())
+    print(f"  Parcel zoning index: {len(data)} APNs with zone codes")
+    return data
 
 
 def parse_date(date_str):
@@ -117,7 +127,7 @@ def load_projects():
     return index, projects
 
 
-def build_permits_table(permits, project_index, parcel_addrs):
+def build_permits_table(permits, project_index, parcel_addrs, parcel_zones):
     """Build column-oriented dict for permits Parquet table."""
     columns = {
         "permit_no": [],
@@ -134,11 +144,13 @@ def build_permits_table(permits, project_index, parcel_addrs):
         "owner": [],
         "address": [],
         "zone_code": [],
+        "zone_category": [],
         "is_downtown": [],
         "project_id": [],
     }
 
-    resolved = 0
+    addr_resolved = 0
+    zone_resolved = 0
     for p in permits:
         columns["permit_no"].append(p.get("permit_no", ""))
         columns["year"].append(p.get("_year", 0))
@@ -156,14 +168,25 @@ def build_permits_table(permits, project_index, parcel_addrs):
         addr = p.get("address", "") or ""
         if not addr and apn and apn in parcel_addrs:
             addr = parcel_addrs[apn]
-            resolved += 1
+            addr_resolved += 1
         columns["address"].append(addr)
-        columns["zone_code"].append(p.get("zone_code", "") or "")
+        zone = p.get("zone_code", "") or ""
+        zone_cat = ""
+        if apn and apn in parcel_zones:
+            pz = parcel_zones[apn]
+            if not zone:
+                zone = pz.get("zone_code", "")
+                zone_resolved += 1
+            zone_cat = pz.get("zone_category", "")
+        columns["zone_code"].append(zone)
+        columns["zone_category"].append(zone_cat)
         columns["is_downtown"].append(bool(p.get("is_downtown")))
         columns["project_id"].append(project_index.get(p.get("permit_no", ""), ""))
 
-    if resolved:
-        print(f"  Permits: {resolved} addresses resolved via parcel APN join")
+    if addr_resolved:
+        print(f"  Permits: {addr_resolved} addresses resolved via parcel APN join")
+    if zone_resolved:
+        print(f"  Permits: {zone_resolved} zone codes resolved via parcel zoning join")
     return columns
 
 
@@ -247,18 +270,20 @@ def build_apr_table():
     return columns
 
 
-def build_housing_projects_table(parcel_addrs=None):
+def build_housing_projects_table(parcel_addrs=None, parcel_zones=None):
     """Build column-oriented dict for unified housing projects Parquet table."""
     if not HOUSING_FILE.exists():
         return None
 
     parcel_addrs = parcel_addrs or {}
+    parcel_zones = parcel_zones or {}
     data = json.loads(HOUSING_FILE.read_text())
     projects = data.get("projects", [])
     columns = {
         "project_id": [], "project_name": [], "agency": [],
         "address": [], "apn": [], "latitude": [], "longitude": [],
-        "is_downtown": [], "units_best": [], "units_source": [],
+        "is_downtown": [], "zone_code": [], "zone_category": [],
+        "units_best": [], "units_source": [],
         "units_apr_proposed": [], "units_apr_approved": [],
         "units_permit_estimated": [],
         "income_very_low": [], "income_low": [],
@@ -269,7 +294,7 @@ def build_housing_projects_table(parcel_addrs=None):
         "apr_tracking_ids": [], "meeting_mention_count": [],
     }
 
-    resolved = 0
+    addr_resolved = 0
     for p in projects:
         columns["project_id"].append(p.get("project_id", ""))
         columns["project_name"].append(p.get("project_name", ""))
@@ -278,9 +303,12 @@ def build_housing_projects_table(parcel_addrs=None):
         apn = p.get("apn", "") or ""
         if not addr and apn and apn in parcel_addrs:
             addr = parcel_addrs[apn]
-            resolved += 1
+            addr_resolved += 1
         columns["address"].append(addr)
         columns["apn"].append(apn)
+        pz = parcel_zones.get(apn, {}) if apn else {}
+        columns["zone_code"].append(pz.get("zone_code", ""))
+        columns["zone_category"].append(pz.get("zone_category", ""))
         columns["latitude"].append(p.get("latitude") or 0.0)
         columns["longitude"].append(p.get("longitude") or 0.0)
         columns["is_downtown"].append(bool(p.get("is_downtown")))
@@ -316,8 +344,8 @@ def build_housing_projects_table(parcel_addrs=None):
 
         columns["meeting_mention_count"].append(len(src.get("meeting_mentions", [])))
 
-    if resolved:
-        print(f"  Housing projects: {resolved} addresses resolved via parcel APN join")
+    if addr_resolved:
+        print(f"  Housing projects: {addr_resolved} addresses resolved via parcel APN join")
     return columns
 
 
@@ -428,31 +456,32 @@ def cmd_export(args):
     downtown = sum(1 for p in permits if p.get("is_downtown"))
     print(f"  {with_apn} with APN, {with_zone} with zone, {downtown} downtown")
 
-    print("Loading parcel addresses...", flush=True)
+    print("Loading parcel data...", flush=True)
     try:
         parcel_addrs = load_parcel_addresses()
     except Exception as e:
         print(f"  WARNING: Could not load parcels: {e}")
         parcel_addrs = {}
+    parcel_zones = load_parcel_zoning()
 
     apr_cols = build_apr_table()
     apr_count = len(apr_cols["year"]) if apr_cols else 0
-    housing_cols = build_housing_projects_table(parcel_addrs)
+    housing_cols = build_housing_projects_table(parcel_addrs, parcel_zones)
     housing_count = len(housing_cols["project_id"]) if housing_cols else 0
     planning_cols = build_planning_projects_table()
     planning_count = len(planning_cols["project_no"]) if planning_cols else 0
 
     if args.dry_run:
         print("\n[dry run] Would export:")
-        print(f"  permits.parquet: {len(permits)} rows × 16 columns")
+        print(f"  permits.parquet: {len(permits)} rows × 18 columns")
         print(f"  permit_projects.parquet: {len(projects)} rows × 11 columns")
         print(f"  apr_filings.parquet: {apr_count} rows × 22 columns")
-        print(f"  housing_projects.parquet: {housing_count} rows × 26 columns")
+        print(f"  housing_projects.parquet: {housing_count} rows × 28 columns")
         print(f"  planning_projects.parquet: {planning_count} rows × 12 columns")
         return
 
     print("\nExporting Parquet...", flush=True)
-    permits_cols = build_permits_table(permits, project_index, parcel_addrs)
+    permits_cols = build_permits_table(permits, project_index, parcel_addrs, parcel_zones)
     permits_table = export_parquet(permits_cols, EXPORTS_DIR / "permits.parquet")
     print(f"  permits.parquet: {permits_table.num_rows} rows, {(EXPORTS_DIR / 'permits.parquet').stat().st_size:,} bytes")
 
