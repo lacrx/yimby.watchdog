@@ -386,7 +386,7 @@ def build_housing_projects_table(parcel_addrs=None, parcel_zones=None):
     return columns
 
 
-def build_planning_projects_table():
+def build_planning_projects_table(parcel_addrs=None, parcel_zones=None):
     """Build column-oriented dict for planning projects Parquet table."""
     agencies = load_agencies(enabled_only=False)
     records = []
@@ -415,8 +415,10 @@ def build_planning_projects_table():
         "type": [], "status": [], "name": [], "description": [],
         "applied": [], "approved": [],
         "address": [], "apn": [], "planner": [],
+        "zone_code": [], "max_density": [], "max_height": [],
     }
 
+    zone_resolved = 0
     for r in records:
         columns["project_no"].append(r.get("project_no", ""))
         columns["year"].append(r.get("_year", 0))
@@ -427,9 +429,33 @@ def build_planning_projects_table():
         columns["description"].append(r.get("description", ""))
         columns["applied"].append(r.get("applied") or "")
         columns["approved"].append(r.get("approved") or "")
-        columns["address"].append(r.get("address") or "")
-        columns["apn"].append(r.get("apn") or "")
+
+        apn = r.get("apn") or ""
+        addr = r.get("address") or ""
+        zone = ""
+        density = None
+        height = ""
+
+        if apn and parcel_addrs and not addr:
+            addr = parcel_addrs.get(apn, "")
+
+        if apn and parcel_zones:
+            pz = parcel_zones.get(apn, {})
+            if pz:
+                zone = pz.get("zone_code", "")
+                density = _parse_density(pz.get("density", ""))
+                height = str(pz.get("height", "") or "")
+                zone_resolved += 1
+
+        columns["address"].append(addr)
+        columns["apn"].append(apn)
         columns["planner"].append(r.get("planner") or "")
+        columns["zone_code"].append(zone)
+        columns["max_density"].append(density)
+        columns["max_height"].append(height)
+
+    if zone_resolved:
+        print(f"  Projects: {zone_resolved} zone codes resolved via parcel zoning join")
 
     return columns
 
@@ -535,7 +561,7 @@ def cmd_export(args):
     apr_count = len(apr_cols["year"]) if apr_cols else 0
     housing_cols = build_housing_projects_table(parcel_addrs, parcel_zones)
     housing_count = len(housing_cols["project_id"]) if housing_cols else 0
-    planning_cols = build_planning_projects_table()
+    planning_cols = build_planning_projects_table(parcel_addrs, parcel_zones)
     planning_count = len(planning_cols["project_no"]) if planning_cols else 0
     str_cols = build_str_table()
     str_count = len(str_cols["account"]) if str_cols else 0
@@ -546,7 +572,7 @@ def cmd_export(args):
         print(f"  permit_projects.parquet: {len(projects)} rows × 11 columns")
         print(f"  apr_filings.parquet: {apr_count} rows × 22 columns")
         print(f"  housing_projects.parquet: {housing_count} rows × 28 columns")
-        print(f"  planning_projects.parquet: {planning_count} rows × 12 columns")
+        print(f"  planning_projects.parquet: {planning_count} rows × 15 columns")
         print(f"  str_licenses.parquet: {str_count} rows × 10 columns")
         return
 
