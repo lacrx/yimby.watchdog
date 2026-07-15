@@ -36,6 +36,7 @@ REFERENCE_DIR = DATA_DIR / "reference"
 PROJECTS_FILE = STRUCTURED_DIR / "permit-projects.json"
 HOUSING_FILE = STRUCTURED_DIR / "housing-projects.json"
 APR_FILE = REFERENCE_DIR / "hcd-apr-oceanside.json"
+STR_FILE = REFERENCE_DIR / "str-licenses.json"
 
 STOSIDE_BUCKET = os.environ.get("STOSIDE_BUCKET", "stoside-data")
 STOSIDE_PROFILE = os.environ.get("AWS_PROFILE", "civic")
@@ -397,6 +398,35 @@ def build_planning_projects_table():
     return columns
 
 
+def build_str_table():
+    """Build column-oriented dict for short-term rental licenses Parquet table."""
+    if not STR_FILE.exists():
+        return None
+
+    records = json.loads(STR_FILE.read_text())
+    columns = {
+        "account": [], "business": [], "license_status": [],
+        "business_area": [], "rental_type": [],
+        "address": [], "apn": [],
+        "property_manager": [],
+        "latitude": [], "longitude": [],
+    }
+
+    for r in records:
+        columns["account"].append(r.get("account", 0))
+        columns["business"].append(r.get("business", ""))
+        columns["license_status"].append(r.get("license_status", ""))
+        columns["business_area"].append(r.get("business_area", ""))
+        columns["rental_type"].append(r.get("rental_type", ""))
+        columns["address"].append(r.get("address", ""))
+        columns["apn"].append(r.get("apn", ""))
+        columns["property_manager"].append(r.get("property_manager", "") or "")
+        columns["latitude"].append(r.get("latitude") or 0.0)
+        columns["longitude"].append(r.get("longitude") or 0.0)
+
+    return columns
+
+
 def export_parquet(columns, output_path):
     """Write column dict as Parquet file."""
     import pyarrow as pa
@@ -407,7 +437,8 @@ def export_parquet(columns, output_path):
                 "above_mod_income", "affordable_units",
                 "units_best", "units_apr_proposed", "units_apr_approved",
                 "units_permit_estimated", "income_very_low", "income_low",
-                "income_moderate", "income_above_moderate", "meeting_mention_count"}
+                "income_moderate", "income_above_moderate", "meeting_mention_count",
+                "account"}
     BOOL_COLS = {"is_downtown", "has_building_permit", "density_bonus", "sb35"}
     # APR table uses string "Yes"/"No" for these; only cast if actual bools
     for bc in list(BOOL_COLS):
@@ -470,6 +501,8 @@ def cmd_export(args):
     housing_count = len(housing_cols["project_id"]) if housing_cols else 0
     planning_cols = build_planning_projects_table()
     planning_count = len(planning_cols["project_no"]) if planning_cols else 0
+    str_cols = build_str_table()
+    str_count = len(str_cols["account"]) if str_cols else 0
 
     if args.dry_run:
         print("\n[dry run] Would export:")
@@ -478,6 +511,7 @@ def cmd_export(args):
         print(f"  apr_filings.parquet: {apr_count} rows × 22 columns")
         print(f"  housing_projects.parquet: {housing_count} rows × 28 columns")
         print(f"  planning_projects.parquet: {planning_count} rows × 12 columns")
+        print(f"  str_licenses.parquet: {str_count} rows × 10 columns")
         return
 
     print("\nExporting Parquet...", flush=True)
@@ -501,6 +535,10 @@ def cmd_export(args):
         planning_table = export_parquet(planning_cols, EXPORTS_DIR / "planning_projects.parquet")
         print(f"  planning_projects.parquet: {planning_table.num_rows} rows, {(EXPORTS_DIR / 'planning_projects.parquet').stat().st_size:,} bytes")
 
+    if str_cols:
+        str_table = export_parquet(str_cols, EXPORTS_DIR / "str_licenses.parquet")
+        print(f"  str_licenses.parquet: {str_table.num_rows} rows, {(EXPORTS_DIR / 'str_licenses.parquet').stat().st_size:,} bytes")
+
     if args.local_only:
         print(f"\nLocal export complete → {EXPORTS_DIR}/")
         return
@@ -515,6 +553,8 @@ def cmd_export(args):
             upload_to_s3(EXPORTS_DIR / "housing_projects.parquet", "data/housing_projects.parquet")
         if planning_cols:
             upload_to_s3(EXPORTS_DIR / "planning_projects.parquet", "data/planning_projects.parquet")
+        if str_cols:
+            upload_to_s3(EXPORTS_DIR / "str_licenses.parquet", "data/str_licenses.parquet")
         print(f"\nDone. Files queryable via stoside-data DuckDB Lambda.")
     except Exception as e:
         print(f"\nS3 upload failed: {e}")
