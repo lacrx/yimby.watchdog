@@ -6,16 +6,16 @@
 #   ./deploy-lambda --skip-build # push existing local image and update Lambda
 #
 # Requires: docker, aws CLI
-# Uses AWS profile: watchdog (assumes watchdog-deployer role)
+# Uses AWS profile: civic (assumes civic-deployer role)
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 AWS_ACCOUNT_ID="662460439248"
 AWS_REGION="us-west-2"
-AWS_PROFILE="watchdog"
-ECR_REPO="${CIVIC_ECR_REPO:-yimby-watchdog}"
-LAMBDA_FUNCTION="${CIVIC_LAMBDA_FUNCTION:-yimby-watchdog-pipeline}"
+AWS_PROFILE="civic"
+ECR_REPO="${CIVIC_ECR_REPO:-civic-watchdog}"
+LAMBDA_FUNCTION="${CIVIC_LAMBDA_FUNCTION:-civic-watchdog-pipeline}"
 DOCKERFILE="Dockerfile.lambda"
 IMAGE_TAG="$(git rev-parse --short HEAD)-$(date +%Y%m%d%H%M%S)"
 

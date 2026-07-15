@@ -27,15 +27,15 @@ if [ -f "$PIDFILE" ]; then
 fi
 
 # ── Check S3 marker ──
-if ! aws s3api head-object --bucket "$BUCKET" --key "$MARKER" --profile watchdog --region us-west-2 >/dev/null 2>&1; then
+if ! aws s3api head-object --bucket "$BUCKET" --key "$MARKER" --profile civic --region us-west-2 >/dev/null 2>&1; then
     exit 0
 fi
 
 # ── Marker found — claim it ──
 log "New docs detected. Starting extraction."
 mkdir -p data/pipeline
-aws s3 cp "s3://$BUCKET/$MARKER" data/pipeline/ --profile watchdog --region us-west-2 --quiet 2>/dev/null || true
-aws s3 rm "s3://$BUCKET/$MARKER" --profile watchdog --region us-west-2 --quiet 2>/dev/null || true
+aws s3 cp "s3://$BUCKET/$MARKER" data/pipeline/ --profile civic --region us-west-2 --quiet 2>/dev/null || true
+aws s3 rm "s3://$BUCKET/$MARKER" --profile civic --region us-west-2 --quiet 2>/dev/null || true
 
 # ── Run extraction (extract-local manages its own PID file) ──
 ./extract-local

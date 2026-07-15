@@ -50,15 +50,6 @@ data "aws_iam_policy_document" "lambda_permissions" {
     resources = [aws_lambda_function.watchdog_pipeline.arn]
   }
 
-  # Explicit deny on stoside resources
-  statement {
-    effect  = "Deny"
-    actions = ["s3:*"]
-    resources = [
-      "arn:aws:s3:::stoside-*",
-      "arn:aws:s3:::stoside-*/*",
-    ]
-  }
 }
 
 resource "aws_iam_role_policy" "lambda_permissions" {
@@ -81,29 +72,31 @@ data "aws_iam_policy_document" "deployer_assume" {
 }
 
 resource "aws_iam_role" "watchdog_deployer" {
-  name                 = "watchdog-deployer"
-  description          = "Deploy role for yimby.watchdog project"
+  name                 = "civic-deployer"
+  description          = "Unified deploy role for civic monitoring projects"
   assume_role_policy   = data.aws_iam_policy_document.deployer_assume.json
   max_session_duration = 3600
 }
 
 data "aws_iam_policy_document" "deployer_permissions" {
-  # S3 — data bucket
+  # S3 — data buckets (both projects)
   statement {
-    sid     = "WatchdogS3"
+    sid     = "S3Buckets"
     actions = ["s3:*"]
     resources = [
       "arn:aws:s3:::yimby-watchdog-*",
       "arn:aws:s3:::yimby-watchdog-*/*",
+      "arn:aws:s3:::stoside-*",
+      "arn:aws:s3:::stoside-*/*",
     ]
   }
 
   # ECR — push and manage images
   statement {
-    sid     = "WatchdogECR"
+    sid     = "ECR"
     actions = ["ecr:*"]
     resources = [
-      "arn:aws:ecr:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:repository/yimby-watchdog*",
+      "arn:aws:ecr:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:repository/civic-watchdog*",
     ]
   }
 
@@ -113,18 +106,28 @@ data "aws_iam_policy_document" "deployer_permissions" {
     resources = ["*"]
   }
 
-  # Lambda — deploy and manage
+  # Lambda — deploy and manage (both regions)
   statement {
-    sid     = "WatchdogLambda"
+    sid     = "LambdaWest"
     actions = ["lambda:*"]
     resources = [
-      "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:yimby-watchdog-*",
+      "arn:aws:lambda:us-west-2:${data.aws_caller_identity.current.account_id}:function:civic-watchdog-*",
+    ]
+  }
+
+  statement {
+    sid     = "LambdaEast"
+    actions = ["lambda:*"]
+    resources = [
+      "arn:aws:lambda:us-east-1:${data.aws_caller_identity.current.account_id}:function:civic-data-*",
+      "arn:aws:lambda:us-east-1:${data.aws_caller_identity.current.account_id}:layer:civic-data-*",
+      "arn:aws:lambda:us-east-1:${data.aws_caller_identity.current.account_id}:layer:civic-data-*:*",
     ]
   }
 
   # IAM — manage project roles + self
   statement {
-    sid = "WatchdogIAM"
+    sid = "IAM"
     actions = [
       "iam:CreateRole",
       "iam:DeleteRole",
@@ -142,8 +145,7 @@ data "aws_iam_policy_document" "deployer_permissions" {
       "iam:ListRoleTags",
     ]
     resources = [
-      "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/yimby-watchdog-*",
-      "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/watchdog-deployer",
+      "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/civic-*",
     ]
   }
 
@@ -161,46 +163,70 @@ data "aws_iam_policy_document" "deployer_permissions" {
 
   # EventBridge Scheduler
   statement {
-    sid     = "WatchdogScheduler"
+    sid     = "Scheduler"
     actions = ["scheduler:*"]
     resources = [
-      "arn:aws:scheduler:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:schedule/default/yimby-watchdog-*",
+      "arn:aws:scheduler:us-west-2:${data.aws_caller_identity.current.account_id}:schedule/default/civic-watchdog-*",
     ]
   }
 
   # CloudWatch Logs
   statement {
-    sid     = "WatchdogLogs"
+    sid     = "Logs"
     actions = ["logs:*"]
     resources = [
-      "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/yimby-watchdog-*",
+      "arn:aws:logs:us-west-2:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/civic-watchdog-*",
+      "arn:aws:logs:us-east-1:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/civic-data-*",
     ]
   }
 
-  # Explicit deny on stoside resources
+  # API Gateway (us-east-1)
   statement {
-    sid    = "DenyStoside"
-    effect = "Deny"
+    sid = "APIGateway"
     actions = [
-      "s3:*",
-      "lambda:*",
-      "ecr:*",
-      "iam:*",
-      "scheduler:*",
+      "apigateway:GET",
+      "apigateway:POST",
+      "apigateway:PUT",
+      "apigateway:PATCH",
+      "apigateway:DELETE",
     ]
+    resources = ["arn:aws:apigateway:us-east-1::/apis/*"]
+  }
+
+  # CloudFront
+  statement {
+    sid = "CloudFront"
+    actions = [
+      "cloudfront:GetDistribution",
+      "cloudfront:GetDistributionConfig",
+      "cloudfront:UpdateDistribution",
+      "cloudfront:ListDistributions",
+      "cloudfront:GetOriginAccessControl",
+      "cloudfront:CreateOriginAccessControl",
+      "cloudfront:UpdateOriginAccessControl",
+      "cloudfront:DeleteOriginAccessControl",
+      "cloudfront:ListOriginAccessControls",
+      "cloudfront:CreateInvalidation",
+      "cloudfront:TagResource",
+      "cloudfront:UntagResource",
+      "cloudfront:ListTagsForResource",
+    ]
+    resources = ["*"]
+  }
+
+  # Terraform state
+  statement {
+    sid     = "TerraformState"
+    actions = ["s3:*"]
     resources = [
-      "arn:aws:s3:::stoside-*",
-      "arn:aws:s3:::stoside-*/*",
-      "arn:aws:lambda:*:${data.aws_caller_identity.current.account_id}:function:stoside-*",
-      "arn:aws:ecr:*:${data.aws_caller_identity.current.account_id}:repository/stoside-*",
-      "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/stoside-*",
-      "arn:aws:scheduler:*:${data.aws_caller_identity.current.account_id}:schedule/default/stoside-*",
+      "arn:aws:s3:::stoside-terraform-state",
+      "arn:aws:s3:::stoside-terraform-state/*",
     ]
   }
 }
 
 resource "aws_iam_role_policy" "watchdog_deployer_permissions" {
-  name   = "watchdog-deploy"
+  name   = "civic-deploy"
   role   = aws_iam_role.watchdog_deployer.id
   policy = data.aws_iam_policy_document.deployer_permissions.json
 }

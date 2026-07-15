@@ -18,7 +18,7 @@ terraform {
 
 provider "aws" {
   region  = var.aws_region
-  profile = "watchdog"
+  profile = "civic"
 
   default_tags {
     tags = {

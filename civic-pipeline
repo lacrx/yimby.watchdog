@@ -375,7 +375,7 @@ fi
 
 # ── 2b.3: Export permits + filings to Parquet + upload to S3 ──
 log "Exporting permits to Parquet..."
-if AWS_PROFILE="${AWS_PROFILE:-watchdog}" python3 transforms/export_parquet.py >> data/export-parquet.log 2>&1; then
+if AWS_PROFILE="${AWS_PROFILE:-civic}" python3 transforms/export_parquet.py >> data/export-parquet.log 2>&1; then
     log "Parquet export + upload done."
 else
     log "WARNING: Parquet export failed. Continuing pipeline."

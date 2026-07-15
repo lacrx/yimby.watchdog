@@ -7,7 +7,7 @@ variable "aws_region" {
 variable "project" {
   description = "Project tag for all resources"
   type        = string
-  default     = "yimby-watchdog"
+  default     = "civic-watchdog"
 }
 
 variable "bucket_name" {

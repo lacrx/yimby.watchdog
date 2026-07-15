@@ -37,7 +37,7 @@ PROJECTS_FILE = STRUCTURED_DIR / "permit-projects.json"
 APR_FILE = REFERENCE_DIR / "hcd-apr-oceanside.json"
 
 STOSIDE_BUCKET = os.environ.get("STOSIDE_BUCKET", "stoside-data")
-STOSIDE_PROFILE = os.environ.get("AWS_PROFILE", "stoside")
+STOSIDE_PROFILE = os.environ.get("AWS_PROFILE", "civic")
 STOSIDE_REGION = "us-east-1"
 
 
