@@ -18,6 +18,7 @@ Output:
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -67,6 +68,19 @@ def load_parcel_addresses():
             index[apn] = f"{num} {st}"
     print(f"  Parcel address index: {len(index)} APNs with addresses")
     return index
+
+
+_DENSITY_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:dwelling|du)", re.IGNORECASE)
+
+
+def _parse_density(val):
+    """Extract numeric density (du/acre) from string or number. Returns float or None."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return None if math.isnan(val) else float(val)
+    m = _DENSITY_RE.search(str(val))
+    return float(m.group(1)) if m else None
 
 
 def load_parcel_zoning():
@@ -146,6 +160,8 @@ def build_permits_table(permits, project_index, parcel_addrs, parcel_zones):
         "address": [],
         "zone_code": [],
         "zone_category": [],
+        "max_density": [],
+        "max_height": [],
         "is_downtown": [],
         "project_id": [],
     }
@@ -181,6 +197,16 @@ def build_permits_table(permits, project_index, parcel_addrs, parcel_zones):
             zone_cat = pz.get("zone_category", "")
         columns["zone_code"].append(zone)
         columns["zone_category"].append(zone_cat)
+        density = None
+        height = ""
+        if apn and apn in parcel_zones:
+            pz = parcel_zones[apn]
+            density = _parse_density(pz.get("density"))
+            h = pz.get("height")
+            if h and not (isinstance(h, float) and math.isnan(h)):
+                height = str(h)
+        columns["max_density"].append(density)
+        columns["max_height"].append(height)
         columns["is_downtown"].append(bool(p.get("is_downtown")))
         columns["project_id"].append(project_index.get(p.get("permit_no", ""), ""))
 
@@ -284,6 +310,7 @@ def build_housing_projects_table(parcel_addrs=None, parcel_zones=None):
         "project_id": [], "project_name": [], "agency": [],
         "address": [], "apn": [], "latitude": [], "longitude": [],
         "is_downtown": [], "zone_code": [], "zone_category": [],
+        "max_density": [], "max_height": [],
         "units_best": [], "units_source": [],
         "units_apr_proposed": [], "units_apr_approved": [],
         "units_permit_estimated": [],
@@ -310,6 +337,15 @@ def build_housing_projects_table(parcel_addrs=None, parcel_zones=None):
         pz = parcel_zones.get(apn, {}) if apn else {}
         columns["zone_code"].append(pz.get("zone_code", ""))
         columns["zone_category"].append(pz.get("zone_category", ""))
+        density = None
+        height = ""
+        if pz:
+            density = _parse_density(pz.get("density"))
+            h = pz.get("height")
+            if h and not (isinstance(h, float) and math.isnan(h)):
+                height = str(h)
+        columns["max_density"].append(density)
+        columns["max_height"].append(height)
         columns["latitude"].append(p.get("latitude") or 0.0)
         columns["longitude"].append(p.get("longitude") or 0.0)
         columns["is_downtown"].append(bool(p.get("is_downtown")))
@@ -444,7 +480,7 @@ def export_parquet(columns, output_path):
     for bc in list(BOOL_COLS):
         if bc in columns and columns[bc] and isinstance(columns[bc][0], str):
             BOOL_COLS = BOOL_COLS - {bc}
-    FLOAT_COLS = {"latitude", "longitude"}
+    FLOAT_COLS = {"latitude", "longitude", "max_density"}
 
     arrays = {}
     for col, values in columns.items():
