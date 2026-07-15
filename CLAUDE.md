@@ -51,6 +51,10 @@ python transforms/extract_structured.py
 python transforms/meeting_merge.py
 python transforms/monthly_rollup.py
 
+# Build unified housing projects (cross-references all sources)
+python transforms/housing_projects.py          # build if stale
+python transforms/housing_projects.py --stats  # show match rates + top projects
+
 # Pipeline health checks
 python pipeline_preflight.py
 python pipeline_doctor.py
@@ -69,10 +73,12 @@ data/{agency_slug}/
   state.json          # Scraper state (last-seen markers)
   permits/            # Building permits + planning projects (eTRAKit JSONL, Oceanside only)
 data/structured/      # Extracted JSONL (meetings-combined, all-records)
+data/structured/housing-projects.json  # Unified housing projects (cross-ref all sources)
+data/exports/         # Parquet files for DuckDB queries
 data/transcripts/     # Whisper transcription output
 ```
 
-Permits and planning projects are standalone structured data (type, description, status, dates) — they do NOT go through `claude -p` extraction. Meeting documents do. Building permits use `etrakit-permits-{year}.jsonl`, planning projects use `etrakit-projects-{year}.jsonl`.
+Permits and planning projects are standalone structured data (type, description, status, dates) — they do NOT go through `claude -p` extraction. Meeting documents do. Building permits use `etrakit-permits-{year}.jsonl`, planning projects use `etrakit-projects-{year}.jsonl`. `housing_projects.py` cross-references permits, planning projects, HCD APR filings, and meeting extractions into a unified entity per named project.
 
 ## Platform Scraper Modules
 

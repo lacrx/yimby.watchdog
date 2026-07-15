@@ -34,6 +34,7 @@ STRUCTURED_DIR = DATA_DIR / "structured"
 EXPORTS_DIR = DATA_DIR / "exports"
 REFERENCE_DIR = DATA_DIR / "reference"
 PROJECTS_FILE = STRUCTURED_DIR / "permit-projects.json"
+HOUSING_FILE = STRUCTURED_DIR / "housing-projects.json"
 APR_FILE = REFERENCE_DIR / "hcd-apr-oceanside.json"
 
 STOSIDE_BUCKET = os.environ.get("STOSIDE_BUCKET", "stoside-data")
@@ -211,6 +212,119 @@ def build_apr_table():
     return columns
 
 
+def build_housing_projects_table():
+    """Build column-oriented dict for unified housing projects Parquet table."""
+    if not HOUSING_FILE.exists():
+        return None
+
+    data = json.loads(HOUSING_FILE.read_text())
+    projects = data.get("projects", [])
+    columns = {
+        "project_id": [], "project_name": [], "agency": [],
+        "address": [], "apn": [], "latitude": [], "longitude": [],
+        "is_downtown": [], "units_best": [], "units_source": [],
+        "units_apr_proposed": [], "units_apr_approved": [],
+        "units_permit_estimated": [],
+        "income_very_low": [], "income_low": [],
+        "income_moderate": [], "income_above_moderate": [],
+        "status": [], "density_bonus": [], "sb35": [],
+        "first_activity": [], "last_activity": [],
+        "permit_count": [], "planning_refs": [],
+        "apr_tracking_ids": [], "meeting_mention_count": [],
+    }
+
+    for p in projects:
+        columns["project_id"].append(p.get("project_id", ""))
+        columns["project_name"].append(p.get("project_name", ""))
+        columns["agency"].append(p.get("agency", ""))
+        columns["address"].append(p.get("address", "") or "")
+        columns["apn"].append(p.get("apn", "") or "")
+        columns["latitude"].append(p.get("latitude") or 0.0)
+        columns["longitude"].append(p.get("longitude") or 0.0)
+        columns["is_downtown"].append(bool(p.get("is_downtown")))
+
+        units = p.get("units", {})
+        columns["units_best"].append(units.get("best") or 0)
+        columns["units_source"].append(units.get("best_source", ""))
+        columns["units_apr_proposed"].append(units.get("apr_proposed") or 0)
+        columns["units_apr_approved"].append(units.get("apr_approved") or 0)
+        columns["units_permit_estimated"].append(units.get("permit_estimated") or 0)
+
+        tiers = p.get("income_tiers") or {}
+        columns["income_very_low"].append(tiers.get("very_low", 0))
+        columns["income_low"].append(tiers.get("low", 0))
+        columns["income_moderate"].append(tiers.get("moderate", 0))
+        columns["income_above_moderate"].append(tiers.get("above_moderate", 0))
+
+        columns["status"].append(p.get("status", ""))
+        columns["density_bonus"].append(bool(p.get("density_bonus")))
+        columns["sb35"].append(bool(p.get("sb35")))
+        columns["first_activity"].append(p.get("first_activity") or "")
+        columns["last_activity"].append(p.get("last_activity") or "")
+
+        src = p.get("sources", {})
+        pp = src.get("permit_project") or {}
+        columns["permit_count"].append(pp.get("permit_count", 0))
+
+        plan_nos = [pl.get("project_no", "") for pl in src.get("planning_projects", [])]
+        columns["planning_refs"].append(",".join(plan_nos) if plan_nos else "")
+
+        apr_ids = [a.get("tracking_id", "") for a in src.get("apr_filings", [])]
+        columns["apr_tracking_ids"].append(",".join(apr_ids) if apr_ids else "")
+
+        columns["meeting_mention_count"].append(len(src.get("meeting_mentions", [])))
+
+    return columns
+
+
+def build_planning_projects_table():
+    """Build column-oriented dict for planning projects Parquet table."""
+    agencies = load_agencies(enabled_only=False)
+    records = []
+    for slug, cfg in agencies.items():
+        if "permits" not in cfg:
+            continue
+        permits_dir = agency_data_dir(slug) / "permits"
+        if not permits_dir.exists():
+            continue
+        for jf in sorted(permits_dir.glob("etrakit-projects-*.jsonl")):
+            year_match = re.search(r"(\d{4})", jf.name)
+            year = int(year_match.group(1)) if year_match else 0
+            with open(jf) as f:
+                for line in f:
+                    if line.strip():
+                        r = json.loads(line)
+                        r["_year"] = year
+                        r["_agency"] = slug
+                        records.append(r)
+
+    if not records:
+        return None
+
+    columns = {
+        "project_no": [], "year": [], "agency": [],
+        "type": [], "status": [], "name": [], "description": [],
+        "applied": [], "approved": [],
+        "address": [], "apn": [], "planner": [],
+    }
+
+    for r in records:
+        columns["project_no"].append(r.get("project_no", ""))
+        columns["year"].append(r.get("_year", 0))
+        columns["agency"].append(r.get("_agency", ""))
+        columns["type"].append(r.get("type", ""))
+        columns["status"].append(r.get("status", ""))
+        columns["name"].append(r.get("name", ""))
+        columns["description"].append(r.get("description", ""))
+        columns["applied"].append(r.get("applied") or "")
+        columns["approved"].append(r.get("approved") or "")
+        columns["address"].append(r.get("address") or "")
+        columns["apn"].append(r.get("apn") or "")
+        columns["planner"].append(r.get("planner") or "")
+
+    return columns
+
+
 def export_parquet(columns, output_path):
     """Write column dict as Parquet file."""
     import pyarrow as pa
@@ -218,8 +332,15 @@ def export_parquet(columns, output_path):
 
     INT_COLS = {"year", "permit_count", "estimated_units",
                 "tot_proposed_units", "tot_approved_units", "tot_disapproved_units",
-                "above_mod_income", "affordable_units"}
-    BOOL_COLS = {"is_downtown", "has_building_permit"}
+                "above_mod_income", "affordable_units",
+                "units_best", "units_apr_proposed", "units_apr_approved",
+                "units_permit_estimated", "income_very_low", "income_low",
+                "income_moderate", "income_above_moderate", "meeting_mention_count"}
+    BOOL_COLS = {"is_downtown", "has_building_permit", "density_bonus", "sb35"}
+    # APR table uses string "Yes"/"No" for these; only cast if actual bools
+    for bc in list(BOOL_COLS):
+        if bc in columns and columns[bc] and isinstance(columns[bc][0], str):
+            BOOL_COLS = BOOL_COLS - {bc}
     FLOAT_COLS = {"latitude", "longitude"}
 
     arrays = {}
@@ -265,12 +386,18 @@ def cmd_export(args):
 
     apr_cols = build_apr_table()
     apr_count = len(apr_cols["year"]) if apr_cols else 0
+    housing_cols = build_housing_projects_table()
+    housing_count = len(housing_cols["project_id"]) if housing_cols else 0
+    planning_cols = build_planning_projects_table()
+    planning_count = len(planning_cols["project_no"]) if planning_cols else 0
 
     if args.dry_run:
         print("\n[dry run] Would export:")
         print(f"  permits.parquet: {len(permits)} rows × 15 columns")
         print(f"  permit_projects.parquet: {len(projects)} rows × 11 columns")
         print(f"  apr_filings.parquet: {apr_count} rows × 22 columns")
+        print(f"  housing_projects.parquet: {housing_count} rows × 26 columns")
+        print(f"  planning_projects.parquet: {planning_count} rows × 12 columns")
         return
 
     print("\nExporting Parquet...", flush=True)
@@ -286,6 +413,14 @@ def cmd_export(args):
         apr_table = export_parquet(apr_cols, EXPORTS_DIR / "apr_filings.parquet")
         print(f"  apr_filings.parquet: {apr_table.num_rows} rows, {(EXPORTS_DIR / 'apr_filings.parquet').stat().st_size:,} bytes")
 
+    if housing_cols:
+        housing_table = export_parquet(housing_cols, EXPORTS_DIR / "housing_projects.parquet")
+        print(f"  housing_projects.parquet: {housing_table.num_rows} rows, {(EXPORTS_DIR / 'housing_projects.parquet').stat().st_size:,} bytes")
+
+    if planning_cols:
+        planning_table = export_parquet(planning_cols, EXPORTS_DIR / "planning_projects.parquet")
+        print(f"  planning_projects.parquet: {planning_table.num_rows} rows, {(EXPORTS_DIR / 'planning_projects.parquet').stat().st_size:,} bytes")
+
     if args.local_only:
         print(f"\nLocal export complete → {EXPORTS_DIR}/")
         return
@@ -296,6 +431,10 @@ def cmd_export(args):
         upload_to_s3(EXPORTS_DIR / "permit_projects.parquet", "data/permit_projects.parquet")
         if apr_cols:
             upload_to_s3(EXPORTS_DIR / "apr_filings.parquet", "data/apr_filings.parquet")
+        if housing_cols:
+            upload_to_s3(EXPORTS_DIR / "housing_projects.parquet", "data/housing_projects.parquet")
+        if planning_cols:
+            upload_to_s3(EXPORTS_DIR / "planning_projects.parquet", "data/planning_projects.parquet")
         print(f"\nDone. Files queryable via stoside-data DuckDB Lambda.")
     except Exception as e:
         print(f"\nS3 upload failed: {e}")

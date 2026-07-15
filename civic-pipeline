@@ -389,7 +389,11 @@ if [ "$(date +%d)" = "01" ]; then
     fi
 fi
 
-# ── 2b.3: Export permits + filings to Parquet + upload to S3 ──
+# ── 2b.3: Build unified housing projects ──
+log "Building unified housing projects..."
+python3 transforms/housing_projects.py >> data/housing-projects.log 2>&1 || log "WARNING: Housing projects build failed."
+
+# ── 2b.4: Export permits + filings to Parquet + upload to S3 ──
 log "Exporting permits to Parquet..."
 if AWS_PROFILE="${AWS_PROFILE:-civic}" python3 transforms/export_parquet.py >> data/export-parquet.log 2>&1; then
     log "Parquet export + upload done."
