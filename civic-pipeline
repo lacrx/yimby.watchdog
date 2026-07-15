@@ -361,7 +361,19 @@ run_with_timeout "Zone enrichment" python3 transforms/enrich_permits.py enrich -
     >> data/enrich-permits.log 2>&1
 log "Zone enrichment done."
 
-# ── 2b.2: Export permits to Parquet + upload to S3 ──
+# ── 2b.2: HCD APR filings (monthly — runs on 1st of each month) ──
+if [ "$(date +%d)" = "01" ]; then
+    log "Monthly APR refresh..."
+    if python3 loaders/hcd_apr.py download >> data/hcd-apr.log 2>&1 && \
+       python3 loaders/hcd_apr.py enrich  >> data/hcd-apr.log 2>&1 && \
+       python3 loaders/hcd_apr.py crossref >> data/hcd-apr.log 2>&1; then
+        log "APR download + enrich + crossref done."
+    else
+        log "WARNING: APR refresh failed. Continuing pipeline."
+    fi
+fi
+
+# ── 2b.3: Export permits + filings to Parquet + upload to S3 ──
 log "Exporting permits to Parquet..."
 if AWS_PROFILE="${AWS_PROFILE:-watchdog}" python3 transforms/export_parquet.py >> data/export-parquet.log 2>&1; then
     log "Parquet export + upload done."
