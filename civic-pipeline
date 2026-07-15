@@ -355,6 +355,20 @@ log "Building permit project groupings..."
 python3 transforms/permit_projects.py >> data/permit-projects.log 2>&1 || log "WARNING: Permit project grouping failed. Continuing pipeline."
 log "Permit project grouping done."
 
+# ── 2b.1: Enrich permits with GIS zoning data ──
+log "Enriching permits with zoning data..."
+run_with_timeout "Zone enrichment" python3 transforms/enrich_permits.py enrich --year "$CURRENT_YEAR" \
+    >> data/enrich-permits.log 2>&1
+log "Zone enrichment done."
+
+# ── 2b.2: Export permits to Parquet + upload to S3 ──
+log "Exporting permits to Parquet..."
+if AWS_PROFILE="${AWS_PROFILE:-watchdog}" python3 transforms/export_parquet.py >> data/export-parquet.log 2>&1; then
+    log "Parquet export + upload done."
+else
+    log "WARNING: Parquet export failed. Continuing pipeline."
+fi
+
 # ── 2c: Monthly rollups (auto-detects stale months) ──
 log "Building monthly digests..."
 python3 transforms/monthly_rollup.py >> data/monthly-rollup.log 2>&1 || log "WARNING: Monthly rollup failed. Continuing pipeline."

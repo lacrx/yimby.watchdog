@@ -358,6 +358,87 @@ def cmd_enrich(args):
     print(f"\nEnriched {enriched_count} permits, wrote {len(all_results)} to {in_file}")
 
 
+def cmd_backfill_apn(args):
+    """Re-fetch permits missing APNs. Faster than full enrich — skips already-enriched."""
+    agencies = load_agencies(enabled_only=False)
+    agency_slug = args.agency
+    config = agencies.get(agency_slug)
+    if not config or "permits" not in config:
+        print(f"No permit config for agency '{agency_slug}'")
+        sys.exit(1)
+
+    permit_config = config["permits"]
+    base_url = permit_config["base_url"]
+    data_dir = agency_data_dir(agency_slug)
+    permits_dir = data_dir / "permits"
+
+    years = list(range(args.start_year, args.end_year + 1)) if not args.year else [args.year]
+
+    session = _make_session()
+    total_backfilled = 0
+
+    for year in years:
+        in_file = permits_dir / f"etrakit-permits-{year}.jsonl"
+        if not in_file.exists():
+            continue
+
+        permits = []
+        with open(in_file) as f:
+            for line in f:
+                if line.strip():
+                    permits.append(json.loads(line))
+
+        if args.housing_only:
+            candidates = [p for p in permits if p.get("type", "") in HOUSING_TYPES and not p.get("apn")]
+        else:
+            candidates = [p for p in permits if p.get("type", "") in INFILL_TYPES and not p.get("apn")]
+
+        if not candidates:
+            print(f"{year}: {len(permits)} permits, 0 need APN backfill")
+            continue
+
+        print(f"{year}: {len(permits)} permits, {len(candidates)} need APN backfill")
+
+        batch_size = args.batch
+        if batch_size > 0:
+            candidates = candidates[:batch_size]
+
+        permit_index = {p["permit_no"]: p for p in permits}
+        backfilled = 0
+
+        for i, p in enumerate(candidates):
+            permit_no = p["permit_no"]
+            try:
+                result = fetch_permit(session, base_url, permit_no, enrich=True)
+            except Exception as e:
+                print(f"  Error on {permit_no}: {e}", flush=True)
+                time.sleep(5)
+                continue
+
+            if result and result.get("apn"):
+                permit_index[permit_no] = result
+                backfilled += 1
+                print(f"  {permit_no}: apn={result['apn']}", flush=True)
+            elif result:
+                permit_index[permit_no] = result
+
+            time.sleep(args.delay)
+
+            if (i + 1) % 50 == 0:
+                print(f"  ...{i + 1}/{len(candidates)}: {backfilled} APNs found", flush=True)
+                time.sleep(2)
+
+        all_results = [permit_index[p["permit_no"]] for p in permits]
+        with open(in_file, "w") as f:
+            for p in all_results:
+                f.write(json.dumps(p) + "\n")
+
+        print(f"  {year}: backfilled {backfilled} APNs")
+        total_backfilled += backfilled
+
+    print(f"\nTotal: {total_backfilled} APNs backfilled")
+
+
 def main():
     parser = argparse.ArgumentParser(description="eTRAKiT building permit scraper")
     sub = parser.add_subparsers(dest="command")
@@ -378,12 +459,23 @@ def main():
     enrich_p.add_argument("--all-types", action="store_true", help="Enrich all types")
     enrich_p.add_argument("--delay", type=float, default=1.0, help="Seconds between requests")
 
+    bfill_p = sub.add_parser("backfill-apn", help="Re-fetch permits missing APNs")
+    bfill_p.add_argument("--agency", default="oceanside", help="Agency slug")
+    bfill_p.add_argument("--year", type=int, default=0, help="Specific year (default: all years)")
+    bfill_p.add_argument("--start-year", type=int, default=2020, help="Start year for range")
+    bfill_p.add_argument("--end-year", type=int, default=datetime.now().year, help="End year for range")
+    bfill_p.add_argument("--batch", type=int, default=0, help="Max permits per year (0=all)")
+    bfill_p.add_argument("--housing-only", action="store_true", help="Only backfill housing types")
+    bfill_p.add_argument("--delay", type=float, default=1.0, help="Seconds between requests")
+
     args = parser.parse_args()
 
     if args.command == "fetch":
         cmd_fetch(args)
     elif args.command == "enrich":
         cmd_enrich(args)
+    elif args.command == "backfill-apn":
+        cmd_backfill_apn(args)
     else:
         parser.print_help()
 
