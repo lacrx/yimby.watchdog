@@ -233,7 +233,23 @@ for slug, a in cfg['agencies'].items():
         print(f\"{slug}|{a.get('name', slug)}\")
 ")
 
-# ── 1c.1: Enrich new infill permits (contacts, site info, linked activities) ──
+# ── 1c.1: Fetch planning projects (development plans, density bonus, etc) ──
+while IFS='|' read -r SLUG NAME; do
+    log "Fetching $NAME planning projects ($CURRENT_YEAR)..."
+    if run_with_timeout "$NAME projects" python3 scrapers/etrakit.py projects --agency "$SLUG" --year "$CURRENT_YEAR" --delay 0.5 >> "data/${SLUG}/permits/projects.log" 2>&1; then
+        log "$NAME projects done."
+    else
+        log "$NAME projects failed — continuing pipeline."
+    fi
+done < <(python3 -c "
+import yaml
+cfg = yaml.safe_load(open('agencies.yaml'))
+for slug, a in cfg['agencies'].items():
+    if a.get('enabled', True) and a.get('permits'):
+        print(f\"{slug}|{a.get('name', slug)}\")
+")
+
+# ── 1c.2: Enrich new infill permits (contacts, site info, linked activities) ──
 while IFS='|' read -r SLUG NAME; do
     log "Enriching $NAME infill permits ($CURRENT_YEAR)..."
     if run_with_timeout "$NAME enrich" python3 scrapers/etrakit.py enrich --agency "$SLUG" --year "$CURRENT_YEAR" --infill --delay 1.5 >> "data/${SLUG}/permits/enrich.log" 2>&1; then
