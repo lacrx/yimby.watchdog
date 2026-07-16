@@ -501,6 +501,11 @@ def cmd_backfill_apn(args):
             if (i + 1) % 50 == 0:
                 print(f"  ...{i + 1}/{len(candidates)}: {backfilled} APNs found", flush=True)
                 time.sleep(2)
+                # Checkpoint: save progress every 50 permits
+                all_results = [permit_index[p["permit_no"]] for p in permits]
+                with open(in_file, "w") as f:
+                    for p in all_results:
+                        f.write(json.dumps(p) + "\n")
 
         all_results = [permit_index[p["permit_no"]] for p in permits]
         with open(in_file, "w") as f:
