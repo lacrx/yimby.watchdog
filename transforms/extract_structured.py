@@ -580,8 +580,8 @@ def collect_all_sources(queue=None, hot_days=14):
     queue: None (all), "hot" (recent meetings), or "cold" (backlog).
     hot_days: days back from today that counts as "hot" (default 14).
 
-    forward_only agencies use enabled_date as cutoff instead of hot_days,
-    and are excluded from cold queue entirely.
+    forward_only agencies use enabled_date as cutoff for hot queue;
+    cold queue includes their full backlog.
     """
     sources = []
     agencies = load_agencies(enabled_only=True)
@@ -599,17 +599,14 @@ def collect_all_sources(queue=None, hot_days=14):
 
         if is_tally_only and queue:
             continue
-        if queue == "cold" and is_forward_only:
-            continue
-
         for f in sorted(ddir.glob("*.txt"), reverse=True):
             if queue:
                 meeting_date = doc_index.get(f.name, "")
 
-                if is_forward_only:
+                if is_forward_only and queue == "hot":
                     if not meeting_date or meeting_date < enabled_date:
                         continue
-                else:
+                elif not is_forward_only:
                     is_hot = meeting_date >= hot_cutoff if meeting_date else False
                     if queue == "hot" and not is_hot:
                         continue
