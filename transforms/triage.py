@@ -63,7 +63,15 @@ def predict_relevance(text, filename=""):
         if re.search(pat, fn_lower):
             return False, 0.0
 
-    text_lower = text[:8000].lower()
+    # Sample head + middle + tail for long docs — transcripts and large
+    # agendas front-load procedural content (roll call, invocation, pledge)
+    # that drowns out substantive keywords appearing later.
+    if len(text) > 24000:
+        mid = len(text) // 2
+        sample = text[:8000] + text[mid - 4000:mid + 4000] + text[-8000:]
+    else:
+        sample = text[:8000]
+    text_lower = sample.lower()
     denom = max(len(text), 1) / 1000
 
     proc_hits = sum(text_lower.count(kw) for kw in PROCEDURAL_KW)
