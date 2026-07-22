@@ -59,6 +59,11 @@ python transforms/housing_projects.py --stats  # show match rates + top projects
 python pipeline_preflight.py
 python pipeline_doctor.py
 
+# Estimate extraction volume for rollout planning
+python pipeline_estimate.py                    # tallies since earliest enabled_date
+python pipeline_estimate.py --days 14          # last 14 days
+python pipeline_estimate.py --csv              # CSV for spreadsheets
+
 # Deploy Lambda (after changing lambda_handler, scrapers, or agencies.yaml)
 ./deploy-lambda
 ```
