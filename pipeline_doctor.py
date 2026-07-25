@@ -287,26 +287,30 @@ def count_remaining():
 
 def build_autofix_prompt(findings, extraction_log_lines, pipeline_log_lines):
     """Build a prompt for claude -p to diagnose and fix pipeline issues."""
-    # Gather recent error context
+    # Gather recent error context — broad keyword set to capture operational issues
+    error_keywords = [
+        "Error", "FAILED", "Traceback", "not found", "Module",
+        "session limit", "rate limit", "exit code", "timed out",
+        "retrying", "Circuit breaker", "JSON parse error",
+        "Stopping", "WARNING", "broken",
+    ]
     error_context = []
-    for line in extraction_log_lines[-50:]:
+    for line in extraction_log_lines[-100:]:
         line = line.strip()
-        if any(kw in line for kw in ["Error", "FAILED", "Traceback", "not found", "Module"]):
+        if any(kw.lower() in line.lower() for kw in error_keywords):
             error_context.append(line)
 
     for line in pipeline_log_lines[-50:]:
         line = line.strip()
-        if any(kw in line for kw in ["failed", "WARNING", "Error", "not found"]):
+        if any(kw.lower() in line.lower() for kw in error_keywords):
             error_context.append(line)
 
     # Identify files likely involved
     involved_files = set()
     for line in error_context:
-        # Extract file paths from tracebacks
         match = re.search(r'File "([^"]+)"', line)
         if match:
             involved_files.add(match.group(1))
-        # Common script references
         for script in ["extract-backlog", "extract-local", "civic-pipeline",
                        "extract_structured.py", "meeting_merge.py", "monthly_rollup.py"]:
             if script in line:
@@ -315,19 +319,24 @@ def build_autofix_prompt(findings, extraction_log_lines, pipeline_log_lines):
                 else:
                     involved_files.add(script)
 
-    # Read involved files for context
+    # Always include extract_structured.py for extraction-related findings
+    extraction_keywords = ["extract", "JSON parse", "session limit", "throughput", "chunking"]
+    if any(kw.lower() in f.lower() for f in findings for kw in extraction_keywords):
+        involved_files.add(str(REPO_ROOT / "transforms" / "extract_structured.py"))
+
+    # Read involved files for context — focus on the functions that matter
     file_contents = {}
-    for fpath in list(involved_files)[:3]:
+    for fpath in list(involved_files)[:5]:
         try:
             content = Path(fpath).read_text()
-            if len(content) > 5000:
-                content = content[:5000] + "\n... (truncated)"
+            if len(content) > 8000:
+                content = content[:8000] + "\n... (truncated)"
             file_contents[fpath] = content
         except Exception:
             pass
 
     prompt_parts = [
-        "You are a pipeline maintenance agent. The civic monitoring pipeline had errors on its last run.",
+        "You are a pipeline maintenance agent. The civic monitoring pipeline had issues on its last run.",
         "Your job: diagnose the root cause and fix it by editing the relevant files.",
         "",
         "## Findings (unresolved)",
@@ -339,7 +348,7 @@ def build_autofix_prompt(findings, extraction_log_lines, pipeline_log_lines):
     prompt_parts.append("")
     prompt_parts.append("## Error log context (recent)")
     prompt_parts.append("")
-    for line in error_context[-30:]:
+    for line in error_context[-50:]:
         prompt_parts.append(f"  {line}")
 
     if file_contents:
@@ -354,9 +363,16 @@ def build_autofix_prompt(findings, extraction_log_lines, pipeline_log_lines):
     prompt_parts.append("")
     prompt_parts.append("1. Diagnose the root cause of each finding.")
     prompt_parts.append("2. Fix the issue by editing the relevant file(s).")
-    prompt_parts.append("3. If you cannot fix it (e.g., needs human auth, external service down), explain what's wrong and what the human should do.")
-    prompt_parts.append(f"4. Working directory: {REPO_ROOT}")
-    prompt_parts.append("5. Do not run the full pipeline — just fix the code/config issue.")
+    prompt_parts.append("3. Common root causes to check:")
+    prompt_parts.append("   - Session/rate limit messages in stdout not being detected (only stderr checked)")
+    prompt_parts.append("   - Oversized documents burning entire session budgets via too many chunks")
+    prompt_parts.append("   - JSON output not being parsed correctly (missing --json-schema flag, broken fence stripping)")
+    prompt_parts.append("   - Retry loops that never terminate on persistent errors")
+    prompt_parts.append("   - Files that repeatedly fail but never get skip-markered")
+    prompt_parts.append("4. If you cannot fix it (e.g., needs human auth, external service down), explain what's wrong and what the human should do.")
+    prompt_parts.append(f"5. Working directory: {REPO_ROOT}")
+    prompt_parts.append("6. Do not run the full pipeline — just fix the code/config issue.")
+    prompt_parts.append("7. Test your fix with a minimal command if possible.")
 
     return "\n".join(prompt_parts)
 
@@ -684,6 +700,36 @@ def diagnose(dry_run=False):
                         f"Record '{json_file.name}' has null date and no date in filename — needs manual fix"
                     )
 
+    # ─── Finding: Low extraction throughput ───
+
+    ext_started = ext_finished = ext_count = None
+    for line in ext_lines:
+        line = line.strip()
+        m = re.match(r'Extracting structured data: (\d+) sources', line)
+        if m:
+            ext_count = int(m.group(1))
+        ts_m = re.match(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]', line)
+        if ts_m:
+            try:
+                ts = datetime.strptime(ts_m.group(1), '%Y-%m-%d %H:%M:%S')
+                if ext_started is None:
+                    ext_started = ts
+                ext_finished = ts
+            except ValueError:
+                pass
+    done_m = re.search(r'(\d+) extracted', "\n".join(l.strip() for l in ext_lines[-5:]))
+    actual_extracted = int(done_m.group(1)) if done_m else 0
+
+    if ext_started and ext_finished and ext_count and ext_count > 10:
+        duration_min = (ext_finished - ext_started).total_seconds() / 60
+        if duration_min > 30 and actual_extracted < max(3, ext_count * 0.05):
+            finding = (
+                f"Low extraction throughput: {actual_extracted}/{ext_count} docs in {duration_min:.0f}min — "
+                f"expected ~1 doc/3min. Check extraction log for repeated failures or session limit loops."
+            )
+            diagnosis["findings"].append(finding)
+            print(f"  FINDING: {finding}")
+
     # ─── Finding: Stalled pipeline ───
 
     if pipe_errors["zero_extraction_runs"] >= 3:
@@ -750,6 +796,9 @@ def diagnose(dry_run=False):
         "crashed", "CLI not found", "command not found",
         "ModuleNotFoundError", "ImportError", "TypeError",
         "RETRY FAILED",
+        "Low extraction throughput",
+        "JSON parse errors",
+        "wasted cold extraction window",
     ]
     AUTOFIX_SKIP = ["authentication is broken", "rate-limited"]
 
