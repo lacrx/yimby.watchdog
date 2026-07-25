@@ -41,6 +41,32 @@ _state_law_flags = config.get("extraction/state_law_flags",
                               ["HAA", "SB330", "SB79", "SB35", "density_bonus", "housing_element"])
 _state_law_flags_str = " | ".join(_state_law_flags)
 
+EXTRACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "meeting_id": {"type": ["string", "null"]},
+        "date": {"type": ["string", "null"], "description": "YYYY-MM-DD"},
+        "body": {"type": ["string", "null"]},
+        "agency": {"type": ["string", "null"]},
+        "doc_type": {"type": ["string", "null"], "enum": [
+            "agenda", "minutes", "staff_report", "transcript", "agenda_packet", None
+        ]},
+        "votes": {"type": "array", "items": {"type": "object"}},
+        "housing_items": {"type": "array", "items": {"type": "object"}},
+        "fiscal_items": {"type": "array", "items": {"type": "object"}},
+        "legal_flags": {"type": "array", "items": {"type": "string"}},
+        "council_positions": {"type": "array", "items": {"type": "object"}},
+        "public_comments": {"type": "array", "items": {"type": "string"}},
+        "key_quotes": {"type": "array", "items": {"type": "string"}},
+        "procedural_only": {"type": "boolean"},
+    },
+    "required": ["meeting_id", "date", "body", "agency", "doc_type",
+                  "votes", "housing_items", "fiscal_items", "legal_flags",
+                  "council_positions", "public_comments", "key_quotes",
+                  "procedural_only"],
+    "additionalProperties": False,
+}
+
 EXTRACTION_PROMPT = f"""Extract structured data from this raw local government document. Return ONLY valid JSON, no markdown fencing, no explanation.
 
 Schema:
@@ -111,7 +137,7 @@ class AuthError(Exception):
     pass
 
 
-def _call_claude(prompt, max_retries=2):
+def _call_claude(prompt, max_retries=2, schema=None):
     """Call claude -p with retries. Returns (record, error_category) tuple.
 
     On success: (dict, None). On failure: (None, "timeout"|"empty_output"|"json_parse"|"exit_code").
@@ -120,10 +146,13 @@ def _call_claude(prompt, max_retries=2):
     burning API credits on batch extraction.
     """
     env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    cmd = ["claude", "-p", "--output-format", "text"]
+    if schema:
+        cmd += ["--json-schema", json.dumps(schema)]
     for attempt in range(max_retries + 1):
         try:
             result = subprocess.run(
-                ["claude", "-p", "--output-format", "text"],
+                cmd,
                 input=prompt,
                 capture_output=True, text=True, timeout=300,
                 env=env,
@@ -157,24 +186,32 @@ def _call_claude(prompt, max_retries=2):
                 print(f"  claude -p returned empty output")
                 return None, "empty_output"
 
-            if output.startswith("```"):
-                output = output.split("\n", 1)[1] if "\n" in output else output
-                if output.endswith("```"):
-                    output = output[:-3].strip()
-
             try:
                 record = json.loads(output)
-                if isinstance(record, list):
-                    record = record[0] if len(record) == 1 else {"_chunks": record}
-                return record, None
-            except json.JSONDecodeError as e:
-                if attempt < max_retries:
-                    print(f"  JSON parse error, retrying ({attempt+1}/{max_retries})...")
-                    time.sleep(5)
-                    continue
-                print(f"  JSON parse error: {e}")
-                print(f"  Raw output ({len(result.stdout)} chars): {result.stdout[:500]}")
-                return None, "json_parse"
+            except json.JSONDecodeError:
+                # Fallback: extract JSON object from prose-wrapped output
+                brace_start = output.find("{")
+                brace_end = output.rfind("}")
+                if brace_start >= 0 and brace_end > brace_start:
+                    try:
+                        record = json.loads(output[brace_start:brace_end + 1])
+                    except json.JSONDecodeError:
+                        record = None
+                else:
+                    record = None
+
+                if record is None:
+                    if attempt < max_retries:
+                        print(f"  JSON parse error, retrying ({attempt+1}/{max_retries})...")
+                        time.sleep(5)
+                        continue
+                    print(f"  JSON parse error: could not extract JSON")
+                    print(f"  Raw output ({len(result.stdout)} chars): {result.stdout[:500]}")
+                    return None, "json_parse"
+
+            if isinstance(record, list):
+                record = record[0] if len(record) == 1 else {"_chunks": record}
+            return record, None
 
         except FileNotFoundError:
             print("  claude CLI not found.")
@@ -241,7 +278,7 @@ def extract_structured(text, meeting_meta):
 
     if len(text) <= CHUNK_SIZE:
         prompt = EXTRACTION_PROMPT + meta_context + text
-        return _call_claude(prompt)
+        return _call_claude(prompt, schema=EXTRACTION_SCHEMA)
 
     chunks = []
     pos = 0
@@ -260,7 +297,7 @@ def extract_structured(text, meeting_meta):
     last_error = None
     for ci, chunk in enumerate(chunks):
         prompt = EXTRACTION_PROMPT + meta_context + "\n" + chunk
-        record, err = _call_claude(prompt)
+        record, err = _call_claude(prompt, schema=EXTRACTION_SCHEMA)
         if record:
             records.append(record)
         elif err:

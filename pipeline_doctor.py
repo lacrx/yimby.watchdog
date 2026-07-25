@@ -458,20 +458,44 @@ def diagnose(dry_run=False):
                 diagnosis["fixes_applied"].append(fix)
                 print(f"  FIX: {fix}")
 
+    # ─── Finding: JSON parse error rate ───
+
+    json_parse_count = len(ext_errors["json_parse"])
+    if json_parse_count > 5:
+        finding = f"JSON parse errors: {json_parse_count} in recent extraction log — check --json-schema support"
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+        diagnosis["recommendations"].append(
+            "High JSON parse error rate suggests --json-schema flag may not be working. "
+            "Run: claude -p --json-schema '{\"type\":\"object\"}' <<< 'test' to verify."
+        )
+
     # ─── Finding: Oversized files ───
 
     if oversized:
-        for fpath, size in oversized:
-            # Check if content is likely non-meeting (plans, drawings, salary schedules)
-            text_sample = fpath.read_text()[:2000].lower()
-            non_meeting_signals = [
-                "salary schedule", "architectural plan", "plan set",
-                "drawing", "specification", "bid tabulation",
-                "financial statement", "investment portfolio",
-            ]
-            is_non_meeting = any(sig in text_sample for sig in non_meeting_signals)
+        from transforms.extract_structured import split_oversized_doc
 
-            if is_non_meeting:
+        meeting_name_signals = ["agenda", "packet", "staff_report", "minutes"]
+        non_meeting_content_signals = [
+            "salary schedule", "architectural plan", "plan set",
+            "drawing", "specification", "bid tabulation",
+            "financial statement", "investment portfolio",
+        ]
+        skip_name_signals = [
+            "project_plans", "environmental_doc", "pavement",
+            "plan_set", "architectural", "traffic_study",
+            "transportation_assessment", "geotechnical",
+        ]
+
+        for fpath, size in oversized:
+            name_lower = fpath.name.lower()
+            text_sample = fpath.read_text()[:2000].lower()
+
+            is_skip_name = any(s in name_lower for s in skip_name_signals)
+            is_non_meeting_content = any(sig in text_sample for sig in non_meeting_content_signals)
+            is_meeting_name = any(s in name_lower for s in meeting_name_signals)
+
+            if is_skip_name or (is_non_meeting_content and not is_meeting_name):
                 finding = f"Oversized non-meeting file: {fpath.name} ({size:,} bytes)"
                 diagnosis["findings"].append(finding)
                 print(f"  FINDING: {finding}")
@@ -485,6 +509,16 @@ def diagnose(dry_run=False):
                         "size_bytes": size,
                     }))
                     fix = f"Skipped '{fpath.name}' — {size:,} bytes, non-meeting content"
+                    diagnosis["fixes_applied"].append(fix)
+                    print(f"  FIX: {fix}")
+            else:
+                finding = f"Oversized meeting doc needs split: {fpath.name} ({size:,} bytes)"
+                diagnosis["findings"].append(finding)
+                print(f"  FINDING: {finding}")
+
+                if not dry_run:
+                    parts = split_oversized_doc(fpath)
+                    fix = f"Split '{fpath.name}' into {parts} parts ({size:,} bytes)"
                     diagnosis["fixes_applied"].append(fix)
                     print(f"  FIX: {fix}")
 
