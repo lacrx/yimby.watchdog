@@ -82,6 +82,7 @@ Document text:
 
 SKIP_MARKER = ".skip"  # written next to source file to permanently skip un-extractable docs
 CHUNK_SIZE = 60000     # chars per chunk (leaves room for prompt + schema in context)
+MAX_DOC_CHARS = 2_000_000  # 2M chars (~33 chunks) — bigger docs burn the whole session budget
 CHUNK_OVERLAP = 2000   # overlap between chunks to avoid splitting mid-sentence
 MAX_FAIL_RETRIES = 3   # auto-skip after this many extraction failures
 FAILURE_STATE_FILE = None  # set in cmd_extract() after STRUCTURED_DIR is available
@@ -128,11 +129,11 @@ def _call_claude(prompt, max_retries=2):
                 env=env,
             )
 
-            stderr_lower = result.stderr.lower()
-            if "session limit" in stderr_lower or "rate limit" in stderr_lower:
-                raise RateLimitHit(result.stderr.strip()[:200])
+            combined_lower = (result.stderr + " " + result.stdout).lower()
+            if "session limit" in combined_lower or "rate limit" in combined_lower:
+                raise RateLimitHit((result.stderr.strip() or result.stdout.strip())[:200])
 
-            if "invalid authentication" in stderr_lower or "401" in stderr_lower or "403" in stderr_lower:
+            if "invalid authentication" in combined_lower or "401" in combined_lower or "403" in combined_lower:
                 raise AuthError(result.stderr.strip()[:200] or result.stdout.strip()[:200])
 
             if result.returncode != 0:
@@ -649,6 +650,8 @@ def is_skippable(text):
     stripped = text.strip()
     if len(stripped) < 100:
         return "too_short"
+    if len(stripped) > MAX_DOC_CHARS:
+        return "oversized"
 
     sample = stripped[:5000]
     alpha_ratio = sum(c.isalpha() or c.isspace() for c in sample) / max(len(sample), 1)
@@ -684,6 +687,105 @@ def has_skip_marker(source_path):
     if source_path.with_suffix(source_path.suffix + ".split").exists():
         return True
     return False
+
+
+import re as _re
+
+TARGET_PART_CHARS = 500_000  # aim for ~500K per part (~8 chunks each)
+
+_SECTION_RE = _re.compile(
+    r'^\s*(?:STAFF REPORT|PUBLIC HEARING|CONSENT CALENDAR|NEW BUSINESS|'
+    r'OLD BUSINESS|ACTION ITEMS?|CLOSED SESSION)\s*$',
+    _re.IGNORECASE,
+)
+
+
+def split_oversized_doc(source_path):
+    """Split an oversized agenda packet into parts at section boundaries.
+
+    Targets ~500K chars per part, splitting at the nearest section header
+    (STAFF REPORT, PUBLIC HEARING, etc.). Falls back to line-count splits
+    when no headers exist.
+
+    Writes {stem}-part01.txt, etc. into the same directory.
+    Marks the original with .split so it's skipped on future runs.
+    Returns count of parts written.
+    """
+    text = source_path.read_text()
+    lines = text.split("\n")
+
+    # Build cumulative char offsets per line
+    offsets = []
+    cum = 0
+    for line in lines:
+        offsets.append(cum)
+        cum += len(line) + 1  # +1 for newline
+
+    # Find section boundary line numbers
+    section_starts = []
+    for i, line in enumerate(lines):
+        if _SECTION_RE.match(line):
+            section_starts.append(i)
+
+    # Build parts by accumulating sections until we hit the target size
+    parts = []
+    part_start = 0
+
+    for boundary in section_starts:
+        if boundary <= part_start:
+            continue
+        part_chars = offsets[boundary] - offsets[part_start]
+        if part_chars >= TARGET_PART_CHARS:
+            parts.append((part_start, boundary))
+            part_start = boundary
+
+    # Final part
+    if part_start < len(lines):
+        parts.append((part_start, len(lines)))
+
+    # If no section headers found, split by line count
+    if len(parts) <= 1:
+        n_parts = max(2, len(text) // TARGET_PART_CHARS + 1)
+        lines_per = len(lines) // n_parts
+        parts = []
+        for i in range(n_parts):
+            start = i * lines_per
+            end = (i + 1) * lines_per if i < n_parts - 1 else len(lines)
+            parts.append((start, end))
+
+    # Sub-split any part still over MAX_DOC_CHARS
+    final_parts = []
+    for start, end in parts:
+        part_chars = offsets[min(end, len(offsets) - 1)] - offsets[start]
+        if part_chars > MAX_DOC_CHARS:
+            n_sub = part_chars // TARGET_PART_CHARS + 1
+            sub_lines = (end - start) // n_sub
+            for j in range(n_sub):
+                s = start + j * sub_lines
+                e = start + (j + 1) * sub_lines if j < n_sub - 1 else end
+                final_parts.append((s, e))
+        else:
+            final_parts.append((start, end))
+
+    stem = source_path.stem
+    parent = source_path.parent
+    parts_written = 0
+    for idx, (start, end) in enumerate(final_parts):
+        part_text = "\n".join(lines[start:end]).strip()
+        if len(part_text) < 100:
+            continue
+        part_path = parent / f"{stem}-part{idx+1:02d}.txt"
+        part_path.write_text(part_text)
+        parts_written += 1
+
+    split_marker = source_path.with_suffix(source_path.suffix + ".split")
+    split_marker.write_text(json.dumps({
+        "split_at": datetime.now().isoformat(),
+        "parts": parts_written,
+        "original_chars": len(text),
+    }))
+
+    return parts_written
 
 
 def _failure_state_path():
@@ -839,7 +941,21 @@ def cmd_extract(args):
         text = sf.read_text()
 
         skip_reason = is_skippable(text)
-        if skip_reason:
+        if skip_reason == "oversized":
+            name_lower = sf.name.lower()
+            skip_names = ["project_plans", "environmental_doc", "pavement",
+                          "plan_set", "architectural", "traffic_study",
+                          "transportation_assessment", "geotechnical"]
+            if any(s in name_lower for s in skip_names):
+                write_skip_marker(sf, "oversized_non_meeting")
+                skipped += 1
+                print(f"  Skipping permanently: oversized non-meeting ({len(text.strip()):,} chars)")
+            else:
+                parts = split_oversized_doc(sf)
+                print(f"  Split into {parts} parts ({len(text.strip()):,} chars) — parts enter queue next run")
+            i += 1
+            continue
+        elif skip_reason:
             write_skip_marker(sf, skip_reason)
             skipped += 1
             print(f"  Skipping permanently: {skip_reason} ({len(text.strip())} chars)")

@@ -62,6 +62,7 @@ def get_extraction_errors(log_lines):
         "failures": [],
         "circuit_breakers": [],
         "terminated": [],
+        "session_limit_hits": [],
     }
 
     blocking_file = None
@@ -106,6 +107,13 @@ def get_extraction_errors(log_lines):
 
         elif "Terminated" in line:
             errors["terminated"].append(line)
+
+        elif "session limit" in line.lower() or "hit your session limit" in line.lower():
+            for j in range(max(0, i - 8), i):
+                m = re.search(r'\] (.+\.txt)', log_lines[j])
+                if m:
+                    errors["session_limit_hits"].append(m.group(1))
+                    break
 
         i += 1
 
@@ -493,6 +501,39 @@ def diagnose(dry_run=False):
             diagnosis["recommendations"].append(
                 "Files with 3+ failures will be auto-skipped on next extraction run"
             )
+
+    # ─── Finding: Session limit wasted run ───
+
+    if ext_errors["session_limit_hits"]:
+        from collections import Counter
+        hit_counts = Counter(ext_errors["session_limit_hits"])
+        for fname, count in hit_counts.most_common():
+            finding = f"Session limit hit {count} time(s) on '{fname}' — wasted cold extraction window"
+            diagnosis["findings"].append(finding)
+            print(f"  FINDING: {finding}")
+
+            source_path = None
+            for docs_dir in all_docs_dirs():
+                candidate = docs_dir / fname
+                if candidate.exists():
+                    source_path = candidate
+                    break
+
+            if source_path and not dry_run:
+                size = source_path.stat().st_size
+                if size > 2_000_000:
+                    skip_path = source_path.with_suffix(source_path.suffix + ".skip")
+                    if not skip_path.exists():
+                        skip_path.write_text(json.dumps({
+                            "reason": "oversized_session_burner",
+                            "skipped_at": now.isoformat(),
+                            "skipped_by": "pipeline_doctor",
+                            "size_bytes": size,
+                            "session_limit_hits": count,
+                        }))
+                        fix = f"Skipped '{fname}' — {size:,} bytes, burned session limit {count} time(s)"
+                        diagnosis["fixes_applied"].append(fix)
+                        print(f"  FIX: {fix}")
 
     # ─── Finding: Auth broken ───
 
