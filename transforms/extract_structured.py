@@ -140,7 +140,7 @@ class AuthError(Exception):
 def _call_claude(prompt, max_retries=2, schema=None):
     """Call claude -p with retries. Returns (record, error_category) tuple.
 
-    On success: (dict, None). On failure: (None, "timeout"|"empty_output"|"json_parse"|"exit_code").
+    On success: (dict, None). On failure: (None, "timeout"|"empty_output"|"json_parse"|"exit_code"|"exit_code_empty").
     Raises RateLimitHit on session/rate limits and AuthError on 401/403.
     Uses subscription auth only — ANTHROPIC_API_KEY is stripped to avoid
     burning API credits on batch extraction.
@@ -158,26 +158,31 @@ def _call_claude(prompt, max_retries=2, schema=None):
                 env=env,
             )
 
-            combined_lower = (result.stderr + " " + result.stdout).lower()
-            if "session limit" in combined_lower or "rate limit" in combined_lower:
-                raise RateLimitHit((result.stderr.strip() or result.stdout.strip())[:200])
+            clean_out = _ANSI_RE.sub('', result.stdout)
+            clean_err = _ANSI_RE.sub('', result.stderr)
+            combined_lower = (clean_err + " " + clean_out).lower()
+            if "session limit" in combined_lower or "rate limit" in combined_lower or "you've reached" in combined_lower:
+                raise RateLimitHit((clean_err.strip() or clean_out.strip())[:200])
 
-            if "invalid authentication" in combined_lower or "401" in combined_lower or "403" in combined_lower:
-                raise AuthError(result.stderr.strip()[:200] or result.stdout.strip()[:200])
+            stderr_lower = clean_err.lower()
+            if "invalid authentication" in stderr_lower or "http 401" in stderr_lower or "http 403" in stderr_lower or "status 401" in stderr_lower or "status 403" in stderr_lower or ("401" in stderr_lower and "unauthorized" in stderr_lower) or ("403" in stderr_lower and "forbidden" in stderr_lower):
+                raise AuthError(clean_err.strip()[:200] or clean_out.strip()[:200])
 
             if result.returncode != 0:
+                if not clean_out.strip() and not clean_err.strip():
+                    return None, "exit_code_empty"
                 if attempt < max_retries:
                     print(f"  claude -p exit code {result.returncode}, retrying ({attempt+1}/{max_retries})...")
                     time.sleep(5 * (attempt + 1))
                     continue
                 print(f"  claude -p exit code {result.returncode}")
-                if result.stderr:
-                    print(f"  stderr: {result.stderr[:300]}")
-                if result.stdout:
-                    print(f"  stdout: {result.stdout[:300]}")
+                if clean_err:
+                    print(f"  stderr: {clean_err[:300]}")
+                if clean_out:
+                    print(f"  stdout: {clean_out[:300]}")
                 return None, "exit_code"
 
-            output = result.stdout.strip()
+            output = clean_out.strip()
             if not output:
                 if attempt < max_retries:
                     print(f"  empty output, retrying ({attempt+1}/{max_retries})...")
@@ -206,7 +211,7 @@ def _call_claude(prompt, max_retries=2, schema=None):
                         time.sleep(5)
                         continue
                     print(f"  JSON parse error: could not extract JSON")
-                    print(f"  Raw output ({len(result.stdout)} chars): {result.stdout[:500]}")
+                    print(f"  Raw output ({len(output)} chars): {output[:500]}")
                     return None, "json_parse"
 
             if isinstance(record, list):
@@ -302,6 +307,8 @@ def extract_structured(text, meeting_meta):
             records.append(record)
         elif err:
             last_error = err
+            if err == "exit_code_empty":
+                break
         time.sleep(1)
 
     merged = _merge_records(records)
@@ -635,7 +642,7 @@ def collect_all_sources(queue=None, hot_days=14):
         is_tally_only = cfg.get("tally_only", False)
         enabled_date = cfg.get("enabled_date", "")
 
-        if is_tally_only and queue:
+        if is_tally_only:
             continue
         for f in sorted(ddir.glob("*.txt"), reverse=True):
             if queue:
@@ -735,6 +742,8 @@ _SECTION_RE = _re.compile(
     r'OLD BUSINESS|ACTION ITEMS?|CLOSED SESSION)\s*$',
     _re.IGNORECASE,
 )
+
+_ANSI_RE = _re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
 
 
 def split_oversized_doc(source_path):
@@ -1075,6 +1084,13 @@ def cmd_extract(args):
             record_failure(failure_state, sf.name, error_cat, queue=queue)
             fc = failure_state[sf.name]["fail_count"]
             print(f"  FAILED ({error_cat or 'unknown'}, attempt {fc}/{MAX_FAIL_RETRIES})")
+
+            if error_cat == "exit_code_empty" and consecutive_failures >= 2:
+                remaining = len(to_process) - i - 1
+                print(f"\n  Likely session limit: {consecutive_failures} consecutive empty-output failures.")
+                print(f"  Stopping — run `claude -p \"test\"` to check session status.")
+                print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
+                break
 
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                 remaining = len(to_process) - i - 1
