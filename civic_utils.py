@@ -265,6 +265,39 @@ def _date_from_meeting_id(mid):
     return ""
 
 
+_TITLE_DATE_RE = re.compile(
+    r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s+(\d{4})"
+)
+_TITLE_DATE_RE2 = re.compile(r"(\d{1,2})/(\d{1,2})/(\d{4})")
+
+
+def _date_from_title(title):
+    """Parse date from meeting title like 'City Council Meeting 6:00 p.m. - Jun 24, 2026'."""
+    if not title:
+        return ""
+    m = _TITLE_DATE_RE.search(title)
+    if m:
+        months = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+                  "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+        mon = months.get(m.group(1), 0)
+        return f"{m.group(3)}-{mon:02d}-{int(m.group(2)):02d}"
+    m = _TITLE_DATE_RE2.search(title)
+    if m:
+        return f"{m.group(3)}-{int(m.group(1)):02d}-{int(m.group(2)):02d}"
+    return ""
+
+
+def _body_from_title(title):
+    """Extract body name from title like 'Regular City Council Meeting 6:00 p.m. - Jun 24, 2026'."""
+    if not title:
+        return ""
+    # Strip time and date suffix
+    body = re.split(r"\s+\d{1,2}:\d{2}\s*[ap]\.?m\.?", title, flags=re.IGNORECASE)[0]
+    # Strip prefixes like "Regular", "Special"
+    body = re.sub(r"^(Regular|Special|Joint|Adjourned)\s+", "", body, flags=re.IGNORECASE)
+    return body.strip(" -") or ""
+
+
 def rebuild_doc_index(slug, state, docs_dir):
     """Build doc-index.json mapping document filenames to meeting dates.
 
@@ -285,11 +318,13 @@ def rebuild_doc_index(slug, state, docs_dir):
             m = meetings[mid]
             date = normalize_date(m.get("date", ""))
             if not date:
+                date = _date_from_title(m.get("title", ""))
+            if not date:
                 date = _date_from_meeting_id(mid)
             if date:
                 documents[txt_file.name] = {
                     "meeting_date": date,
-                    "body": m.get("body", ""),
+                    "body": m.get("body", "") or _body_from_title(m.get("title", "")),
                 }
 
     index = {
