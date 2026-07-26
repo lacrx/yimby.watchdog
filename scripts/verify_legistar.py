@@ -91,6 +91,20 @@ def report_missing_meetings(legistar_meetings, state):
             missing_list.append(m)
             print(f"  {mid}: {m['body']} — {m['date']}")
         return missing_list
+
+    # Check for commission gap
+    legistar_bodies = {m["body"] for m in legistar_meetings.values()}
+    state_bodies = {m.get("body") for m in state.get("meetings", {}).values()}
+    known_commissions = state_bodies - legistar_bodies
+    if known_commissions:
+        print(f"\n=== Commission Gap ===")
+        print(f"Bodies in state.json but NOT on Legistar calendar:")
+        for b in sorted(known_commissions):
+            if b:
+                print(f"  - {b}")
+        print("These commissions may have been removed from Legistar's public calendar.")
+        print("Check if Oceanside moved them to a different system.")
+
     return []
 
 
