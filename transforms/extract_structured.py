@@ -343,7 +343,7 @@ def cmd_tally(args):
         window_months = 2
         cutoff = (datetime.now().date() - timedelta(days=window_months * 30)).isoformat()
 
-    all_sources = collect_all_sources()
+    all_sources = collect_all_sources(include_tally=True)
     if not all_sources:
         print("No sources found.")
         return
@@ -619,11 +619,12 @@ def load_doc_index():
     return index
 
 
-def collect_all_sources(queue=None, hot_days=14):
+def collect_all_sources(queue=None, hot_days=14, include_tally=False):
     """Collect raw source files, optionally filtered by queue.
 
     queue: None (all), "hot" (recent meetings), or "cold" (backlog).
     hot_days: days back from today that counts as "hot" (default 14).
+    include_tally: include tally-only agencies (for cost projection, not extraction).
 
     forward_only agencies use enabled_date as cutoff for hot queue;
     cold queue includes their full backlog.
@@ -642,7 +643,7 @@ def collect_all_sources(queue=None, hot_days=14):
         is_tally_only = cfg.get("tally_only", False)
         enabled_date = cfg.get("enabled_date", "")
 
-        if is_tally_only:
+        if is_tally_only and not include_tally:
             continue
         for f in sorted(ddir.glob("*.txt"), reverse=True):
             if queue:
