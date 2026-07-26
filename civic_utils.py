@@ -303,6 +303,10 @@ def rebuild_doc_index(slug, state, docs_dir):
 
     Called at end of each scraper's cmd_fetch(). Uses meeting_id prefix
     matching against on-disk .txt files.
+
+    Date priority: extraction-derived date (from structured/*.json) is primary
+    as meeting_date. Legistar/scraper date kept as filed_date for provenance.
+    Falls back to filed_date when no extraction exists.
     """
     meetings = state.get("meetings", {})
     meeting_ids = list(meetings.keys())
@@ -312,20 +316,30 @@ def rebuild_doc_index(slug, state, docs_dir):
     if not docs_path.exists():
         return 0
 
+    structured_dir = DATA_DIR / "structured"
+    extraction_dates = _load_extraction_dates(structured_dir)
+
     for txt_file in docs_path.glob("*.txt"):
         mid = _match_meeting_id(txt_file.name, meeting_ids)
         if mid and mid in meetings:
             m = meetings[mid]
-            date = normalize_date(m.get("date", ""))
-            if not date:
-                date = _date_from_title(m.get("title", ""))
-            if not date:
-                date = _date_from_meeting_id(mid)
-            if date:
-                documents[txt_file.name] = {
-                    "meeting_date": date,
-                    "body": m.get("body", "") or _body_from_title(m.get("title", "")),
-                }
+            filed_date = normalize_date(m.get("date", ""))
+            if not filed_date:
+                filed_date = _date_from_title(m.get("title", ""))
+            if not filed_date:
+                filed_date = _date_from_meeting_id(mid)
+            if not filed_date:
+                continue
+
+            stem = txt_file.name[:-4] if txt_file.name.endswith(".txt") else txt_file.name
+            ext_date = extraction_dates.get(stem, "")
+
+            entry = {
+                "meeting_date": ext_date if ext_date else filed_date,
+                "filed_date": filed_date,
+                "body": m.get("body", "") or _body_from_title(m.get("title", "")),
+            }
+            documents[txt_file.name] = entry
 
     index = {
         "_generated": datetime.now().isoformat(timespec="seconds"),
@@ -335,6 +349,25 @@ def rebuild_doc_index(slug, state, docs_dir):
     index_path = agency_data_dir(slug) / "doc-index.json"
     save_json(index_path, index)
     return len(documents)
+
+
+def _load_extraction_dates(structured_dir):
+    """Load date fields from extraction JSONs. Returns {stem: YYYY-MM-DD}."""
+    dates = {}
+    if not structured_dir.exists():
+        return dates
+    for json_file in structured_dir.glob("*.json"):
+        if json_file.name in ("extraction-state.json", "meetings-state.json", "document-dates.json"):
+            continue
+        try:
+            record = json.loads(json_file.read_text())
+            if isinstance(record, dict) and "date" in record:
+                d = record["date"]
+                if d and re.match(r"^\d{4}-\d{2}-\d{2}$", str(d)):
+                    dates[json_file.stem] = str(d)
+        except (json.JSONDecodeError, Exception):
+            continue
+    return dates
 
 
 DISCOVERY_LOG = DATA_DIR / "pipeline" / "discovery.jsonl"
