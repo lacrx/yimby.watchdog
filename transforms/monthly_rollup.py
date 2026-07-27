@@ -121,6 +121,43 @@ def load_permits_by_month():
     return by_month
 
 
+def _load_permits_by_date_field(date_field):
+    """Load housing permits grouped by a specific date field (applied/approved/issued)."""
+    by_month = defaultdict(list)
+    agencies = load_agencies(enabled_only=True)
+    for slug, cfg in agencies.items():
+        if "permits" not in cfg:
+            continue
+        permits_dir = agency_data_dir(slug) / "permits"
+        if not permits_dir.exists():
+            continue
+        for pf in sorted(permits_dir.glob("etrakit-permits-*.jsonl")):
+            try:
+                with open(pf) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        r = json.loads(line)
+                        ptype = r.get("type", "")
+                        if ptype not in HOUSING_PERMIT_TYPES:
+                            continue
+                        month = parse_date_to_month(r.get(date_field, ""))
+                        if month:
+                            by_month[month].append(r)
+            except (json.JSONDecodeError, Exception):
+                continue
+    return by_month
+
+
+def load_permits_approved_by_month():
+    return _load_permits_by_date_field("approved")
+
+
+def load_permits_issued_by_month():
+    return _load_permits_by_date_field("issued")
+
+
 def load_planning_by_month():
     """Load planning projects from all agencies, grouped by month. Only housing-relevant types."""
     by_month = defaultdict(list)
@@ -233,7 +270,8 @@ def summarize_permits(permits):
     }
 
 
-def merge_month(month, meetings, permits, intel, project_index=None, planning=None):
+def merge_month(month, meetings, permits, intel, project_index=None, planning=None,
+                permits_approved=None, permits_issued=None):
     """Merge all data sources for a month into one digest."""
     bodies = set()
     agencies = set()
@@ -311,6 +349,12 @@ def merge_month(month, meetings, permits, intel, project_index=None, planning=No
                 )
         digest["permits"] = permit_summary
 
+    if permits_approved:
+        digest["permits_approved"] = summarize_permits(permits_approved)
+
+    if permits_issued:
+        digest["permits_issued"] = summarize_permits(permits_issued)
+
     if intel:
         digest["intel"] = [
             {
@@ -338,6 +382,8 @@ def merge_month(month, meetings, permits, intel, project_index=None, planning=No
     digest["_source_hash"] = content_hash({
         "meetings": [(r.get("meeting_id"), r.get("source_count")) for r in meetings],
         "permits": len(permits),
+        "permits_approved": len(permits_approved or []),
+        "permits_issued": len(permits_issued or []),
         "planning": len(planning or []),
         "intel": len(intel),
         "meeting_content": content_hash(meetings),
@@ -371,6 +417,8 @@ def cmd_rollup(args):
 
     meetings_by_month = load_meetings_by_month()
     permits_by_month = load_permits_by_month()
+    approved_by_month = load_permits_approved_by_month()
+    issued_by_month = load_permits_issued_by_month()
     planning_by_month = load_planning_by_month()
     intel_by_month = load_intel_by_month()
     project_index, _ = load_projects()
@@ -378,16 +426,20 @@ def cmd_rollup(args):
     all_months = sorted(set(
         list(meetings_by_month.keys()) +
         list(permits_by_month.keys()) +
+        list(approved_by_month.keys()) +
+        list(issued_by_month.keys()) +
         list(planning_by_month.keys()) +
         list(intel_by_month.keys())
     ))
 
     m_count = sum(len(v) for v in meetings_by_month.values())
     p_count = sum(len(v) for v in permits_by_month.values())
+    a_count = sum(len(v) for v in approved_by_month.values())
+    is_count = sum(len(v) for v in issued_by_month.values())
     pl_count = sum(len(v) for v in planning_by_month.values())
     i_count = sum(len(v) for v in intel_by_month.values())
     proj_str = f", {len(project_index)} permit→project mappings" if project_index else ""
-    print(f"Loaded {m_count} meetings, {p_count} permits, {pl_count} planning, {i_count} intel items across {len(all_months)} months{proj_str}")
+    print(f"Loaded {m_count} meetings, {p_count} filed/{a_count} approved/{is_count} issued permits, {pl_count} planning, {i_count} intel across {len(all_months)} months{proj_str}")
 
     if args.month:
         if args.month not in all_months:
@@ -401,10 +453,13 @@ def cmd_rollup(args):
     for month in all_months:
         meetings = meetings_by_month.get(month, [])
         permits = permits_by_month.get(month, [])
+        p_approved = approved_by_month.get(month, [])
+        p_issued = issued_by_month.get(month, [])
         planning = planning_by_month.get(month, [])
         intel = intel_by_month.get(month, [])
 
-        digest = merge_month(month, meetings, permits, intel, project_index, planning)
+        digest = merge_month(month, meetings, permits, intel, project_index, planning,
+                             p_approved, p_issued)
 
         out_path = MONTHLY_DIR / f"{month}.json"
         if out_path.exists() and not args.force and not args.month:
@@ -421,7 +476,11 @@ def cmd_rollup(args):
 
         parts = [f"{digest['substantive_count']} meetings"]
         if permits:
-            parts.append(f"{digest['permits']['total']} permits")
+            parts.append(f"{digest['permits']['total']} filed")
+        if p_approved:
+            parts.append(f"{len(p_approved)} approved")
+        if p_issued:
+            parts.append(f"{len(p_issued)} issued")
         if planning:
             parts.append(f"{len(planning)} planning")
         if intel:
@@ -448,11 +507,13 @@ def cmd_stats(args):
     total_housing = 0
     total_legal = 0
     total_meetings = 0
-    total_permits = 0
+    total_filed = 0
+    total_approved = 0
+    total_issued = 0
     total_planning = 0
 
-    print(f"{'Month':8s} {'Mtgs':>5s} {'Subst':>6s} {'Votes':>6s} {'Housing':>8s} {'Legal':>6s} {'Permits':>8s} {'Plan':>6s}")
-    print("-" * 68)
+    print(f"{'Month':8s} {'Mtgs':>5s} {'Votes':>6s} {'Housing':>8s} {'Filed':>6s} {'Appvd':>6s} {'Issued':>7s} {'Plan':>6s}")
+    print("-" * 62)
 
     for df in digests:
         d = json.loads(df.read_text())
@@ -460,21 +521,24 @@ def cmd_stats(args):
         housing = len(d.get("housing_items", []))
         legal = len(d.get("legal_flags", []))
         meetings = d.get("meeting_count", d.get("record_count", 0))
-        subst = d.get("substantive_count", 0)
-        permits = d.get("permits", {}).get("total", 0)
+        filed = d.get("permits", {}).get("total", 0)
+        approved = d.get("permits_approved", {}).get("total", 0)
+        issued = d.get("permits_issued", {}).get("total", 0)
         planning = d.get("planning_projects", {}).get("total", 0)
 
         total_votes += votes
         total_housing += housing
         total_legal += legal
         total_meetings += meetings
-        total_permits += permits
+        total_filed += filed
+        total_approved += approved
+        total_issued += issued
         total_planning += planning
 
-        print(f"{d['month']:8s} {meetings:5d} {subst:6d} {votes:6d} {housing:8d} {legal:6d} {permits:8d} {planning:6d}")
+        print(f"{d['month']:8s} {meetings:5d} {votes:6d} {housing:8d} {filed:6d} {approved:6d} {issued:7d} {planning:6d}")
 
-    print("-" * 68)
-    print(f"{'TOTAL':8s} {total_meetings:5d} {'':6s} {total_votes:6d} {total_housing:8d} {total_legal:6d} {total_permits:8d} {total_planning:6d}")
+    print("-" * 62)
+    print(f"{'TOTAL':8s} {total_meetings:5d} {total_votes:6d} {total_housing:8d} {total_filed:6d} {total_approved:6d} {total_issued:7d} {total_planning:6d}")
     print(f"\n{len(digests)} monthly digests")
 
 
@@ -494,12 +558,16 @@ def main():
         MONTHLY_DIR.mkdir(parents=True, exist_ok=True)
         meetings_by_month = load_meetings_by_month()
         permits_by_month = load_permits_by_month()
+        approved_by_month = load_permits_approved_by_month()
+        issued_by_month = load_permits_issued_by_month()
         planning_by_month = load_planning_by_month()
         intel_by_month = load_intel_by_month()
         project_index, _ = load_projects()
         all_months = sorted(set(
             list(meetings_by_month.keys()) +
             list(permits_by_month.keys()) +
+            list(approved_by_month.keys()) +
+            list(issued_by_month.keys()) +
             list(planning_by_month.keys()) +
             list(intel_by_month.keys())
         ))
@@ -512,6 +580,8 @@ def main():
                 intel_by_month.get(month, []),
                 project_index,
                 planning_by_month.get(month, []),
+                approved_by_month.get(month, []),
+                issued_by_month.get(month, []),
             )
             out_path = MONTHLY_DIR / f"{month}.json"
             if not out_path.exists():
