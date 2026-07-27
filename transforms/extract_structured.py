@@ -64,7 +64,7 @@ EXTRACTION_SCHEMA = {
                   "votes", "housing_items", "fiscal_items", "legal_flags",
                   "council_positions", "public_comments", "key_quotes",
                   "procedural_only"],
-    "additionalProperties": False,
+    "additionalProperties": True,
 }
 
 EXTRACTION_PROMPT = f"""Extract structured data from this raw local government document. Return ONLY valid JSON, no markdown fencing, no explanation.
@@ -77,17 +77,17 @@ Schema:
   "agency": "string — the agency or jurisdiction name from the document",
   "doc_type": "agenda | minutes | staff_report | transcript | agenda_packet",
   "votes": [
-    {{"item": "description", "result": "approved 4-1 | denied | tabled | continued", "yes": ["names"], "no": ["names"], "abstain": ["names"]}}
+    {{"item_id": "agenda item number or short label (e.g. 'item-7', 'PH-1')", "item": "description", "result": "approved 4-1 | denied | tabled | continued", "yes": ["names"], "no": ["names"], "abstain": ["names"]}}
   ],
   "housing_items": [
-    {{"type": "zoning | density | permit | affordable | adu | transit_oriented | state_compliance", "description": "...", "address": "if mentioned", "units": null_or_number, "outcome": "approved | denied | continued | discussed", "state_law_flags": ["{_state_law_flags_str}"]}}
+    {{"item_id": "same label as matching vote if voted on", "type": "zoning | density | permit | affordable | adu | transit_oriented | state_compliance", "description": "...", "address": "if mentioned", "units": null_or_number, "outcome": "approved | denied | continued | discussed", "filing_numbers": ["D26-00001", "BLDG26-0001"], "applicant": "developer or applicant name if mentioned", "state_law_flags": ["{_state_law_flags_str}"]}}
   ],
   "fiscal_items": [
     {{"description": "...", "amount": null_or_number, "type": "infrastructure | bond | contract | grant | fee"}}
   ],
   "legal_flags": ["string — any potential state law violation, enforcement action, or litigation risk"],
   "council_positions": [
-    {{"member": "name", "action": "voted yes | voted no | abstained | moved | seconded | spoke for | spoke against | amended", "on": "item description", "evidence": "verbatim quote or factual description of what they did"}}
+    {{"item_id": "same label as matching vote/housing_item", "member": "name", "action": "voted yes | voted no | abstained | moved | seconded | spoke for | spoke against | amended", "on": "item description", "evidence": "verbatim quote or factual description of what they did"}}
   ],
   "public_comments": ["public comments mentioning specific agenda items, policies, or legal standards"],
   "key_quotes": ["direct quotes from officials or public — verbatim text only"],
@@ -98,6 +98,9 @@ Rules:
 - If the document is purely procedural (roll call, adjournment, consent calendar with nothing notable), set procedural_only: true and leave arrays empty.
 - Only include names that appear BY NAME in the document text. Never invent or guess names.
 - For council_positions: record what each named member DID (motion, vote, statement, question), not your assessment of their political orientation. Use exact words in evidence when available.
+- When a vote, housing_item, and/or council_position refer to the same agenda item, give them the same item_id value. Derive item_id from the agenda item number in the document (e.g. "item-7", "PH-1", "H-2").
+- filing_numbers: extract planning case numbers (D26-00001, CUP24-00003, DB25-00012, ZA25-00001, etc.) and building permit numbers (BLDG26-0001) mentioned in each housing item. Omit the field if none are mentioned.
+- applicant: extract the developer or applicant name if mentioned. Omit if not mentioned.
 - Empty arrays are fine — don't pad with empty objects.
 - Dates must be YYYY-MM-DD format.
 - Extract ALL votes, housing items, and dollar amounts — do not summarize or omit.

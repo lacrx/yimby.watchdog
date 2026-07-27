@@ -179,9 +179,17 @@ def build_meeting_index(meeting_items):
     by_ref = defaultdict(list)
     by_addr = defaultdict(list)
     for item in meeting_items:
+        seen_refs = set()
+        for ref in item.get("filing_numbers", []):
+            ref = ref.strip().upper()
+            if ref and ref not in seen_refs:
+                by_ref[ref].append(item)
+                seen_refs.add(ref)
         desc = item.get("description", "")
         for ref in PROJECT_REF_RE.findall(desc):
-            by_ref[ref].append(item)
+            if ref not in seen_refs:
+                by_ref[ref].append(item)
+                seen_refs.add(ref)
         addr = _normalize_addr(item.get("address") or "")
         if addr:
             street_num = _extract_street_number(addr)
@@ -312,9 +320,7 @@ def _addr_match(a, b):
 
 # ── Status & Units ──
 
-def derive_status(permit_statuses, planning_statuses):
-    if not permit_statuses and not planning_statuses:
-        return "planning"
+def derive_status(permit_statuses, planning_statuses, meeting_outcomes=None):
     if permit_statuses:
         s = set(permit_statuses)
         if "FINALED" in s:
@@ -328,6 +334,10 @@ def derive_status(permit_statuses, planning_statuses):
         return "permitted"
     if any("APPROVED" in (s or "").upper() for s in planning_statuses):
         return "entitled"
+    if meeting_outcomes and any(o == "approved" for o in meeting_outcomes):
+        return "entitled"
+    if not permit_statuses and not planning_statuses:
+        return "planning"
     return "planning"
 
 
@@ -408,6 +418,7 @@ def build_all():
         permit_statuses = []
         for status, count in (pp.get("status_breakdown") or {}).items():
             permit_statuses.extend([status] * count)
+        mtg_outcomes = [item.get("outcome", "") for item, _ in mtg_matches]
 
         units = reconcile_units(
             [r for r, _ in apr_matches],
@@ -429,7 +440,7 @@ def build_all():
             "is_downtown": location.get("is_downtown", False),
             "units": units,
             "income_tiers": income_tiers_from_apr([r for r, _ in apr_matches]),
-            "status": derive_status(permit_statuses, plan_statuses),
+            "status": derive_status(permit_statuses, plan_statuses, mtg_outcomes),
             "density_bonus": any(
                 (r.get("density_bonus_received") or "").lower() == "yes"
                 for r, _ in apr_matches
@@ -459,7 +470,8 @@ def build_all():
                 ],
                 "meeting_mentions": [
                     {"meeting_id": item["meeting_id"], "date": item.get("date", ""),
-                     "type": item.get("type", ""), "match_method": method}
+                     "type": item.get("type", ""), "outcome": item.get("outcome", ""),
+                     "match_method": method}
                     for item, method in mtg_matches
                 ],
             },
@@ -540,7 +552,9 @@ def build_all():
             "is_downtown": False,
             "units": units,
             "income_tiers": income_tiers_from_apr([r for r, _ in apr_matches]),
-            "status": "entitled" if has_approved else "planning",
+            "status": "entitled" if has_approved or any(
+                item.get("outcome") == "approved" for item, _ in mtg_matches
+            ) else "planning",
             "density_bonus": has_db,
             "sb35": False,
             "first_activity": min(all_applied) if all_applied else None,
@@ -560,7 +574,8 @@ def build_all():
                 ],
                 "meeting_mentions": [
                     {"meeting_id": item["meeting_id"], "date": item.get("date", ""),
-                     "type": item.get("type", ""), "match_method": method}
+                     "type": item.get("type", ""), "outcome": item.get("outcome", ""),
+                     "match_method": method}
                     for item, method in mtg_matches
                 ],
             },

@@ -320,6 +320,7 @@ def build_housing_projects_table(parcel_addrs=None, parcel_zones=None):
         "first_activity": [], "last_activity": [],
         "permit_count": [], "planning_refs": [],
         "apr_tracking_ids": [], "meeting_mention_count": [],
+        "latest_meeting_outcome": [], "latest_meeting_date": [],
     }
 
     addr_resolved = 0
@@ -379,7 +380,12 @@ def build_housing_projects_table(parcel_addrs=None, parcel_zones=None):
         apr_ids = [a.get("tracking_id", "") for a in src.get("apr_filings", [])]
         columns["apr_tracking_ids"].append(",".join(apr_ids) if apr_ids else "")
 
-        columns["meeting_mention_count"].append(len(src.get("meeting_mentions", [])))
+        mentions = src.get("meeting_mentions", [])
+        columns["meeting_mention_count"].append(len(mentions))
+        dated = [m for m in mentions if m.get("date")]
+        latest = max(dated, key=lambda m: m["date"]) if dated else {}
+        columns["latest_meeting_outcome"].append(latest.get("outcome", ""))
+        columns["latest_meeting_date"].append(latest.get("date", ""))
 
     if addr_resolved:
         print(f"  Housing projects: {addr_resolved} addresses resolved via parcel APN join")

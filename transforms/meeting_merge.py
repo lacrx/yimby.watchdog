@@ -290,11 +290,11 @@ def merge_records(meeting_id, records, doc_dates=None):
     all_comments = _dedup(all_comments)
     all_quotes = _dedup(all_quotes)
 
-    # Deduplicate votes by item description
+    # Deduplicate votes by item_id (preferred) or item description
     seen_votes = set()
     deduped_votes = []
     for v in all_votes:
-        key = v.get("item", "").lower().strip()[:80]
+        key = v.get("item_id") or v.get("item", "").lower().strip()[:80]
         if key and key not in seen_votes:
             seen_votes.add(key)
             deduped_votes.append(v)
