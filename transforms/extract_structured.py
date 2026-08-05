@@ -21,6 +21,7 @@ Combined: data/structured/all-records.jsonl (one line per record, for bulk reads
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -104,6 +105,7 @@ Rules:
 - Empty arrays are fine — don't pad with empty objects.
 - Dates must be YYYY-MM-DD format.
 - Extract ALL votes, housing items, and dollar amounts — do not summarize or omit.
+- EXCLUDE state legislature activity: agenda packets often contain legislative tracking tables listing state bill status (AB/SB numbers with Assembly/Senate committee votes). These are NOT local board votes. Only record votes taken by the local body itself. Indicators of state-level activity to exclude: bill numbers (AB ###, SB ###) as the primary subject with no local action (adopt/oppose/support resolution), vote tallies exceeding the board's size, references to Assembly/Senate committees.
 - Return ONLY the JSON object. No other text.
 
 Document text:
@@ -275,6 +277,45 @@ def _merge_records(records):
     return merged
 
 
+_STATE_BILL_RE = re.compile(r'^(AB|SB)\s*\d{2,5}\b', re.IGNORECASE)
+_LOCAL_ACTION_RE = re.compile(
+    r'oppose|support|implement|ordinance|resolution to|position on|'
+    r'continued determination|teleconference|remote meeting|adopt', re.IGNORECASE)
+
+
+def _sanitize_state_legislature_votes(record):
+    """Remove votes that are state legislature activity, not local board actions."""
+    votes = record.get("votes", [])
+    if not votes:
+        return record
+    cleaned = []
+    removed_ids = set()
+    for v in votes:
+        item = v.get("item", "")
+        if not _STATE_BILL_RE.match(item.strip()):
+            cleaned.append(v)
+            continue
+        if _LOCAL_ACTION_RE.search(item):
+            cleaned.append(v)
+            continue
+        result = v.get("result", "")
+        result_match = re.search(r'(\d+)-(\d+)', result)
+        result_total = int(result_match.group(1)) + int(result_match.group(2)) if result_match else 0
+        total_voters = len(v.get("yes", [])) + len(v.get("no", [])) + len(v.get("abstain", []))
+        if result_total > 20 or total_voters == 0:
+            if v.get("item_id"):
+                removed_ids.add(v["item_id"])
+            continue
+        cleaned.append(v)
+    if len(cleaned) < len(votes):
+        record["votes"] = cleaned
+        if removed_ids:
+            record["council_positions"] = [
+                cp for cp in record.get("council_positions", [])
+                if cp.get("item_id") not in removed_ids]
+    return record
+
+
 def extract_structured(text, meeting_meta):
     """Extract structured JSON from document text, chunking if large.
 
@@ -305,7 +346,18 @@ def extract_structured(text, meeting_meta):
     last_error = None
     for ci, chunk in enumerate(chunks):
         prompt = EXTRACTION_PROMPT + meta_context + "\n" + chunk
-        record, err = _call_claude(prompt, schema=EXTRACTION_SCHEMA)
+        try:
+            record, err = _call_claude(prompt, schema=EXTRACTION_SCHEMA)
+        except RateLimitHit as rl:
+            if records:
+                merged = _merge_records(records)
+                if merged:
+                    merged["_partial"] = True
+                    merged["_chunks_completed"] = ci
+                    merged["_chunks_total"] = len(chunks)
+                    rl.partial_result = merged
+                    print(f"  Rate limit at chunk {ci+1}/{len(chunks)}, {len(records)} partial chunks salvaged")
+            raise
         if record:
             records.append(record)
         elif err:
@@ -584,8 +636,11 @@ def rebuild_combined(structured_dir):
     """Rebuild the combined JSONL file from individual records."""
     jsonl_path = structured_dir / "all-records.jsonl"
     records = []
+    doc_index = load_doc_index()
+    backfilled = 0
 
-    skip_files = {"extraction-state.json", "meetings-state.json", "document-dates.json"}
+    skip_files = {"extraction-state.json", "meetings-state.json", "document-dates.json",
+                  "extraction-failures.json"}
     for json_file in sorted(structured_dir.glob("*.json")):
         if json_file.name in skip_files:
             continue
@@ -593,6 +648,12 @@ def rebuild_combined(structured_dir):
             record = json.loads(json_file.read_text())
             if not isinstance(record, dict) or "votes" not in record:
                 continue
+            if not record.get("date") and record.get("_source"):
+                idx_date = doc_index.get(record["_source"], "")
+                if idx_date:
+                    record["date"] = idx_date
+                    json_file.write_text(json.dumps(record, indent=2, default=str))
+                    backfilled += 1
             records.append(record)
         except (json.JSONDecodeError, Exception):
             continue
@@ -602,7 +663,8 @@ def rebuild_combined(structured_dir):
         for r in records:
             f.write(json.dumps(r, default=str) + "\n")
 
-    print(f"Combined JSONL: {len(records)} records → {jsonl_path}")
+    backfill_msg = f" ({backfilled} dates backfilled)" if backfilled else ""
+    print(f"Combined JSONL: {len(records)} records → {jsonl_path}{backfill_msg}")
     return len(records)
 
 
@@ -838,6 +900,43 @@ def split_oversized_doc(source_path):
     return parts_written
 
 
+def presplit_oversized(sources):
+    """Pre-split oversized documents before extraction starts.
+
+    Runs before the main loop so parts enter the queue immediately
+    instead of waiting for the next run.
+    """
+    skip_names = ["project_plans", "environmental_doc", "pavement",
+                  "plan_set", "architectural", "traffic_study",
+                  "transportation_assessment", "geotechnical"]
+    split_count = 0
+    for source_type, sf in sources:
+        if has_skip_marker(sf):
+            continue
+        try:
+            size = sf.stat().st_size
+        except OSError:
+            continue
+        if size <= MAX_DOC_CHARS:
+            continue
+        try:
+            text = sf.read_text()
+        except OSError:
+            continue
+        stripped = text.strip()
+        if len(stripped) <= MAX_DOC_CHARS:
+            continue
+        name_lower = sf.name.lower()
+        if any(s in name_lower for s in skip_names):
+            write_skip_marker(sf, "oversized_non_meeting")
+            print(f"  Pre-skip: {sf.name} (oversized non-meeting, {len(stripped):,} chars)")
+        else:
+            parts = split_oversized_doc(sf)
+            print(f"  Pre-split: {sf.name} -> {parts} parts ({len(stripped):,} chars)")
+            split_count += 1
+    return split_count
+
+
 def _failure_state_path():
     return STRUCTURED_DIR / "extraction-failures.json"
 
@@ -881,6 +980,13 @@ def cmd_extract(args):
 
     all_sources = collect_all_sources(queue=queue, hot_days=hot_days)
 
+    # Pre-split oversized docs from ALL queues so they don't accumulate
+    all_for_presplit = collect_all_sources(queue=None, hot_days=hot_days) if queue else all_sources
+    split_count = presplit_oversized(all_for_presplit)
+    if split_count:
+        print(f"  Pre-split {split_count} oversized doc(s), re-scanning...")
+        all_sources = collect_all_sources(queue=queue, hot_days=hot_days)
+
     if not all_sources:
         queue_label = f" ({queue})" if queue else ""
         print(f"No source files found{queue_label}. Run fetch first.")
@@ -911,6 +1017,8 @@ def cmd_extract(args):
 
     if skipped_markers:
         print(f"  {skipped_markers} sources permanently skipped (.skip marker)")
+
+    to_process.sort(key=lambda x: x[1].stat().st_size)
 
     if args.dry_run:
         already = len(all_sources) - len(to_process) - skipped_markers
@@ -947,7 +1055,9 @@ def cmd_extract(args):
     if use_triage:
         print("  Triage enabled (rule-based substantive filter)")
 
+    doc_index = load_doc_index()
     failure_state = load_failure_state()
+    rate_limited = False
     stop_hour = getattr(args, "stop_at", None)
     print(f"Extracting structured data: {len(to_process)} sources to process")
     if stop_hour:
@@ -1001,8 +1111,18 @@ def cmd_extract(args):
                 skipped += 1
                 print(f"  Skipping permanently: oversized non-meeting ({len(text.strip()):,} chars)")
             else:
-                parts = split_oversized_doc(sf)
-                print(f"  Split into {parts} parts ({len(text.strip()):,} chars) — parts enter queue next run")
+                parts_written = split_oversized_doc(sf)
+                print(f"  Split into {parts_written} parts ({len(text.strip()):,} chars)")
+                # Add split parts to current run queue
+                parent = sf.parent
+                for idx in range(1, parts_written + 1):
+                    part_path = parent / f"{sf.stem}-part{idx:02d}.txt"
+                    if part_path.exists():
+                        part_out = STRUCTURED_DIR / f"{part_path.stem}.json"
+                        if not part_out.exists():
+                            to_process.append((source_type, part_path, part_out))
+                if parts_written:
+                    to_process[i+1:] = sorted(to_process[i+1:], key=lambda x: x[1].stat().st_size)
             i += 1
             continue
         elif skip_reason:
@@ -1040,6 +1160,17 @@ def cmd_extract(args):
             print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
             break
         except RateLimitHit as e:
+            partial = getattr(e, 'partial_result', None)
+            if partial:
+                if not partial.get("meeting_id"):
+                    mid = sf.stem.replace("-transcript", "").split("-")[0]
+                    partial["meeting_id"] = mid
+                partial["_source"] = sf.name
+                partial["_source_type"] = source_type
+                out_path.write_text(json.dumps(partial, indent=2, default=str))
+                success += 1
+                print(f"  Saved partial extraction ({len(partial.get('votes',[]))}v {len(partial.get('housing_items',[]))}h)")
+
             remaining = len(to_process) - i
             msg = str(e).lower()
             # Parse reset time from "resets 6am" style messages
@@ -1068,14 +1199,20 @@ def cmd_extract(args):
             print(f"\n  Rate limit hit: {e}")
             print(f"  Stopping — {remaining} sources remaining, will resume next run.")
             print(f"  ({success} extracted, {failed} failed, {skipped} skipped this run)")
+            rate_limited = True
             break
 
         if record:
             if not record.get("meeting_id"):
                 mid = sf.stem.replace("-transcript", "").split("-")[0]
                 record["meeting_id"] = mid
+            if not record.get("date"):
+                idx_date = doc_index.get(sf.name, "")
+                if idx_date:
+                    record["date"] = idx_date
             record["_source"] = sf.name
             record["_source_type"] = source_type
+            record = _sanitize_state_legislature_votes(record)
 
             out_path.write_text(json.dumps(record, indent=2, default=str))
             success += 1
@@ -1115,6 +1252,9 @@ def cmd_extract(args):
 
     if success > 0:
         rebuild_combined(STRUCTURED_DIR)
+
+    if rate_limited:
+        sys.exit(2)
 
 
 def cmd_stats(args):
