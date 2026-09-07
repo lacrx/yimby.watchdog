@@ -307,7 +307,8 @@ def cmd_fetch(args):
                 new_count += 1
                 print(f"    NEW: {meta['body']} — {meta['date']}")
 
-            if mid in state["meetings"] and not args.deep:
+            has_docs = any(f.name.startswith(mid) for f in docs_dir.glob(f"{mid}-*.txt"))
+            if mid in state["meetings"] and has_docs and not args.deep:
                 continue
 
             docs = item["docs"]
@@ -360,7 +361,8 @@ def cmd_fetch(args):
             new_count += 1
             print(f"    NEW: {meeting['body']} — {meeting['date'].strftime('%Y-%m-%d')}")
 
-        if mid in state["meetings"] and not args.deep:
+        has_docs = any(f.name.startswith(mid) for f in docs_dir.glob(f"{mid}-*.txt"))
+        if mid in state["meetings"] and has_docs and not args.deep:
             continue
 
         for doc in meeting["docs"]:
