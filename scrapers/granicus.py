@@ -121,6 +121,72 @@ def parse_rss(xml_text, cutoff_date=None):
     return items
 
 
+def fetch_viewpublisher_html(base_url, view_id, cutoff_date=None):
+    """Scrape ViewPublisher HTML page for archived meetings beyond RSS cap."""
+    start = cutoff_date.strftime("%Y-%m-%d") if cutoff_date else "2010-01-01"
+    end = datetime.now().strftime("%Y-%m-%d")
+    url = f"{base_url}/ViewPublisher.php?view_id={view_id}&clip_id=0&range=custom&start_date={start}&end_date={end}"
+
+    resp = requests.get(url, timeout=120, headers={"User-Agent": USER_AGENT})
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    items = []
+    seen_ids = set()
+    current_body = None
+
+    for el in soup.find_all(["h2", "a"]):
+        if el.name == "h2":
+            text = el.get_text(strip=True)
+            if text not in ("Upcoming Events", "Archived Meetings"):
+                current_body = text
+            continue
+
+        href = el.get("href", "")
+        if "AgendaViewer" not in href:
+            continue
+
+        mid = meeting_id_from_link(href)
+        if mid in seen_ids:
+            continue
+        seen_ids.add(mid)
+
+        # Walk up to the table-row to get date
+        row = el.find_parent("li", class_="table-row")
+        date_text = ""
+        dt = None
+        if row:
+            date_cell = row.find("div", class_=re.compile(r"date"))
+            if date_cell:
+                date_text = date_cell.get_text(strip=True)
+
+        if date_text:
+            date_text = re.sub(r'\s+', ' ', date_text.replace('\xa0', ' ')).strip()
+            dt = parse_date_from_title(date_text)
+
+        if cutoff_date and dt and dt < cutoff_date:
+            continue
+
+        link_url = href if href.startswith("http") else f"https:{href}"
+        body = current_body or ""
+        if not body and row:
+            name_cell = row.find("div", class_=re.compile(r"name"))
+            if name_cell:
+                body = extract_body_from_title(name_cell.get_text(strip=True))
+        title = f"{body} - {date_text}" if body and date_text else body or date_text
+
+        items.append({
+            "title": title,
+            "link": link_url,
+            "guid": "",
+            "date": dt,
+            "body": body,
+            "meeting_id": mid,
+        })
+
+    return items
+
+
 def extract_pdf_links_from_agenda(agenda_url, base_url):
     """Scrape AgendaViewer page for PDF download links."""
     resp = requests.get(agenda_url, timeout=30, headers={"User-Agent": USER_AGENT})
@@ -195,6 +261,17 @@ def cmd_fetch(args):
     xml_text = fetch_rss(base_url, view_id)
     items = parse_rss(xml_text, cutoff_date=cutoff)
     print(f"  {len(items)} meetings in RSS feed (after {cutoff.strftime('%Y-%m-%d')} cutoff)")
+
+    # RSS feeds are capped (~100 items). For deep historical fetches,
+    # supplement with HTML scraping of the ViewPublisher archive page.
+    rss_ids = {it["meeting_id"] for it in items}
+    oldest_rss = min((it["date"] for it in items if it["date"]), default=None)
+    if oldest_rss and cutoff < oldest_rss:
+        print(f"  RSS oldest: {oldest_rss.strftime('%Y-%m-%d')}, cutoff: {cutoff.strftime('%Y-%m-%d')} — fetching HTML archive...")
+        html_items = fetch_viewpublisher_html(base_url, view_id, cutoff_date=cutoff)
+        new_from_html = [it for it in html_items if it["meeting_id"] not in rss_ids]
+        print(f"  {len(html_items)} meetings in HTML archive, {len(new_from_html)} beyond RSS")
+        items.extend(new_from_html)
 
     new_count = 0
     doc_count = 0

@@ -993,10 +993,13 @@ def cmd_extract(args):
         return
 
     meeting_filter = set(args.meeting) if args.meeting else None
+    agency_filter = getattr(args, "agency", None)
 
     to_process = []
     skipped_markers = 0
     for source_type, sf in all_sources:
+        if agency_filter and f"/{agency_filter}/" not in str(sf):
+            continue
         if meeting_filter and not any(sf.stem.startswith(mid) for mid in meeting_filter):
             continue
 
@@ -1315,6 +1318,7 @@ def main():
     parser.add_argument("--queue", choices=["hot", "cold"], help="hot=recent meetings only, cold=backlog only")
     parser.add_argument("--hot-days", type=int, default=14, help="Days back that counts as 'hot' (default: 14)")
     parser.add_argument("--cost-report", action="store_true", help="Project monthly API cost from discovery + tally history")
+    parser.add_argument("--agency", metavar="SLUG", help="Only extract sources for this agency")
 
     args = parser.parse_args()
 

@@ -239,8 +239,9 @@ def find_oversized_files():
         for f in docs_dir.glob("*.txt"):
             if f.stat().st_size > MAX_SOURCE_SIZE_FOR_SKIP:
                 skip_path = f.with_suffix(f.suffix + ".skip")
+                split_path = f.with_suffix(f.suffix + ".split")
                 json_path = STRUCTURED_DIR / (f.stem + ".json")
-                if not skip_path.exists() and not json_path.exists():
+                if not skip_path.exists() and not split_path.exists() and not json_path.exists():
                     oversized.append((f, f.stat().st_size))
     return oversized
 

@@ -65,7 +65,7 @@ def get_video_duration(url):
     """Get video duration in seconds without downloading."""
     try:
         result = subprocess.run(
-            ["yt-dlp", "--print", "duration", "--no-download", url],
+            ["yt-dlp", "--js-runtimes", "node", "--print", "duration", "--no-download", url],
             capture_output=True, text=True, timeout=30,
         )
         if result.returncode == 0 and result.stdout.strip():
@@ -86,6 +86,7 @@ def download_audio(url, output_path):
         result = subprocess.run(
             [
                 "yt-dlp",
+                "--js-runtimes", "node",
                 "-x", "--audio-format", "mp3",
                 "--audio-quality", "5",  # lower quality = smaller file
                 "-o", str(output_path.with_suffix(".%(ext)s")),

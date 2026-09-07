@@ -78,24 +78,26 @@ python3 transforms/extract_structured.py --queue hot $FORCE || HOT_RC=$?
 EXTRACT_AFTER_HOT=$(find data/structured -name '*.json' 2>/dev/null | wc -l)
 HOT_EXTRACTIONS=$((EXTRACT_AFTER_HOT - EXTRACT_BEFORE))
 
-if [ "$HOT_RC" -ne 0 ]; then
+if [ "$HOT_RC" -eq 2 ]; then
+    log "Hot extraction hit session limit — skipping cold queue."
+elif [ "$HOT_RC" -ne 0 ]; then
     log "WARNING: Hot extraction failed (exit $HOT_RC)"
 fi
 log "Hot extraction done: $HOT_EXTRACTIONS new."
 
-# ── Step 3b: Cold extraction — backlog, time-bounded ──
+# ── Step 3b: Cold extraction — backlog, time-bounded (skip if session exhausted) ──
 if [ "$HOT_RC" -eq 0 ] && [ -n "$EXTRACT_CUTOFF" ]; then
     CURRENT_HOUR=$(date +%H)
     if [ "$CURRENT_HOUR" -lt "$EXTRACT_CUTOFF" ]; then
         log "Cold extraction (backlog, until ${EXTRACT_CUTOFF}:00)..."
-        python3 transforms/extract_structured.py --queue cold --stop-at "$EXTRACT_CUTOFF" $FORCE || true
+        python3 transforms/extract_structured.py --queue cold --stop-at "$EXTRACT_CUTOFF" --agency carlsbad $FORCE || true
         log "Cold extraction done."
     else
         log "No time remaining for cold extraction."
     fi
 elif [ "$HOT_RC" -eq 0 ] && [ -z "$EXTRACT_CUTOFF" ]; then
     log "Cold extraction (backlog, limit 50)..."
-    python3 transforms/extract_structured.py --queue cold --limit 50 $FORCE || true
+    python3 transforms/extract_structured.py --queue cold --limit 50 --agency carlsbad $FORCE || true
     log "Cold extraction done."
 fi
 
