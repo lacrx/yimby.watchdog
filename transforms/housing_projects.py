@@ -27,7 +27,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from civic_utils import load_agencies, agency_data_dir
+from civic_utils import load_agencies, agency_data_dir, permit_jsonl_files
 
 DATA_DIR = REPO_ROOT / "data"
 STRUCTURED_DIR = DATA_DIR / "structured"
@@ -95,11 +95,7 @@ def load_planning_projects():
     for slug, agency in agencies.items():
         if not agency.get("permits"):
             continue
-        data_dir = agency_data_dir(slug)
-        permits_dir = Path(data_dir) / "permits"
-        if not permits_dir.exists():
-            continue
-        for jf in sorted(permits_dir.glob("etrakit-projects-*.jsonl")):
+        for jf in permit_jsonl_files(slug, "projects"):
             for line in jf.read_text().splitlines():
                 if line.strip():
                     rec = json.loads(line)

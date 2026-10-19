@@ -91,6 +91,27 @@ agencies:
       - All Boards/Commissions
       - Traffic Safety & Mobility Commission
     deep_fetch: false
+    permits:
+      platform: arcgis
+      service_url: https://services.arcgis.com/ay9ePoQ2UfAX3U38/arcgis/rest/services/BuildingPermits/FeatureServer/0
+      date_field: AppliedDate
+      field_map:
+        permit_no: PermitNum
+        type: PermitClass
+        description: Description
+        status: StatusCurrent
+        applied: AppliedDate
+        issued: IssuedDate
+        completed: CompletedDate
+        address: OriginalAddress1
+        city: OriginalCity
+        state: OriginalState
+        zip: OriginalZip
+        jurisdiction: Jurisdiction
+        latitude: POINT_Y
+        longitude: POINT_X
+        tract: TRACT
+        district: DISTRICTID
     enabled: true
 
   encinitas:

@@ -220,10 +220,22 @@ log "Intel feed done."
 
 # ── 1c: Fetch building permits (agencies with permit config) ──
 CURRENT_YEAR=$(date '+%Y')
-while IFS='|' read -r SLUG NAME; do
-    log "Fetching $NAME permits ($CURRENT_YEAR, incremental)..."
+while IFS='|' read -r SLUG NAME PLATFORM; do
+    log "Fetching $NAME permits ($CURRENT_YEAR, $PLATFORM, incremental)..."
     mkdir -p "data/${SLUG}/permits"
-    if run_with_timeout "$NAME permits" python3 scrapers/etrakit.py fetch --agency "$SLUG" --year "$CURRENT_YEAR" >> "data/${SLUG}/permits/fetch.log" 2>&1; then
+    case "$PLATFORM" in
+        etrakit)
+            CMD="python3 scrapers/etrakit.py fetch --agency $SLUG --year $CURRENT_YEAR"
+            ;;
+        arcgis)
+            CMD="python3 scrapers/arcgis_permits.py fetch --agency $SLUG --year $CURRENT_YEAR"
+            ;;
+        *)
+            log "  $NAME: unknown permit platform '$PLATFORM', skipping."
+            continue
+            ;;
+    esac
+    if run_with_timeout "$NAME permits" $CMD >> "data/${SLUG}/permits/fetch.log" 2>&1; then
         log "$NAME permits done."
     else
         log "$NAME permits failed — continuing pipeline."
@@ -233,10 +245,11 @@ import yaml
 cfg = yaml.safe_load(open('agencies.yaml'))
 for slug, a in cfg['agencies'].items():
     if a.get('enabled', True) and a.get('permits'):
-        print(f\"{slug}|{a.get('name', slug)}\")
+        platform = a['permits'].get('platform', 'etrakit')
+        print(f\"{slug}|{a.get('name', slug)}|{platform}\")
 ")
 
-# ── 1c.1: Fetch planning projects (development plans, density bonus, etc) ──
+# ── 1c.1: Fetch planning projects (eTRAKit only — development plans, density bonus, etc) ──
 while IFS='|' read -r SLUG NAME; do
     log "Fetching $NAME planning projects ($CURRENT_YEAR)..."
     if run_with_timeout "$NAME projects" python3 scrapers/etrakit.py projects --agency "$SLUG" --year "$CURRENT_YEAR" --delay 0.5 >> "data/${SLUG}/permits/projects.log" 2>&1; then
@@ -249,10 +262,11 @@ import yaml
 cfg = yaml.safe_load(open('agencies.yaml'))
 for slug, a in cfg['agencies'].items():
     if a.get('enabled', True) and a.get('permits'):
-        print(f\"{slug}|{a.get('name', slug)}\")
+        if a['permits'].get('platform') == 'etrakit':
+            print(f\"{slug}|{a.get('name', slug)}\")
 ")
 
-# ── 1c.2: Enrich new infill permits (contacts, site info, linked activities) ──
+# ── 1c.2: Enrich new infill permits (eTRAKit only — contacts, site info, linked activities) ──
 while IFS='|' read -r SLUG NAME; do
     log "Enriching $NAME infill permits ($CURRENT_YEAR)..."
     if run_with_timeout "$NAME enrich" python3 scrapers/etrakit.py enrich --agency "$SLUG" --year "$CURRENT_YEAR" --infill --delay 1.5 >> "data/${SLUG}/permits/enrich.log" 2>&1; then
@@ -265,7 +279,8 @@ import yaml
 cfg = yaml.safe_load(open('agencies.yaml'))
 for slug, a in cfg['agencies'].items():
     if a.get('enabled', True) and a.get('permits'):
-        print(f\"{slug}|{a.get('name', slug)}\")
+        if a['permits'].get('platform') == 'etrakit':
+            print(f\"{slug}|{a.get('name', slug)}\")
 ")
 
 # ── 1d: Discover new meeting videos ──

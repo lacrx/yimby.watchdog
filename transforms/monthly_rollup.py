@@ -8,7 +8,7 @@ extraction, new permit, new intel item) triggers a rebuild for that month only.
 
 Data sources:
   1. Meeting records  — data/structured/meetings/*.json (merged per-meeting)
-  2. Building permits — data/{agency}/permits/etrakit-permits-*.jsonl
+  2. Building permits — data/{agency}/permits/*-permits-*.jsonl
   3. Intel feed       — data/intel/intel-*.json
 
 Usage:
@@ -32,7 +32,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from civic_utils import load_agencies, agency_data_dir
+from civic_utils import load_agencies, agency_data_dir, permit_jsonl_files
 
 DATA_DIR = REPO_ROOT / "data"
 STRUCTURED_DIR = DATA_DIR / "structured"
@@ -99,10 +99,7 @@ def load_permits_by_month():
     for slug, cfg in agencies.items():
         if "permits" not in cfg:
             continue
-        permits_dir = agency_data_dir(slug) / "permits"
-        if not permits_dir.exists():
-            continue
-        for pf in sorted(permits_dir.glob("etrakit-permits-*.jsonl")):
+        for pf in permit_jsonl_files(slug, "permits"):
             try:
                 with open(pf) as f:
                     for line in f:
@@ -128,10 +125,7 @@ def _load_permits_by_date_field(date_field):
     for slug, cfg in agencies.items():
         if "permits" not in cfg:
             continue
-        permits_dir = agency_data_dir(slug) / "permits"
-        if not permits_dir.exists():
-            continue
-        for pf in sorted(permits_dir.glob("etrakit-permits-*.jsonl")):
+        for pf in permit_jsonl_files(slug, "permits"):
             try:
                 with open(pf) as f:
                     for line in f:
@@ -165,10 +159,7 @@ def load_planning_by_month():
     for slug, cfg in agencies.items():
         if "permits" not in cfg:
             continue
-        permits_dir = agency_data_dir(slug) / "permits"
-        if not permits_dir.exists():
-            continue
-        for pf in sorted(permits_dir.glob("etrakit-projects-*.jsonl")):
+        for pf in permit_jsonl_files(slug, "projects"):
             try:
                 with open(pf) as f:
                     for line in f:

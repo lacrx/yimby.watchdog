@@ -75,6 +75,14 @@ def agency_meetings_dir(slug):
     return DATA_DIR / slug / "meetings"
 
 
+def permit_jsonl_files(slug, kind="permits"):
+    """Return sorted JSONL permit/project files for an agency, any platform."""
+    permits_dir = agency_data_dir(slug) / "permits"
+    if not permits_dir.exists():
+        return []
+    return sorted(permits_dir.glob(f"*-{kind}-*.jsonl"))
+
+
 def all_docs_dirs(enabled_only=True):
     """Return list of existing document directories across all agencies."""
     dirs = []
@@ -95,9 +103,46 @@ def all_meetings_dirs(enabled_only=True):
     return dirs
 
 
+FIRECRAWL_FALLBACK_HOSTS = ("escribemeetings.com",)
+FIRECRAWL_FALLBACK_MAX_PER_NIGHT = int(os.environ.get("FIRECRAWL_FALLBACK_MAX_PER_NIGHT", "150"))
+
+
+def _firecrawl_fallback(url, dest_path):
+    """Fetch a Cloudflare-challenged document via Firecrawl, save text beside dest_path.
+
+    Writes dest_path.with_suffix(".txt") so extract_text() picks it up as its cache.
+    Capped per day (FIRECRAWL_FALLBACK_MAX_PER_NIGHT) to protect the credit pool.
+    """
+    if not shutil.which("firecrawl"):
+        return False
+    counter = Path(__file__).parent / "data" / f".firecrawl-fallback-{datetime.now():%Y-%m-%d}"
+    used = int(counter.read_text()) if counter.exists() else 0
+    if used >= FIRECRAWL_FALLBACK_MAX_PER_NIGHT:
+        return False
+    counter.write_text(str(used + 1))
+    txt_path = dest_path.with_suffix(".txt")
+    try:
+        result = subprocess.run(["firecrawl", "scrape", url, "-o", str(txt_path)],
+                                capture_output=True, text=True, timeout=300)
+        if result.returncode == 0 and txt_path.exists() and txt_path.stat().st_size > 0:
+            print(f"  firecrawl fallback ok ({used + 1}/{FIRECRAWL_FALLBACK_MAX_PER_NIGHT})")
+            return True
+    except Exception as e:
+        print(f"  firecrawl fallback failed: {e}")
+    txt_path.unlink(missing_ok=True)
+    return False
+
+
 def download_pdf(url, dest_path, headers=None, verify=True):
-    """Download a PDF. Skips if already exists and non-empty."""
+    """Download a PDF. Skips if already exists and non-empty.
+
+    On a Cloudflare 403 from a known host, falls back to Firecrawl and stores
+    extracted text only (no PDF); returns True so callers proceed to extract_text().
+    """
     if dest_path.exists() and dest_path.stat().st_size > 0:
+        return True
+    txt_path = dest_path.with_suffix(".txt")
+    if any(h in url for h in FIRECRAWL_FALLBACK_HOSTS) and txt_path.exists() and txt_path.stat().st_size > 0:
         return True
     hdrs = {"User-Agent": USER_AGENT}
     if headers:
@@ -111,6 +156,10 @@ def download_pdf(url, dest_path, headers=None, verify=True):
             return True
         return False
     except Exception as e:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 403 and any(h in url for h in FIRECRAWL_FALLBACK_HOSTS):
+            if _firecrawl_fallback(url, dest_path):
+                return True
         print(f"  download failed: {e}")
         return False
 

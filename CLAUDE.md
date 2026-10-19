@@ -36,9 +36,12 @@ source .venv/bin/activate
 ./civic-pipeline local --extract-until 20
 
 # Fetch building permits (incremental, current year)
-python scrapers/etrakit.py fetch
-python scrapers/etrakit.py fetch --year 2025    # specific year
-python scrapers/etrakit.py fetch --full          # full rescan
+python scrapers/etrakit.py fetch                           # Oceanside (eTRAKit)
+python scrapers/etrakit.py fetch --year 2025
+python scrapers/etrakit.py fetch --full                    # full rescan
+python scrapers/arcgis_permits.py fetch                    # Carlsbad (ArcGIS)
+python scrapers/arcgis_permits.py fetch --agency carlsbad --full
+python scrapers/arcgis_permits.py stats --agency carlsbad  # permit summary
 
 # Fetch planning projects (development plans, density bonus, CUPs, etc)
 python scrapers/etrakit.py projects
@@ -76,20 +79,20 @@ data/{agency_slug}/
   documents/          # Raw scraped text (agendas, staff reports)
   doc-index.json      # Document metadata index
   state.json          # Scraper state (last-seen markers)
-  permits/            # Building permits + planning projects (eTRAKit JSONL, Oceanside only)
+  permits/            # Building permits + planning projects ({platform}-permits-{year}.jsonl)
 data/structured/      # Extracted JSONL (meetings-combined, all-records)
 data/structured/housing-projects.json  # Unified housing projects (cross-ref all sources)
 data/exports/         # Parquet files for DuckDB queries
 data/transcripts/     # Whisper transcription output
 ```
 
-Permits and planning projects are standalone structured data (type, description, status, dates) — they do NOT go through `claude -p` extraction. Meeting documents do. Building permits use `etrakit-permits-{year}.jsonl`, planning projects use `etrakit-projects-{year}.jsonl`. `housing_projects.py` cross-references permits, planning projects, HCD APR filings, and meeting extractions into a unified entity per named project.
+Permits and planning projects are standalone structured data (type, description, status, dates) — they do NOT go through `claude -p` extraction. Meeting documents do. Building permits use `{platform}-permits-{year}.jsonl` (e.g. `etrakit-permits-2026.jsonl`, `arcgis-permits-2023.jsonl`), planning projects use `{platform}-projects-{year}.jsonl`. `housing_projects.py` cross-references permits, planning projects, HCD APR filings, and meeting extractions into a unified entity per named project.
 
 ## Platform Scraper Modules
 
-Each scraper in `scrapers/` implements a platform adapter. `lambda_handler.py` dispatches by the `platform` field in `agencies.yaml`. Supported platforms: `legistar_html`, `legistar_odata`, `escribe`, `civicplus`, `civicclerk`, `granicus`, `swagit`, `carlsbad_cms`, `laserfiche`, `primegov`, custom HTML.
+Each scraper in `scrapers/` implements a platform adapter. `lambda_handler.py` dispatches meetings by the `platform` field in `agencies.yaml`. Supported meeting platforms: `legistar_html`, `legistar_odata`, `escribe`, `civicplus`, `civicclerk`, `granicus`, `swagit`, `carlsbad_cms`, `laserfiche`, `primegov`, custom HTML. Permit platforms (dispatched by `permits.platform`): `etrakit` (Oceanside), `arcgis` (Carlsbad; generic for any ArcGIS Feature Service).
 
-`civic_utils.py` provides shared helpers: `load_agencies()`, `agency_data_dir()`, PDF-to-text, content hashing.
+`civic_utils.py` provides shared helpers: `load_agencies()`, `agency_data_dir()`, `permit_jsonl_files()`, PDF-to-text, content hashing.
 
 ## Related Projects
 - `yimby.analysis`: downstream analysis — executive summaries, council member profiles, leadership grading. Reads from this repo's `data/` directory

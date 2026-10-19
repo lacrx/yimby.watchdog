@@ -162,8 +162,8 @@ def load_permits(year):
         if "permits" not in cfg:
             continue
         permits_dir = agency_data_dir(slug) / "permits"
-        pf = permits_dir / f"etrakit-permits-{year}.jsonl"
-        if pf.exists():
+        pf = next(permits_dir.glob(f"*-permits-{year}.jsonl"), None)
+        if pf and pf.exists():
             permits = []
             with open(pf) as f:
                 for line in f:
