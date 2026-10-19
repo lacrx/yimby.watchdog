@@ -45,6 +45,7 @@ DATA_DIR = Path(os.environ.get("WATCHDOG_DATA_DIR", str(REPO_ROOT / "data")))
 AGENCIES_FILE = REPO_ROOT / "agencies.yaml"
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) yimby-watchdog/1.0"
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 _agencies_cache = None
 

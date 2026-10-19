@@ -25,7 +25,7 @@ from bs4 import BeautifulSoup
 from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
     safe_filename, agency_data_dir, rebuild_doc_index,
-    cmd_list_meetings, log_discovery, USER_AGENT,
+    cmd_list_meetings, log_discovery, BROWSER_UA,
 )
 
 SLUG = "lemon_grove"
@@ -93,10 +93,14 @@ def cmd_fetch(args):
     print(f"Fetching Lemon Grove meetings (cutoff {cutoff.strftime('%Y-%m-%d')})...")
 
     session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
+    session.headers.update({"User-Agent": BROWSER_UA})
 
-    resp = session.get(LISTING_URL, timeout=30)
-    resp.raise_for_status()
+    try:
+        resp = session.get(LISTING_URL, timeout=30)
+        resp.raise_for_status()
+    except requests.HTTPError as e:
+        print(f"  Listing page returned {resp.status_code} — site may be blocking scrapers")
+        return
     events = _parse_listing(resp.text)
     print(f"  Found {len(events)} events on listing page")
 
@@ -150,7 +154,7 @@ def cmd_fetch(args):
             if dest.exists() and dest.stat().st_size > 0:
                 continue
 
-            if download_pdf(doc_url, dest):
+            if download_pdf(doc_url, dest, headers={"User-Agent": BROWSER_UA}):
                 text = extract_text(dest)
                 if text:
                     doc_count += 1

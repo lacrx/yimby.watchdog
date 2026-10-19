@@ -43,6 +43,7 @@ HEALTH_FILE = REPO_ROOT / "data" / "preflight-health.json"
 QUARANTINE_THRESHOLD = 3
 PROBE_TIMEOUT = 15
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) yimby-watchdog/1.0"
+BROWSER_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 
 def load_health():
@@ -316,7 +317,7 @@ def probe_lemon_grove_events(cfg):
     base = cfg.get("base_url", "").rstrip("/")
     url = f"{base}/council"
     resp = requests.get(url, timeout=PROBE_TIMEOUT,
-                        headers={"User-Agent": USER_AGENT})
+                        headers={"User-Agent": BROWSER_UA})
     if resp.status_code != 200:
         return False, f"HTTP {resp.status_code}"
     detail_count = resp.text.count("/Detail/")
