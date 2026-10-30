@@ -52,6 +52,34 @@ HOUSING_PLANNING_TYPES = {
 
 PROJECTS_FILE = STRUCTURED_DIR / "permit-projects.json"
 
+# Maps non-canonical agency names in meeting records to canonical agencies.yaml names.
+# Joint bodies fold into the first (primary) city listed.
+AGENCY_ALIASES = {
+    "Carlsbad": "City of Carlsbad",
+    "Carlsbad Municipal Water District": "City of Carlsbad",
+    "Carlsbad Municipal Water District / City of Carlsbad": "City of Carlsbad",
+    "City of Oceanside / City of Carlsbad": "City of Oceanside",
+    "City of Oceanside / City of Carlsbad (Joint Powers)": "City of Oceanside",
+    "Del Mar": "City of Del Mar",
+    "del_mar": "City of Del Mar",
+    "Encinitas": "City of Encinitas",
+    "Encinitas Ranch Golf Authority": "City of Encinitas",
+    "San Dieguito Water District": "City of Encinitas",
+    "San Dieguito Water District / City of Encinitas": "City of Encinitas",
+    "Encina Wastewater Authority": "City of Encinitas",
+    "Buena Vista Lagoon": "City of Carlsbad",
+    "Escondido": "City of Escondido",
+    "escondido": "City of Escondido",
+    "NCTD": "North County Transit District",
+    "San Diego Community Power": "County of San Diego",
+    "Unknown (Mayor Ehlers referenced)": "Unknown",
+}
+
+
+def _canonical_agency(name):
+    """Resolve an agency name to its canonical form."""
+    return AGENCY_ALIASES.get(name, name)
+
 
 def parse_date_to_month(date_str):
     """Parse M/D/YYYY or YYYY-MM-DD to YYYY-MM. Returns None on failure."""
@@ -261,6 +289,37 @@ def summarize_permits(permits):
     }
 
 
+def _empty_municipality_bucket():
+    return {
+        "meeting_count": 0,
+        "substantive_count": 0,
+        "bodies": set(),
+        "votes": [],
+        "housing_items": [],
+        "fiscal_items": [],
+        "legal_flags": [],
+        "council_positions": [],
+        "public_comments": [],
+        "key_quotes": [],
+    }
+
+
+def _finalize_municipality(bucket):
+    """Convert sets to sorted lists and deduplicate."""
+    return {
+        "meeting_count": bucket["meeting_count"],
+        "substantive_count": bucket["substantive_count"],
+        "bodies": sorted(bucket["bodies"]),
+        "votes": bucket["votes"],
+        "housing_items": bucket["housing_items"],
+        "fiscal_items": bucket["fiscal_items"],
+        "legal_flags": deduplicate(bucket["legal_flags"]),
+        "council_positions": bucket["council_positions"],
+        "public_comments": deduplicate(bucket["public_comments"]),
+        "key_quotes": deduplicate(bucket["key_quotes"]),
+    }
+
+
 def merge_month(month, meetings, permits, intel, project_index=None, planning=None,
                 permits_approved=None, permits_issued=None):
     """Merge all data sources for a month into one digest."""
@@ -275,23 +334,49 @@ def merge_month(month, meetings, permits, intel, project_index=None, planning=No
     all_quotes = []
     substantive_count = 0
 
+    by_municipality = defaultdict(_empty_municipality_bucket)
+
     for r in meetings:
-        if r.get("body"):
-            bodies.add(r["body"])
-        if r.get("agency"):
-            agencies.add(r["agency"])
+        body = r.get("body", "")
+        agency = _canonical_agency(r.get("agency", "Unknown"))
+        if body:
+            bodies.add(body)
+        if agency:
+            agencies.add(agency)
+
+        muni = by_municipality[agency]
+        muni["meeting_count"] += 1
+        if body:
+            muni["bodies"].add(body)
 
         if r.get("procedural_only"):
             continue
         substantive_count += 1
+        muni["substantive_count"] += 1
 
-        all_votes.extend(r.get("votes", []))
-        all_housing.extend(r.get("housing_items", []))
-        all_fiscal.extend(r.get("fiscal_items", []))
-        all_legal.extend(r.get("legal_flags", []))
-        all_positions.extend(r.get("council_positions", []))
-        all_comments.extend(r.get("public_comments", []))
-        all_quotes.extend(r.get("key_quotes", []))
+        votes = r.get("votes", [])
+        housing = r.get("housing_items", [])
+        fiscal = r.get("fiscal_items", [])
+        legal = r.get("legal_flags", [])
+        positions = r.get("council_positions", [])
+        comments = r.get("public_comments", [])
+        quotes = r.get("key_quotes", [])
+
+        all_votes.extend(votes)
+        all_housing.extend(housing)
+        all_fiscal.extend(fiscal)
+        all_legal.extend(legal)
+        all_positions.extend(positions)
+        all_comments.extend(comments)
+        all_quotes.extend(quotes)
+
+        muni["votes"].extend(votes)
+        muni["housing_items"].extend(housing)
+        muni["fiscal_items"].extend(fiscal)
+        muni["legal_flags"].extend(legal)
+        muni["council_positions"].extend(positions)
+        muni["public_comments"].extend(comments)
+        muni["key_quotes"].extend(quotes)
 
     digest = {
         "month": month,
@@ -299,6 +384,10 @@ def merge_month(month, meetings, permits, intel, project_index=None, planning=No
         "substantive_count": substantive_count,
         "bodies": sorted(bodies),
         "agencies": sorted(agencies),
+        "by_municipality": {
+            name: _finalize_municipality(bucket)
+            for name, bucket in sorted(by_municipality.items())
+        },
         "activity_summary": {
             "meetings_with_votes": sum(1 for r in meetings if r.get("votes")),
             "meetings_with_housing": sum(1 for r in meetings if r.get("housing_items")),
@@ -438,8 +527,10 @@ def cmd_rollup(args):
             return
         all_months = [args.month]
 
+    max_rebuilds = 0 if (args.force or args.month) else args.max_rebuilds
     built = 0
     skipped = 0
+    deferred = 0
 
     for month in all_months:
         meetings = meetings_by_month.get(month, [])
@@ -458,6 +549,10 @@ def cmd_rollup(args):
             if existing.get("_source_hash") == digest["_source_hash"]:
                 skipped += 1
                 continue
+
+        if max_rebuilds and built >= max_rebuilds:
+            deferred += 1
+            continue
 
         out_path.write_text(json.dumps(digest, indent=2, default=str))
         built += 1
@@ -479,7 +574,8 @@ def cmd_rollup(args):
 
         print(f"  {month}: {' + '.join(parts)}{counts}")
 
-    print(f"\nBuilt {built}, skipped {skipped} (unchanged)")
+    deferred_str = f", deferred {deferred}" if deferred else ""
+    print(f"\nBuilt {built}, skipped {skipped} (unchanged){deferred_str}")
 
     if built > 0:
         rebuild_combined()
@@ -538,6 +634,8 @@ def main():
     parser.add_argument("--force", action="store_true", help="Rebuild all months")
     parser.add_argument("--month", help="Rebuild specific month (YYYY-MM)")
     parser.add_argument("--stats", action="store_true", help="Show monthly stats")
+    parser.add_argument("--max-rebuilds", type=int, default=1,
+                        help="Max months to rebuild per run (0=unlimited, default: 1)")
     parser.add_argument("--check", action="store_true", help="List months needing rebuild")
 
     args = parser.parse_args()
