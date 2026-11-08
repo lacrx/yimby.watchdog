@@ -32,7 +32,6 @@ STRUCTURED_DIR = DATA_DIR / "structured"
 DIAGNOSIS_LOG = DATA_DIR / "pipeline-doctor.jsonl"
 EXTRACTION_LOG = DATA_DIR / "structured-extraction.log"
 PIPELINE_LOG = DATA_DIR / "pipeline-cron.log"
-NOTIFY_LOG = DATA_DIR / "pipeline-notify.log"
 
 SAFE_SKIP_REASONS = {
     "repeated_auth_blocker": "File blocks extraction repeatedly via auth errors on chunking",
@@ -646,6 +645,56 @@ def diagnose(dry_run=False):
         diagnosis["findings"].append(finding)
         print(f"  FINDING: {finding}")
 
+    # ─── Finding: meetings with no documents ───
+
+    from civic_utils import agency_meetings_dir, agency_docs_dir
+    EMPTY_MEETING_AGE_LIMIT = 90
+    for slug, cfg in load_agencies().items():
+        meetings_dir = agency_meetings_dir(slug)
+        docs_dir_path = agency_docs_dir(slug)
+        if not meetings_dir.exists():
+            continue
+        empty_count = 0
+        total_past = 0
+        for mdir in meetings_dir.iterdir():
+            mf = mdir / "meeting.json"
+            if not mf.exists():
+                continue
+            try:
+                m = json.loads(mf.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            date_str = m.get("date", "")
+            if not date_str:
+                continue
+            from civic_utils import normalize_date
+            norm = normalize_date(date_str)
+            if not norm:
+                continue
+            try:
+                mdt = datetime.strptime(norm, "%Y-%m-%d")
+            except ValueError:
+                continue
+            age_days = (now - mdt).days
+            if age_days < 7 or age_days > EMPTY_MEETING_AGE_LIMIT:
+                continue
+            total_past += 1
+            mid = mdir.name
+            has_docs = False
+            if docs_dir_path.exists():
+                prefix = mid + "-"
+                for f in docs_dir_path.iterdir():
+                    if f.name.startswith(prefix) and f.suffix == ".txt" and f.stat().st_size > 0:
+                        has_docs = True
+                        break
+            if not has_docs:
+                empty_count += 1
+        if empty_count > 0 and total_past > 0:
+            pct = empty_count / total_past * 100
+            finding = f"{cfg.get('name', slug)}: {empty_count}/{total_past} past meetings ({pct:.0f}%) have no documents (7-{EMPTY_MEETING_AGE_LIMIT}d window)"
+            diagnosis["findings"].append(finding)
+            print(f"  FINDING: {finding}")
+
     # ─── Finding: eScribe Cloudflare challenge ───
 
     from civic_utils import escribe_blocked_until
@@ -667,7 +716,15 @@ def diagnose(dry_run=False):
             agency_logs.append((f"{config.get('name', slug)} permits", permits_log))
     for label, log_path in agency_logs:
         log_lines_agency = read_tail(log_path, 100)
-        agency_errors = [l.strip() for l in log_lines_agency if "error" in l.lower() or "failed" in l.lower() or "Traceback" in l]
+        # Scope to most recent run: find last run-start boundary
+        recent_start = 0
+        for i, line in enumerate(log_lines_agency):
+            s = line.strip()
+            if (s.startswith("Done.") or s.startswith("Fetching ") or
+                    s.startswith("Resuming from") or s.startswith("Scanning ")):
+                recent_start = i
+        recent_agency_lines = log_lines_agency[recent_start:]
+        agency_errors = [l.strip() for l in recent_agency_lines if "error" in l.lower() or "failed" in l.lower() or "Traceback" in l]
         if agency_errors:
             finding = f"{label} fetch had {len(agency_errors)} error(s) in recent log"
             diagnosis["findings"].append(finding)
@@ -713,8 +770,16 @@ def diagnose(dry_run=False):
             print(f"  FINDING: {finding}")
 
     # ─── Finding: Extraction script crash ───
+    # Scope to the most recent pipeline session (after last tally marker)
+    # to avoid re-flagging old tracebacks that are still in the log window.
 
-    traceback_lines = [l.strip() for l in ext_lines if "Traceback" in l or "Error:" in l or "TypeError:" in l]
+    recent_ext_start = 0
+    for i, line in enumerate(ext_lines):
+        if "=== Forward Tally" in line or "Extracting structured data:" in line:
+            recent_ext_start = i
+
+    recent_ext = ext_lines[recent_ext_start:]
+    traceback_lines = [l.strip() for l in recent_ext if "Traceback" in l or "Error:" in l or "TypeError:" in l]
     if traceback_lines:
         last_tb = traceback_lines[-1][:150]
         finding = f"Extraction script crashed: {last_tb}"

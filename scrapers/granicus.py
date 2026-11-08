@@ -33,6 +33,7 @@ from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
     load_agencies, agency_data_dir, USER_AGENT,
     safe_filename, cmd_list_meetings, rebuild_doc_index, log_discovery,
+    meeting_needs_recheck,
 )
 
 GRAN_NS = "https://www.granicus.com/schema/rss-supplements"
@@ -221,6 +222,7 @@ def extract_pdf_links_from_agenda(agenda_url, base_url):
 
     pdfs = []
     text = resp.text
+    from urllib.parse import unquote
 
     # Type 0: OnBase Agenda Online (San Diego). The meeting page is a JS shell;
     # the agenda itself is served as HTML from Documents/ViewAgenda.
@@ -230,9 +232,20 @@ def extract_pdf_links_from_agenda(agenda_url, base_url):
         return [{"url": f"{root}/Documents/ViewAgenda?meetingId={meeting_id}&doctype=1",
                  "name": "agenda", "type": "agenda_text"}]
 
-    # Type 1: Google Docs Viewer embed → DocumentViewer.php?file=...
+    # Type 0b: Redirected to Google Docs gview (San Marcos, some Encinitas committees).
+    # The server-side redirect lands on docs.google.com/gview?url=<encoded PDF>.
+    gview_matches = []
+    if "docs.google.com/gview" in resp.url:
+        gview_params = parse_qs(urlparse(resp.url).query)
+        if "url" in gview_params:
+            inner_url = gview_params["url"][0]
+            fname = inner_url.rsplit("/", 1)[-1] if "/" in inner_url else "agenda.pdf"
+            pdfs.append({"url": inner_url, "name": fname, "type": "agenda"})
+            gview_matches.append(inner_url)
+            return pdfs
+
+    # Type 1a: Google Docs Viewer embed in page HTML → DocumentViewer.php?file=...
     # URL may be encoded (%3D for =, %26 for &, or double-encoded %253D)
-    from urllib.parse import unquote
     decoded = unquote(unquote(text))
     doc_matches = re.findall(r'DocumentViewer\.php\?file=([^&"\'\\]+\.pdf)', decoded)
     seen_docs = set()
@@ -243,13 +256,23 @@ def extract_pdf_links_from_agenda(agenda_url, base_url):
         url = f"{base_url}/DocumentViewer.php?file={fname}&view=1"
         pdfs.append({"url": url, "name": fname, "type": "agenda"})
 
+    # Type 1b: gview embedded in page HTML (not a redirect)
+    if not doc_matches:
+        gview_in_page = re.findall(r'docs\.google\.com/gview\?[^"\']*url=([^&"\'\\]+)', decoded)
+        for raw_url in gview_in_page:
+            inner_url = unquote(raw_url)
+            if inner_url in seen_docs:
+                continue
+            seen_docs.add(inner_url)
+            gview_matches.append(inner_url)
+            fname = inner_url.rsplit("/", 1)[-1] if "/" in inner_url else "agenda.pdf"
+            pdfs.append({"url": inner_url, "name": fname, "type": "agenda"})
+
     # Type 2: MetaViewer.php links (archived meetings with individual docs)
-    meta_matches = re.findall(
-        r'MetaViewer\.php\?[^"\']+clip_id=(\d+)[^"\']*meta_id=(\d+)', resp.text
-    )
-    if meta_matches:
-        soup = BeautifulSoup(resp.text, "lxml")
-        for link in soup.find_all("a", href=re.compile(r"MetaViewer\.php")):
+    soup = BeautifulSoup(resp.text, "lxml")
+    meta_links = soup.find_all("a", href=re.compile(r"MetaViewer\.php"))
+    if meta_links:
+        for link in meta_links:
             href = link.get("href", "")
             meta_m = re.search(r'meta_id=(\d+)', href)
             if meta_m:
@@ -258,9 +281,10 @@ def extract_pdf_links_from_agenda(agenda_url, base_url):
                 label = link.get_text(strip=True) or f"meta-{meta_id}"
                 pdfs.append({"url": full_url, "name": label, "meta_id": meta_id, "type": "staff_report"})
 
-    # If we found MetaViewer links but no main agenda DocumentViewer, the page itself is the agenda
-    if meta_matches and not doc_matches:
-        pdfs.insert(0, {"url": None, "name": "agenda_html", "type": "agenda_html"})
+    # If MetaViewer links but no main agenda PDF or gview, the page itself is the agenda
+    if meta_links and not doc_matches and not gview_matches:
+        pdfs.insert(0, {"url": resp.url, "name": "agenda_html", "type": "agenda_html",
+                        "html": resp.text})
 
     return pdfs
 
@@ -332,7 +356,11 @@ def cmd_fetch(args):
             print(f"  NEW: {item['title']}")
 
         if mid in state["meetings"] and not args.deep:
-            continue
+            meeting_date = state["meetings"][mid].get("date", "") or (item["date"].strftime("%m/%d/%Y") if item["date"] else "")
+            if not meeting_needs_recheck(mid, docs_dir, meeting_date):
+                continue
+            print(f"  RECHECK: {item['title']} (no documents yet)")
+
 
         # Fetch agenda PDFs
         try:
@@ -345,6 +373,12 @@ def cmd_fetch(args):
 
         for i, pdf_info in enumerate(pdfs):
             if pdf_info["type"] == "agenda_html":
+                dest = docs_dir / f"{mid}-agenda.txt"
+                if not dest.exists() and pdf_info.get("html"):
+                    agenda_text = BeautifulSoup(pdf_info["html"], "lxml").get_text("\n", strip=True)
+                    if agenda_text:
+                        dest.write_text(agenda_text)
+                        doc_count += 1
                 continue
 
             if pdf_info["type"] == "agenda_text":
@@ -393,6 +427,7 @@ def cmd_fetch(args):
         state["meetings"][mid] = {
             "fetched": datetime.now().isoformat(),
             "title": item["title"],
+            "date": item["date"].strftime("%m/%d/%Y") if item["date"] else "",
         }
         time.sleep(1)
 

@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from bs4 import BeautifulSoup
 
-from civic_utils import extract_text, save_json, load_json, agency_data_dir, load_agencies, cmd_list_meetings, rebuild_doc_index, log_discovery, CURL_BIN
+from civic_utils import extract_text, save_json, load_json, agency_data_dir, load_agencies, cmd_list_meetings, rebuild_doc_index, log_discovery, meeting_needs_recheck, CURL_BIN
 
 SLUG = "carlsbad"
 BASE_URL = "https://www.carlsbadca.gov"
@@ -245,7 +245,9 @@ def cmd_fetch(args):
                 print(f"    NEW: {body} — {dt.strftime('%Y-%m-%d')}")
 
             if mid in state["meetings"] and not args.deep:
-                continue
+                if not meeting_needs_recheck(mid, docs_dir, dt.strftime("%m/%d/%Y")):
+                    continue
+                print(f"    RECHECK: {body} — {dt.strftime('%Y-%m-%d')} (no documents yet)")
 
             # Fetch folder page for PDFs
             try:
@@ -280,6 +282,7 @@ def cmd_fetch(args):
             state["meetings"][mid] = {
                 "fetched": datetime.now().isoformat(),
                 "body": body,
+                "date": dt.strftime("%m/%d/%Y"),
             }
             time.sleep(1)
 

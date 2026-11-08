@@ -27,6 +27,7 @@ from civic_utils import (
     extract_text, save_json, load_json,
     agency_data_dir, load_agencies, rebuild_doc_index,
     cmd_list_meetings, log_discovery,
+    meeting_needs_recheck,
 )
 
 SLUG = "santee"
@@ -155,7 +156,9 @@ def cmd_fetch(args):
                 print(f"    NEW: {body} — {dt.strftime('%Y-%m-%d')}")
 
             if mid in state["meetings"] and not args.deep:
-                continue
+                if not meeting_needs_recheck(mid, docs_dir, dt.strftime("%m/%d/%Y")):
+                    continue
+                print(f"    RECHECK: {body} — {dt.strftime('%Y-%m-%d')} (no documents yet)")
 
             for doc in docs:
                 if not args.deep and doc["type"] in ("supplemental", "correspondence"):
@@ -181,6 +184,7 @@ def cmd_fetch(args):
             state["meetings"][mid] = {
                 "fetched": datetime.now().isoformat(),
                 "body": body,
+                "date": dt.strftime("%m/%d/%Y"),
             }
             time.sleep(1)
 

@@ -32,6 +32,7 @@ from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
     load_agencies, agency_data_dir, USER_AGENT,
     safe_filename, cmd_list_meetings, rebuild_doc_index, log_discovery,
+    meeting_needs_recheck,
 )
 
 
@@ -172,7 +173,9 @@ def cmd_fetch(args):
             print(f"  NEW: {meeting['date']} {meeting['body']}")
 
         if mid in state["meetings"] and not args.deep:
-            continue
+            if not meeting_needs_recheck(mid, docs_dir, meeting["date"]):
+                continue
+            print(f"  RECHECK: {meeting['date']} {meeting['body']} (no documents yet)")
 
         for doc in meeting["documents"]:
             title = doc["title"]

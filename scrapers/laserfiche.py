@@ -26,6 +26,7 @@ from civic_utils import (
     extract_text, save_json, load_json,
     safe_filename, agency_data_dir, load_agencies, rebuild_doc_index,
     cmd_list_meetings, log_discovery, USER_AGENT,
+    meeting_needs_recheck,
 )
 
 PORTAL_BASE = "https://portal.laserfiche.com/Portal"
@@ -272,7 +273,9 @@ def cmd_fetch(args):
                 print(f"    NEW: {meeting['title']}")
 
             if mid in state["meetings"] and not getattr(args, "deep", False):
-                continue
+                if not meeting_needs_recheck(mid, docs_dir, meeting.get("date", "")):
+                    continue
+                print(f"    RECHECK: {meeting['title']} (no documents yet)")
 
             for entry_id, doc_name in meeting["docs"]:
                 fname = safe_filename(doc_name, max_len=60)
@@ -290,6 +293,7 @@ def cmd_fetch(args):
             state["meetings"][mid] = {
                 "fetched": datetime.now().isoformat(),
                 "body": body,
+                "date": meeting.get("date", ""),
             }
 
     state["last_fetch"] = datetime.now().isoformat()

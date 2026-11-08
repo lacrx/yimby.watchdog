@@ -32,6 +32,7 @@ from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
     load_agencies, agency_data_dir, USER_AGENT,
     safe_filename, cmd_list_meetings, rebuild_doc_index, log_discovery,
+    meeting_needs_recheck,
 )
 
 BODY_CODES = {
@@ -168,9 +169,11 @@ def cmd_fetch(args):
         is_new = not meeting_file.exists()
 
         if mid in state["meetings"] and not args.deep and not is_new:
-            continue
-
-        print(f"  {'NEW: ' if is_new else ''}{meeting['date']} {meeting['body']}")
+            if not meeting_needs_recheck(mid, docs_dir, meeting["date"]):
+                continue
+            print(f"  RECHECK: {meeting['date']} {meeting['body']} (no documents yet)")
+        elif is_new or args.deep:
+            print(f"  {'NEW: ' if is_new else ''}{meeting['date']} {meeting['body']}")
 
         docs = fetch_meeting_documents(meeting["url"])
         time.sleep(0.5)

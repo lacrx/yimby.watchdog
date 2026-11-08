@@ -26,6 +26,7 @@ from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
     safe_filename, agency_data_dir, rebuild_doc_index,
     cmd_list_meetings, log_discovery, BROWSER_UA,
+    meeting_needs_recheck,
 )
 
 SLUG = "lemon_grove"
@@ -134,7 +135,9 @@ def cmd_fetch(args):
             print(f"    NEW: {title} — {dt.strftime('%Y-%m-%d')}")
 
         if mid in state["meetings"]:
-            continue
+            if not meeting_needs_recheck(mid, docs_dir, dt.strftime("%m/%d/%Y")):
+                continue
+            print(f"    RECHECK: {title} — {dt.strftime('%Y-%m-%d')} (no documents yet)")
 
         # Fetch detail page for document links
         time.sleep(0.5)
@@ -143,7 +146,6 @@ def cmd_fetch(args):
             dresp.raise_for_status()
         except Exception as e:
             print(f"    Detail page failed: {e}")
-            state["meetings"][mid] = {"fetched": datetime.now().isoformat(), "body": title}
             continue
 
         doc_links = _parse_detail(dresp.text, detail_url)

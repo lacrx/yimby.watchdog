@@ -30,6 +30,7 @@ import requests
 from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
     load_agencies, agency_data_dir, log_discovery,
+    meeting_needs_recheck,
 )
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) yimby-watchdog/1.0"
@@ -195,7 +196,10 @@ def cmd_fetch(args):
             print(f"  NEW: {body} — {dt.strftime('%Y-%m-%d') if dt else event_date}")
 
         if mid in state["meetings"] and not args.deep:
-            continue
+            meeting_date = dt.strftime("%m/%d/%Y") if dt else event_date
+            if not meeting_needs_recheck(mid, docs_dir, meeting_date):
+                continue
+            print(f"  RECHECK: {body} — {meeting_date} (no documents yet)")
 
         # Download documents
         has_agenda = event.get("publishedAgenda", False)
@@ -248,6 +252,7 @@ def cmd_fetch(args):
         state["meetings"][mid] = {
             "fetched": datetime.now().isoformat(),
             "body": body,
+            "date": dt.strftime("%m/%d/%Y") if dt else event_date,
         }
         time.sleep(0.5)
 

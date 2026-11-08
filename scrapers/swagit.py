@@ -31,6 +31,7 @@ from civic_utils import (
     download_pdf, extract_text, save_json, load_json,
     load_agencies, agency_data_dir, make_meeting_id,
     cmd_list_meetings, rebuild_doc_index, log_discovery,
+    meeting_needs_recheck,
 )
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -280,7 +281,9 @@ def cmd_fetch(args):
                     print(f"    NEW: {effective_body} — {dt.strftime('%Y-%m-%d')}")
 
                 if mid in state["meetings"] and not getattr(args, "force", False):
-                    continue
+                    if not meeting_needs_recheck(mid, docs_dir, dt.strftime("%m/%d/%Y")):
+                        continue
+                    print(f"    RECHECK: {effective_body} — {dt.strftime('%Y-%m-%d')} (no documents yet)")
 
                 pdf_name = f"{mid}-agenda.pdf"
                 pdf_path = docs_dir / pdf_name
@@ -294,6 +297,7 @@ def cmd_fetch(args):
                     "fetched": datetime.now().isoformat(),
                     "body": effective_body,
                     "video_id": m["video_id"],
+                    "date": dt.strftime("%m/%d/%Y"),
                 }
 
         print(f"    {meeting_count} meetings")

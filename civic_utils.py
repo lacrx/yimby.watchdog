@@ -294,6 +294,33 @@ def make_meeting_id_hash(prefix, body, date_str):
     return hashlib.md5(f"{prefix}-{body}-{date_str}".encode()).hexdigest()[:12]
 
 
+def meeting_needs_recheck(meeting_id, docs_dir, meeting_date_str, max_age_days=60):
+    """Return True if a meeting should be re-visited despite being in state.
+
+    A meeting needs re-check when it has no extracted documents and its date
+    is within max_age_days of today. This catches meetings first seen before
+    their agenda was posted, and minutes posted weeks later.
+    """
+    docs_path = Path(docs_dir)
+    if docs_path.exists():
+        prefix = meeting_id + "-"
+        for f in docs_path.iterdir():
+            if f.name.startswith(prefix) and f.suffix == ".txt" and f.stat().st_size > 0:
+                return False
+
+    if not meeting_date_str:
+        return False
+    date_norm = normalize_date(meeting_date_str)
+    if not date_norm:
+        return False
+    try:
+        meeting_dt = datetime.strptime(date_norm, "%Y-%m-%d")
+    except ValueError:
+        return False
+    age = (datetime.now() - meeting_dt).days
+    return age <= max_age_days
+
+
 def cmd_list_meetings(slug):
     """Generic list command — prints all meetings for an agency."""
     meetings_dir = agency_meetings_dir(slug)

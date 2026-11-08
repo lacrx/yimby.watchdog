@@ -25,7 +25,8 @@ from curl_cffi import requests as cffi_requests
 from civic_utils import (
     extract_text, save_json, load_json,
     agency_data_dir, load_agencies, rebuild_doc_index,
-    cmd_list_meetings, log_discovery,
+    cmd_list_meetings, log_discovery, download_pdf,
+    meeting_needs_recheck,
 )
 
 SLUG = "el_cajon"
@@ -220,7 +221,9 @@ def cmd_fetch(args):
             print(f"    NEW: {body} — {dt.strftime('%Y-%m-%d')}")
 
         if mid in state["meetings"]:
-            continue
+            if not meeting_needs_recheck(mid, docs_dir, dt.strftime("%m/%d/%Y")):
+                continue
+            print(f"    RECHECK: {body} — {dt.strftime('%Y-%m-%d')} (no documents yet)")
 
         for doc in meeting["docs"]:
             safe_name = re.sub(r"[^\w\s\-.]", "", doc["name"])
@@ -237,7 +240,7 @@ def cmd_fetch(args):
             else:
                 print(f"    PDF failed: {doc['name'][:50]}")
 
-        state["meetings"][mid] = {"fetched": datetime.now().isoformat(), "body": body}
+        state["meetings"][mid] = {"fetched": datetime.now().isoformat(), "body": body, "date": dt.strftime("%m/%d/%Y")}
         time.sleep(0.3)
 
     state["last_fetch"] = datetime.now().isoformat()
