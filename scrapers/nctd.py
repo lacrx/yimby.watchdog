@@ -83,9 +83,11 @@ def fetch_board_agenda_page():
 def parse_meetings(html):
     """Extract meetings from NCTD board agenda page.
 
-    Page uses <table class="agenda-table"> with <th> cells (not <td>).
-    Layout: th[0]=date, th[1]=time, th[2]=type, th[3]=location, th[4]=agenda, th[5]=video.
-    First two rows per table are headers. Year from first row text.
+    Page uses <table class="agenda-table">; cells are <td> now (were <th>), so
+    both are accepted. Layout: [0]=date, [1]=time, [2]=type, [3]=location,
+    [4]=agenda, [5]=video. Header and note rows are skipped by content (a row
+    must have 3+ cells and a parseable "Month DD" date). Year comes from the
+    table caption (or first row text).
     """
     soup = BeautifulSoup(html, "lxml")
     meetings = []
@@ -97,17 +99,19 @@ def parse_meetings(html):
         if not rows:
             continue
 
-        year_match = re.search(r"(20\d{2})", rows[0].get_text())
+        caption = table.find("caption")
+        year_src = caption.get_text() if caption else rows[0].get_text()
+        year_match = re.search(r"(20\d{2})", year_src) or re.search(r"(20\d{2})", rows[0].get_text())
         year = int(year_match.group(1)) if year_match else datetime.now().year
 
-        for row in rows[2:]:
-            cells = row.find_all("th")
+        for row in rows:
+            cells = row.find_all(["th", "td"])
             if len(cells) < 3:
                 continue
 
             date_text = cells[0].get_text(strip=True)
-            if not re.match(r"[A-Z]", date_text):
-                continue
+            if not re.match(r"[A-Z][a-z]+\.?\s+\d{1,2}\b", date_text):
+                continue  # header row ("Date"), note row, etc.
 
             time_text = cells[1].get_text(strip=True)
             meeting_type = cells[2].get_text(strip=True)
@@ -120,6 +124,8 @@ def parse_meetings(html):
                     break
                 except ValueError:
                     pass
+            if dt is None:
+                continue
 
             links = row.find_all("a", href=True)
             pdf_url = next(
@@ -144,6 +150,48 @@ def parse_meetings(html):
             })
 
     return meetings
+
+
+def mark_moved_meetings(parsed):
+    """Flag meeting dirs whose date no longer appears on the live page.
+
+    Only considers years the page currently lists (older years may simply have
+    been dropped). Target is the same-body live meeting nearest in date (within 31
+    days); otherwise the dir is marked stale.
+    """
+    live_ids = {m["id"] for m in parsed}
+    live_years = {m["date"][-4:] for m in parsed}
+    by_body = {}
+    for m in parsed:
+        by_body.setdefault(m["body"], []).append(m)
+    marked = 0
+    for d in sorted(MEETINGS_DIR.iterdir()):
+        mf = d / "meeting.json"
+        meta = load_json(mf) if mf.exists() else None
+        if not meta or d.name in live_ids:
+            continue
+        if meta.get("date", "")[-4:] not in live_years:
+            continue
+        try:
+            old_dt = datetime.strptime(meta["date"], "%m/%d/%Y")
+        except (KeyError, ValueError):
+            continue
+        best, best_gap = None, 32
+        for c in by_body.get(meta.get("body"), []):
+            gap = abs((datetime.strptime(c["date"], "%m/%d/%Y") - old_dt).days)
+            if gap < best_gap:
+                best, best_gap = c, gap
+        if best:
+            meta["superseded_by"] = best["id"]
+            meta.pop("stale", None)
+        else:
+            meta["stale"] = True
+            meta.pop("superseded_by", None)
+        save_json(mf, meta)
+        marked += 1
+        print(f"  Moved/removed meeting {d.name} ({meta['body']} {meta['date']}): "
+              + (f"superseded_by {best['id']}" if best else "stale"))
+    return marked
 
 
 def keyword_scan(text, keywords=None):
@@ -177,13 +225,22 @@ def cmd_fetch(args):
     meetings = parse_meetings(html)
     print(f"Found {len(meetings)} meetings")
 
+    if not meetings:
+        print("ERROR: NCTD: listing parsed 0 meetings")
+        sys.exit(3)
+
+    mark_moved_meetings(meetings)
+
     for m in meetings:
         mid = m["id"]
         meeting_dir = MEETINGS_DIR / mid
         meeting_dir.mkdir(exist_ok=True)
 
         meta_file = meeting_dir / "meeting.json"
-        meta_file.write_text(json.dumps(m, indent=2))
+        old = load_json(meta_file) if meta_file.exists() else None
+        if old != m:
+            # Live listing is authoritative; drops any stale/superseded flags.
+            save_json(meta_file, m)
 
         print(f"\n{m['body']} — {m['date']} {m['time']}")
 

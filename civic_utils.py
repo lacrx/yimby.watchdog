@@ -10,6 +10,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 import yaml
@@ -118,6 +119,10 @@ _escribe_last_request = 0.0
 _escribe_notices = set()
 _cf_session = None  # lazy-init CloudflareSession for browser bypass
 _cf_cookies = {}    # domain -> {name: value} from last successful bypass
+_cf_busy_until = 0.0     # epoch; bypass skipped until then after BrowserBusy
+_cf_bypass_dead = False  # set after the first full bypass failure in this process
+_CF_CHALLENGE_STATUSES = (403, 429, 503)
+RECHECK_DAYS = 90        # re-visit window for meetings with no extracted docs
 
 
 def _escribe_state_file():
@@ -156,16 +161,62 @@ def _escribe_pace():
     _escribe_last_request = time.time()
 
 
+def _is_pdf_bytes(data):
+    return bool(data) and b"%PDF" in data[:1024]
+
+
+def _is_pdf_file(path):
+    try:
+        with open(path, "rb") as f:
+            return b"%PDF" in f.read(1024)
+    except OSError:
+        return False
+
+
+def _save_pdf(content, dest_path):
+    """Write content to dest_path only if it is a PDF (atomic via .part)."""
+    if not _is_pdf_bytes(content):
+        return False
+    part = dest_path.with_name(dest_path.name + ".part")
+    part.write_bytes(content)
+    os.replace(part, dest_path)
+    return True
+
+
+def _clear_escribe_cooldown():
+    try:
+        _escribe_state_file().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _disable_bypass():
+    global _cf_bypass_dead
+    _cf_bypass_dead = True
+    _escribe_notice("bypass-dead", "  cf_bypass: disabled for the rest of this run")
+
+
+def _bypass_fail(domain, reason):
+    """Log a FAIL line and stop further bypass attempts in this process."""
+    print(f"cf_bypass: FAIL {domain}: {reason}", flush=True)
+    _disable_bypass()
+
+
 def _try_browser_bypass(url, dest_path):
     """Attempt PDF download via Playwright browser session.
 
     Solves the Cloudflare challenge once per domain, then reuses cookies.
-    Returns True if PDF was saved, False otherwise.
+    Returns True only if a validated PDF was saved. After the first full
+    failure the bypass is disabled for the rest of the process.
     """
-    global _cf_session, _cf_cookies
+    global _cf_session, _cf_cookies, _cf_busy_until
+    if _cf_bypass_dead or time.time() < _cf_busy_until:
+        return False
+    domain = urlparse(url).netloc
     try:
-        from lib.cf_bypass import CloudflareSession
+        from lib.cf_bypass import CloudflareSession, BrowserBusy
     except ImportError:
+        _bypass_fail(domain, "playwright not importable")
         return False
 
     if _cf_session is None:
@@ -173,61 +224,96 @@ def _try_browser_bypass(url, dest_path):
         import atexit
         atexit.register(lambda: _cf_session.close() if _cf_session else None)
 
-    domain = _cf_session._domain(url)
+    def _fetch(cookies):
+        """Returns (status, content, challenged); status None on network error."""
+        ua = _cf_session.user_agent or BROWSER_UA  # cf_clearance is bound to the UA
+        try:
+            resp = requests.get(url, timeout=60, cookies=cookies,
+                                headers={"User-Agent": ua}, allow_redirects=True,
+                                verify=False)
+        except Exception:
+            return None, None, False
+        challenged = ("cf-mitigated" in resp.headers
+                      or resp.status_code in _CF_CHALLENGE_STATUSES)
+        return resp.status_code, resp.content, challenged
 
     # Step 1: try with cached cookies via requests
     if domain in _cf_cookies:
-        try:
-            resp = requests.get(url, timeout=60, cookies=_cf_cookies[domain],
-                                headers={"User-Agent": BROWSER_UA}, allow_redirects=True,
-                                verify=False)
-            if resp.status_code == 200 and b"%PDF" in resp.content[:10]:
-                dest_path.write_bytes(resp.content)
-                return True
-        except Exception:
-            pass
+        status, content, challenged = _fetch(_cf_cookies[domain])
+        if status == 200 and _save_pdf(content, dest_path):
+            _clear_escribe_cooldown()
+            print(f"cf_bypass: OK {domain} (cached-cookies)", flush=True)
+            return True
+        if not challenged:
+            # 404/410, 5xx, network error, non-PDF 200: cookies are fine, this doc is not
+            print(f"  download: no PDF from cached cookies (status {status}) for {url}", flush=True)
+            return False
+        # Cached cf_clearance expired or was rejected: drop it and re-solve once
+        _cf_cookies.pop(domain, None)
+        _cf_session.invalidate(domain)
 
     # Step 2: solve challenge, get fresh cookies
     print(f"  cf_bypass: solving Cloudflare challenge for {domain}...", flush=True)
-    cookies = _cf_session.get_request_cookies(url)
-    if cookies:
-        _cf_cookies[domain] = cookies
-        # Clear the cooldown since browser bypass works
-        try:
-            _escribe_state_file().unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            resp = requests.get(url, timeout=60, cookies=cookies,
-                                headers={"User-Agent": BROWSER_UA}, allow_redirects=True,
-                                verify=False)
-            if resp.status_code == 200 and b"%PDF" in resp.content[:10]:
-                dest_path.write_bytes(resp.content)
-                print(f"  cf_bypass: download succeeded with browser cookies", flush=True)
-                return True
-        except Exception:
-            pass
+    try:
+        cookies = _cf_session.get_request_cookies(url)
+    except BrowserBusy:
+        _cf_busy_until = time.time() + 300
+        _escribe_notice("bypass-busy", f"cf_bypass: skipped {domain}: browser busy in another process (retry in 5 min)")
+        return False
+    except ImportError:
+        _bypass_fail(domain, "playwright not importable")
+        return False
+    if not cookies:
+        # solve() already logged its FAIL line; only a real challenge disables the bypass
+        if getattr(_cf_session, "last_fail_challenge", True):
+            _disable_bypass()
+        return False
+
+    _cf_cookies[domain] = cookies
+    status, content, challenged = _fetch(cookies)
+    if status == 200 and _save_pdf(content, dest_path):
+        _clear_escribe_cooldown()
+        print(f"cf_bypass: OK {domain} (fresh-cookies)", flush=True)
+        return True
+    if not challenged:
+        # Challenge is cleared; this document is missing/broken. Not a bypass failure.
+        print(f"  download: non-PDF response ({status}) for {url}", flush=True)
+        return False
 
     # Step 3: direct browser download as last resort
     print(f"  cf_bypass: trying direct browser download...", flush=True)
     try:
         data = _cf_session.download(url, dest_path)
-        if data and b"%PDF" in data[:10]:
-            print(f"  cf_bypass: direct browser download succeeded", flush=True)
+        if _is_pdf_bytes(data) and dest_path.exists() and _is_pdf_file(dest_path):
+            _clear_escribe_cooldown()
+            print(f"cf_bypass: OK {domain} (browser-download)", flush=True)
             return True
+    except BrowserBusy:
+        _cf_busy_until = time.time() + 300
+        return False
     except Exception as e:
-        print(f"  cf_bypass: browser download failed: {e}", flush=True)
+        print(f"cf_bypass: FAIL {domain}: browser download error: {e}", flush=True)
+        return False
 
+    _bypass_fail(domain, "no PDF obtained via cookies or browser download")
     return False
 
 
 def download_pdf(url, dest_path, headers=None, verify=True):
-    """Download a PDF. Skips if already exists and non-empty.
+    """Download a PDF. Skips if already exists and valid.
 
+    For .pdf destinations an existing file must start with %PDF; otherwise
+    (e.g. a saved challenge page) it is deleted and re-fetched.
     eScribe URLs are paced and attempt browser bypass on Cloudflare 403.
     """
     if dest_path.exists() and dest_path.stat().st_size > 0:
-        return True
+        if dest_path.suffix.lower() != ".pdf" or _is_pdf_file(dest_path):
+            return True
+        print(f"  download: {dest_path.name} is not a PDF; discarding and re-fetching", flush=True)
+        try:
+            dest_path.unlink()
+        except OSError:
+            pass
     is_escribe = ESCRIBE_HOST in url
     if is_escribe:
         until = escribe_blocked_until()
@@ -246,9 +332,10 @@ def download_pdf(url, dest_path, headers=None, verify=True):
         resp = requests.get(url, timeout=60, headers=hdrs, allow_redirects=True,
                             verify=verify)
         resp.raise_for_status()
-        if b"%PDF" in resp.content[:10]:
-            dest_path.write_bytes(resp.content)
+        if _save_pdf(resp.content, dest_path):
             return True
+        print(f"  download: non-PDF response ({resp.status_code}, "
+              f"{resp.headers.get('Content-Type', '?')}) for {url}", flush=True)
         return False
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
@@ -367,7 +454,7 @@ def make_meeting_id_hash(prefix, body, date_str):
     return hashlib.md5(f"{prefix}-{body}-{date_str}".encode()).hexdigest()[:12]
 
 
-def meeting_needs_recheck(meeting_id, docs_dir, meeting_date_str, max_age_days=60):
+def meeting_needs_recheck(meeting_id, docs_dir, meeting_date_str, max_age_days=RECHECK_DAYS):
     """Return True if a meeting should be re-visited despite being in state.
 
     A meeting needs re-check when it has no extracted documents and its date

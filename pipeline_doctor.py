@@ -20,12 +20,28 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime
+from bisect import bisect_left
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(REPO_ROOT))
-from civic_utils import load_agencies, all_docs_dirs, agency_data_dir
+from civic_utils import (load_agencies, all_docs_dirs, agency_data_dir,
+                         agency_docs_dir, agency_meetings_dir, normalize_date,
+                         escribe_blocked_until)
+try:
+    from civic_utils import RECHECK_DAYS
+except ImportError:  # civic_utils builder not landed yet
+    RECHECK_DAYS = 90
+try:
+    from transforms.triage import predict_relevance
+except ImportError:
+    predict_relevance = None
+try:
+    # Real eligibility check (validates src_size etc). Import is side-effect free.
+    from transforms.extract_structured import has_skip_marker as _has_skip_marker
+except ImportError:
+    _has_skip_marker = None
 
 DATA_DIR = REPO_ROOT / "data"
 STRUCTURED_DIR = DATA_DIR / "structured"
@@ -40,6 +56,8 @@ SAFE_SKIP_REASONS = {
 }
 
 MAX_SOURCE_SIZE_FOR_SKIP = 2_000_000  # 2MB — anything bigger is almost certainly not meeting text
+RUN_WINDOW_DAYS = 7  # window for zero-extraction run counting
+CADENCE_QUIET_DAYS = 21  # regular-cadence agencies silent longer than this are flagged
 
 
 def read_tail(path, lines=500):
@@ -119,8 +137,14 @@ def get_extraction_errors(log_lines):
     return errors
 
 
-def get_pipeline_errors(log_lines):
-    """Parse pipeline cron log for phase-level errors."""
+def get_pipeline_errors(log_lines, now=None):
+    """Parse pipeline cron log for phase-level errors.
+
+    zero_extraction_runs counts "No new extractions" lines whose own timestamp
+    is within RUN_WINDOW_DAYS of `now` (a time window, not a line window).
+    """
+    now = now or datetime.now()
+    window_start = now - timedelta(days=RUN_WINDOW_DAYS)
     errors = {
         "terminated_phases": [],
         "failed_phases": [],
@@ -176,10 +200,13 @@ def get_pipeline_errors(log_lines):
         if "failed" in line.lower() and "continuing" in line.lower():
             errors["failed_phases"].append(line)
 
-        if "No new extractions" in line:
+        if "No new extractions" in line and ts and ts >= window_start:
             errors["zero_extraction_runs"] += 1
 
-        if re.search(r'New extractions: \d+', line):
+        # civic-pipeline logs "Extractions: X hot + Y cold = Z total."; the old
+        # "New extractions: N" form is kept for older log lines.
+        ext_m = re.search(r'Extractions: (\d+) hot \+ (\d+) cold = (\d+) total', line)
+        if (ext_m and int(ext_m.group(3)) > 0) or re.search(r'New extractions: \d+', line):
             errors["last_productive_run"] = current_date
 
         # Track phase durations
@@ -234,7 +261,12 @@ def find_blocking_files():
 def find_oversized_files():
     """Find source files that are too large and likely not meeting content."""
     oversized = []
-    for docs_dir in all_docs_dirs():
+    for slug, cfg in load_agencies().items():
+        if cfg.get("tally_only"):
+            continue  # never extracted, so size is irrelevant
+        docs_dir = agency_docs_dir(slug)
+        if not docs_dir.exists():
+            continue
         for f in docs_dir.glob("*.txt"):
             if f.stat().st_size > MAX_SOURCE_SIZE_FOR_SKIP:
                 skip_path = f.with_suffix(f.suffix + ".skip")
@@ -281,8 +313,18 @@ def count_remaining():
 
     Mirrors extract_structured eligibility: skips .skip/.split markers,
     tally_only agencies, and forward_only docs dated before enabled_date
-    (or undated, which the hot queue never takes). Triage is not applied.
+    (or undated, which the hot queue never takes), docs with a valid .skip
+    marker (extract_structured.has_skip_marker when importable), and docs the
+    rule-based triage (transforms.triage.predict_relevance, the same call
+    extract_structured makes) would skip.
     """
+    remaining, _ = _count_remaining()
+    return remaining
+
+
+def _count_remaining():
+    """Return (remaining, triage_skipped_count)."""
+    triage_skipped = 0
     extracted = set(f.stem for f in STRUCTURED_DIR.glob("*.json"))
     remaining = []
     for slug, cfg in load_agencies().items():
@@ -296,32 +338,108 @@ def count_remaining():
         for f in docs_dir.glob("*.txt"):
             if f.stem in extracted:
                 continue
-            if f.with_suffix(".txt.skip").exists() or f.with_suffix(".txt.split").exists():
+            if _has_skip_marker is not None:
+                if _has_skip_marker(f):
+                    continue
+            elif f.with_suffix(".txt.skip").exists() or f.with_suffix(".txt.split").exists():
                 continue
             if forward_from is not None:
                 d = dates.get(f.name, "")
                 if not d or d < forward_from:
                     continue
+            if predict_relevance is not None:
+                try:
+                    extract, _prob = predict_relevance(f.read_text(errors="replace"), f.name)
+                except OSError:
+                    extract = True
+                if not extract:
+                    triage_skipped += 1
+                    continue
             remaining.append(f)
-    return remaining
+    return remaining, triage_skipped
 
 
 def find_stale_agencies(max_age_days=30):
-    """Agencies with no dated meeting document in the last max_age_days.
+    """Agencies that stopped producing dated meeting documents.
 
     Catches scrapers that run without errors but stop producing documents
-    (blocked downloads, moved sites, dead DNS).
+    (blocked downloads, moved sites, dead DNS). Two rules, one result list:
+      - no dated document in max_age_days (any agency), or
+      - cadence: the agency historically meets at least every 3 weeks (median
+        gap between distinct meeting dates over the prior year <= 21 days)
+        yet its newest meeting is older than CADENCE_QUIET_DAYS. This covers
+        agencies whose data model cannot show per-meeting gaps.
+    Returns [(name, newest_date_or_never, reason)].
     """
-    from datetime import timedelta
-    cutoff = (datetime.now().date() - timedelta(days=max_age_days)).isoformat()
-    today = datetime.now().date().isoformat()
+    today_d = datetime.now().date()
+    cutoff = (today_d - timedelta(days=max_age_days)).isoformat()
+    quiet_cutoff = (today_d - timedelta(days=CADENCE_QUIET_DAYS)).isoformat()
+    today = today_d.isoformat()
     stale = []
     for slug, cfg in load_agencies().items():
-        dates = [d for d in _load_doc_dates(slug).values() if d and d <= today]
-        newest = max(dates) if dates else ""
+        dates = sorted({d for d in _load_doc_dates(slug).values() if d and d <= today})
+        newest = dates[-1] if dates else ""
+        name = cfg.get("name", slug)
         if newest < cutoff:
-            stale.append((cfg.get("name", slug), newest or "never"))
+            stale.append((name, newest or "never", "no dated meeting document"))
+            continue
+        if newest < quiet_cutoff:
+            year_ago = (datetime.strptime(newest, "%Y-%m-%d").date() - timedelta(days=365)).isoformat()
+            hist = [datetime.strptime(d, "%Y-%m-%d").date() for d in dates if d >= year_ago]
+            gaps = sorted((b - a).days for a, b in zip(hist, hist[1:]))
+            if len(gaps) >= 4 and gaps[len(gaps) // 2] <= CADENCE_QUIET_DAYS:
+                stale.append((name, newest,
+                              f"normally meets every ~{gaps[len(gaps) // 2]}d but silent >{CADENCE_QUIET_DAYS}d"))
     return stale
+
+
+def _latest_run_lines(lines):
+    """Slice of pipeline log lines from the last 'Starting civic pipeline' on."""
+    start = 0
+    for i, line in enumerate(lines):
+        if "Starting civic pipeline" in line:
+            start = i
+    return lines[start:]
+
+
+def find_phase_errors(lines):
+    """`[local] ERROR:` lines (civic-pipeline phase failures) in the latest run."""
+    return [l.strip() for l in _latest_run_lines(lines)
+            if re.search(r'\] \[[^\]]+\] ERROR:', l)]
+
+
+def find_cf_bypass_failures():
+    """`cf_bypass: FAIL` lines from the latest eScribe-agency watch.log runs and the
+    latest escribe-sweep run (they are not written to pipeline-cron.log)."""
+    hits = []
+    for slug, cfg in load_agencies().items():
+        if cfg.get("platform") not in ("escribe", "solana_drupal"):
+            continue
+        lines = read_tail(agency_data_dir(slug) / "watch.log", 200)
+        start = 0
+        for i, l in enumerate(lines):
+            if l.startswith(("Fetching ", "Resuming from", "Scanning ")):
+                start = i
+        hits += [l.strip() for l in lines[start:] if "cf_bypass: FAIL" in l]
+    sweep = read_tail(DATA_DIR / "escribe-sweep.log", 300)
+    dones = [i for i, l in enumerate(sweep) if l.rstrip().endswith("[escribe-sweep] Done.")]
+    start = dones[-2] + 1 if len(dones) >= 2 else 0
+    hits += [l.strip() for l in sweep[start:] if "cf_bypass: FAIL" in l]
+    return hits
+
+
+def find_empty_listings():
+    """Agencies whose latest watch.log run reports `listing parsed 0 meetings`."""
+    hits = []
+    for slug, cfg in load_agencies().items():
+        lines = read_tail(agency_data_dir(slug) / "watch.log", 200)
+        start = 0
+        for i, l in enumerate(lines):
+            if l.startswith(("Fetching ", "Resuming from", "Scanning ")):
+                start = i
+        if any("listing parsed 0 meetings" in l for l in lines[start:]):
+            hits.append(cfg.get("name", slug))
+    return hits
 
 
 def build_autofix_prompt(findings, extraction_log_lines, pipeline_log_lines):
@@ -436,7 +554,12 @@ def diagnose(dry_run=False):
 
     # 2. Check pipeline log
     pipe_lines = read_tail(PIPELINE_LOG, 200)
-    pipe_errors = get_pipeline_errors(pipe_lines)
+    pipe_errors = get_pipeline_errors(pipe_lines, now)
+    # Run counting needs the whole time window, not the last 200 lines.
+    all_pipe_lines = read_tail(PIPELINE_LOG, 50000)
+    run_stats = get_pipeline_errors(all_pipe_lines, now)
+    pipe_errors["zero_extraction_runs"] = run_stats["zero_extraction_runs"]
+    pipe_errors["last_productive_run"] = run_stats["last_productive_run"]
 
     # 3. Find blocking files
     blockers = find_blocking_files()
@@ -445,7 +568,7 @@ def diagnose(dry_run=False):
     oversized = find_oversized_files()
 
     # 5. Count remaining
-    remaining = count_remaining()
+    remaining, triage_skipped = _count_remaining()
 
     # 6. Check auth
     auth_status = check_auth_health()
@@ -464,6 +587,7 @@ def diagnose(dry_run=False):
 
     diagnosis["stats"] = {
         "remaining_files": len(remaining),
+        "triage_skipped": triage_skipped,
         "auth_status": auth_status,
         "zero_extraction_runs_recent": pipe_errors["zero_extraction_runs"],
         "last_productive_run": pipe_errors["last_productive_run"],
@@ -479,7 +603,7 @@ def diagnose(dry_run=False):
     print(f"  Auth status:         {auth_status}")
     print(f"  Failing extractions: {len(failing_files)}")
     print(f"  Last productive run: {pipe_errors['last_productive_run'] or 'unknown'}")
-    print(f"  Zero-extraction runs: {pipe_errors['zero_extraction_runs']} (recent)")
+    print(f"  Zero-extraction runs: {pipe_errors['zero_extraction_runs']} (last {RUN_WINDOW_DAYS}d)")
     print()
 
     # ─── Finding: Blocking files ───
@@ -640,22 +764,28 @@ def diagnose(dry_run=False):
 
     # ─── Finding: agencies that stopped producing documents ───
 
-    for name, newest in find_stale_agencies():
-        finding = f"{name}: no dated meeting document since {newest} (scraper may be blocked or broken)"
+    for name, newest, reason in find_stale_agencies():
+        finding = f"{name}: {reason}; newest meeting {newest} (scraper may be blocked or broken)"
         diagnosis["findings"].append(finding)
         print(f"  FINDING: {finding}")
 
     # ─── Finding: meetings with no documents ───
 
-    from civic_utils import agency_meetings_dir, agency_docs_dir
-    EMPTY_MEETING_AGE_LIMIT = 90
+    cancel_re = re.compile(r"cancel", re.I)
     for slug, cfg in load_agencies().items():
         meetings_dir = agency_meetings_dir(slug)
         docs_dir_path = agency_docs_dir(slug)
         if not meetings_dir.exists():
             continue
+        bodies = {b.strip().lower() for b in (cfg.get("bodies") or []) if isinstance(b, str)}
+        # List the docs dir once; sorted names allow prefix lookups by bisect.
+        doc_names = []
+        if docs_dir_path.exists():
+            doc_names = sorted(f.name for f in docs_dir_path.iterdir()
+                               if f.suffix == ".txt" and f.stat().st_size > 0)
         empty_count = 0
         total_past = 0
+        undated = 0
         for mdir in meetings_dir.iterdir():
             mf = mdir / "meeting.json"
             if not mf.exists():
@@ -664,44 +794,72 @@ def diagnose(dry_run=False):
                 m = json.loads(mf.read_text())
             except (json.JSONDecodeError, OSError):
                 continue
-            date_str = m.get("date", "")
-            if not date_str:
+            if not isinstance(m, dict):
                 continue
-            from civic_utils import normalize_date
-            norm = normalize_date(date_str)
-            if not norm:
+            if (m.get("cancelled") or m.get("superseded_by")
+                    or m.get("stale") or m.get("no_assets")):
                 continue
-            try:
-                mdt = datetime.strptime(norm, "%Y-%m-%d")
-            except ValueError:
+            if bodies and (m.get("body") or "").strip().lower() not in bodies:
+                continue
+            norm = normalize_date(m.get("date", "")) if m.get("date") else None
+            mdt = None
+            if norm:
+                try:
+                    mdt = datetime.strptime(norm, "%Y-%m-%d")
+                except ValueError:
+                    pass
+            if mdt is None:
+                undated += 1
                 continue
             age_days = (now - mdt).days
-            if age_days < 7 or age_days > EMPTY_MEETING_AGE_LIMIT:
+            if age_days < 7 or age_days > RECHECK_DAYS:
+                continue
+            prefix = mdir.name + "-"
+            k = bisect_left(doc_names, prefix)
+            mine = []
+            while k < len(doc_names) and doc_names[k].startswith(prefix):
+                mine.append(doc_names[k])
+                k += 1
+            if mine and all(cancel_re.search(n) for n in mine):
+                continue  # only doc is a cancellation notice
+            if not mine and cancel_re.search(m.get("title") or ""):
                 continue
             total_past += 1
-            mid = mdir.name
-            has_docs = False
-            if docs_dir_path.exists():
-                prefix = mid + "-"
-                for f in docs_dir_path.iterdir():
-                    if f.name.startswith(prefix) and f.suffix == ".txt" and f.stat().st_size > 0:
-                        has_docs = True
-                        break
-            if not has_docs:
+            if not mine:
                 empty_count += 1
         if empty_count > 0 and total_past > 0:
             pct = empty_count / total_past * 100
-            finding = f"{cfg.get('name', slug)}: {empty_count}/{total_past} past meetings ({pct:.0f}%) have no documents (7-{EMPTY_MEETING_AGE_LIMIT}d window)"
+            finding = f"{cfg.get('name', slug)}: {empty_count}/{total_past} past meetings ({pct:.0f}%) have no documents (7-{RECHECK_DAYS}d window)"
+            diagnosis["findings"].append(finding)
+            print(f"  FINDING: {finding}")
+        if undated:
+            finding = f"{cfg.get('name', slug)}: {undated} meeting row(s) have no parseable date (excluded from coverage check)"
             diagnosis["findings"].append(finding)
             print(f"  FINDING: {finding}")
 
+    # ─── Finding: phase errors / empty listings in latest run ───
+
+    for err in find_phase_errors(all_pipe_lines):
+        finding = f"Latest pipeline run: {err[:160]}"
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+    for name in find_empty_listings():
+        finding = f"{name}: latest scrape parsed 0 meetings (listing broken or site changed)"
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+
     # ─── Finding: eScribe Cloudflare challenge ───
 
-    from civic_utils import escribe_blocked_until
     until = escribe_blocked_until()
     if until:
         finding = (f"eScribe downloads paused (Cloudflare challenge) until "
                    f"{datetime.fromtimestamp(until):%H:%M}; escribe-sweep retries later")
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+
+    cf_fails = find_cf_bypass_failures()
+    if cf_fails:
+        finding = f"cf_bypass failed {len(cf_fails)}x in latest scrape/sweep runs; last: {cf_fails[-1][-140:]}"
         diagnosis["findings"].append(finding)
         print(f"  FINDING: {finding}")
 
@@ -854,7 +1012,8 @@ def diagnose(dry_run=False):
 
     # ─── Finding: Stalled pipeline ───
 
-    if pipe_errors["zero_extraction_runs"] >= 3:
+    # Zero extractions with an empty queue is idle, not stalled.
+    if pipe_errors["zero_extraction_runs"] >= 3 and len(remaining) > 0:
         finding = f"Pipeline produced zero extractions {pipe_errors['zero_extraction_runs']} recent runs"
         diagnosis["findings"].append(finding)
         print(f"  FINDING: {finding}")
@@ -1068,10 +1227,12 @@ def diagnose(dry_run=False):
 
     # ─── Persist ───
 
-    with open(DIAGNOSIS_LOG, "a") as f:
-        f.write(json.dumps(diagnosis, default=str) + "\n")
-
-    print(f"\n  Diagnosis saved to {DIAGNOSIS_LOG}")
+    if dry_run:
+        print("\n  Dry run: diagnosis not saved.")
+    else:
+        with open(DIAGNOSIS_LOG, "a") as f:
+            f.write(json.dumps(diagnosis, default=str) + "\n")
+        print(f"\n  Diagnosis saved to {DIAGNOSIS_LOG}")
     return diagnosis
 
 

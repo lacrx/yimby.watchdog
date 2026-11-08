@@ -22,8 +22,9 @@ if ! flock -n 9; then
     log "Another sweep is running; exiting."
     exit 0
 fi
-# Don't overlap a pipeline run (it holds the extraction pid file while active).
-if pgrep -f "civic-pipeline" >/dev/null; then
+# Don't overlap a pipeline run (civic-pipeline keeps data/.pipeline.pid while active).
+PIPE_PID=$(cat data/.pipeline.pid 2>/dev/null || true)
+if [ -n "$PIPE_PID" ] && kill -0 "$PIPE_PID" 2>/dev/null; then
     log "Pipeline running; exiting."
     exit 0
 fi
@@ -46,7 +47,14 @@ while IFS='|' read -r SLUG PLATFORM; do
         break
     fi
     BEFORE=$(find "data/$SLUG/documents" -name '*.txt' 2>/dev/null | wc -l)
-    timeout 1200 "${CMD[@]}" >> "data/$SLUG/watch.log" 2>&1
+    mkdir -p "data/$SLUG"
+    RC=0
+    timeout -k 30 1200 "${CMD[@]}" >> "data/$SLUG/watch.log" 2>&1 < /dev/null || RC=$?
+    if [ "$RC" -eq 124 ]; then
+        log "ERROR: $SLUG sweep timed out"
+    elif [ "$RC" -ne 0 ]; then
+        log "ERROR: $SLUG sweep failed (rc=$RC)"
+    fi
     AFTER=$(find "data/$SLUG/documents" -name '*.txt' 2>/dev/null | wc -l)
     log "$SLUG: $((AFTER - BEFORE)) new documents"
 done < <(python3 -c "

@@ -34,7 +34,10 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import requests
 from bs4 import BeautifulSoup
+import civic_utils
 from civic_utils import agency_data_dir, rebuild_doc_index, log_discovery
+
+RECHECK_DAYS = getattr(civic_utils, "RECHECK_DAYS", 90)
 
 ENV_FILE = REPO_ROOT / ".env"
 if ENV_FILE.exists():
@@ -297,13 +300,50 @@ def keyword_scan(text, keywords=None):
 # ── Commands ──
 
 
+def _norm_body(body):
+    return re.sub(r"[^a-z0-9]+", " ", (body or "").lower()).strip()
+
+
+def mark_superseded_hash_rows():
+    """Hash-id rows (md5 fallback, no detail link yet) become ghosts once the
+    numeric-id row for the same date and body appears. Mark them superseded_by."""
+    rows = []
+    for mdir in MEETINGS_DIR.iterdir():
+        mf = mdir / "meeting.json"
+        if not mf.exists():
+            continue
+        try:
+            rows.append((mdir.name, mf, json.loads(mf.read_text())))
+        except (ValueError, OSError):
+            continue
+    numeric = {}
+    for mid, _, meta in rows:
+        if mid.isdigit():
+            numeric[(meta.get("date", "").strip(), _norm_body(meta.get("body")))] = mid
+    marked = 0
+    for mid, mf, meta in rows:
+        if mid.isdigit() or meta.get("superseded_by"):
+            continue
+        key = (meta.get("date", "").strip(), _norm_body(meta.get("body")))
+        if key in numeric:
+            meta["superseded_by"] = numeric[key]
+            mf.write_text(json.dumps(meta, indent=2))
+            marked += 1
+            print(f"  Superseded ghost row {mid} -> {numeric[key]}")
+    return marked
+
+
 def cmd_fetch(args):
     """Fetch latest meetings and download documents."""
     ensure_dirs()
     state = load_state()
 
-    current_year = datetime.now().year
+    now = datetime.now()
+    current_year = now.year
     years = list(range(current_year - (args.years - 1), current_year + 1)) if hasattr(args, "years") and args.years > 1 else [current_year]
+    # Early in the year, December meetings (late minutes, rechecks) live in last year's calendar.
+    if now.month <= 2 and (current_year - 1) not in years:
+        years.insert(0, current_year - 1)
 
     meetings = []
     for year in years:
@@ -317,7 +357,7 @@ def cmd_fetch(args):
     print(f"Found {len(meetings)} meetings across {len(years)} year(s)")
 
     force = getattr(args, "force", False)
-    recency_cutoff = datetime.now() - timedelta(days=30)
+    recency_cutoff = datetime.now() - timedelta(days=RECHECK_DAYS)
     skipped = 0
 
     for m in meetings:
@@ -329,6 +369,12 @@ def cmd_fetch(args):
         meeting_dir.mkdir(exist_ok=True)
 
         meta_file = meeting_dir / "meeting.json"
+        try:
+            old_meta = json.loads(meta_file.read_text()) if meta_file.exists() else {}
+        except (ValueError, OSError):
+            old_meta = {}
+        if old_meta.get("superseded_by"):
+            m["superseded_by"] = old_meta["superseded_by"]
         meta_file.write_text(json.dumps(m, indent=2))
 
         already_fetched = mid in state.get("meetings", {})
@@ -428,6 +474,7 @@ def cmd_fetch(args):
     if skipped:
         print(f"\nSkipped {skipped} previously fetched meetings (unchanged)")
 
+    mark_superseded_hash_rows()
     state["last_fetch"] = datetime.now().isoformat()
     rebuild_doc_index("oceanside", state, DOCS_DIR)
     save_state(state)

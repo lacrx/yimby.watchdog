@@ -91,6 +91,8 @@ def fetch_escribe_meetings(cutoff_date, escribe_bodies, deep=False):
 
     for body_type in escribe_bodies:
         page = 1
+        seen = 0
+        seen_ids = set()
         while True:
             resp = session.post(PAST_MEETINGS_URL, json={
                 "type": body_type,
@@ -102,6 +104,14 @@ def fetch_escribe_meetings(cutoff_date, escribe_bodies, deep=False):
 
             if not meetings:
                 break
+
+            # Guard against an API that repeats the last page forever.
+            page_ids = {m.get("Id") for m in meetings}
+            if page_ids and page_ids <= seen_ids:
+                break
+            seen_ids |= page_ids
+            seen += len(meetings)
+            total = data.get("TotalCount")
 
             hit_cutoff = False
             for m in meetings:
@@ -132,7 +142,9 @@ def fetch_escribe_meetings(cutoff_date, escribe_bodies, deep=False):
                     "docs": docs,
                 })
 
-            if hit_cutoff or len(meetings) < 10:
+            # Page size is not fixed (17 observed), so paginate until an empty
+            # page, the cutoff, or TotalCount is reached.
+            if hit_cutoff or (isinstance(total, int) and seen >= total):
                 break
             page += 1
 
@@ -144,6 +156,11 @@ def fetch_escribe_meetings(cutoff_date, escribe_bodies, deep=False):
 def meeting_id_drupal(body, dt):
     body_slug = re.sub(r'[^a-z0-9]+', '-', body.lower()).strip('-')[:30]
     return f"sb-{body_slug}-{dt.strftime('%Y%m%d')}"
+
+
+AGENDA_FIELDS = ".views-field-field-agenda-or-action-agenda, .views-field-field-notice-or-agenda"
+PACKET_FIELDS = ".views-field-field-combined-agenda-packet"
+MINUTES_FIELDS = ".views-field-field-approved-minutes"
 
 
 def parse_drupal_page(html, base_url, body_prefix=None, cutoff_date=None):
@@ -186,9 +203,9 @@ def parse_drupal_page(html, base_url, body_prefix=None, cutoff_date=None):
         # Collect document links from each field
         docs = []
 
-        # Action agenda
-        agenda_field = row.select_one(".views-field-field-agenda-or-action-agenda")
-        if agenda_field:
+        # Agenda. Council rows use field-agenda-or-action-agenda; commission
+        # rows use field-notice-or-agenda. Accept both.
+        for agenda_field in row.select(AGENDA_FIELDS):
             for a in agenda_field.find_all("a", href=True):
                 href = a["href"]
                 if not href.startswith("http"):
@@ -196,8 +213,7 @@ def parse_drupal_page(html, base_url, body_prefix=None, cutoff_date=None):
                 docs.append({"url": href, "type": "agenda", "text": a.get_text(strip=True)})
 
         # Packet
-        packet_field = row.select_one(".views-field-field-combined-agenda-packet")
-        if packet_field:
+        for packet_field in row.select(PACKET_FIELDS):
             for a in packet_field.find_all("a", href=True):
                 href = a["href"]
                 if not href.startswith("http"):
@@ -205,8 +221,7 @@ def parse_drupal_page(html, base_url, body_prefix=None, cutoff_date=None):
                 docs.append({"url": href, "type": "packet", "text": a.get_text(strip=True)})
 
         # Minutes
-        minutes_field = row.select_one(".views-field-field-approved-minutes")
-        if minutes_field:
+        for minutes_field in row.select(MINUTES_FIELDS):
             for a in minutes_field.find_all("a", href=True):
                 href = a["href"]
                 if not href.startswith("http"):
@@ -288,6 +303,7 @@ def cmd_fetch(args):
 
     new_count = 0
     doc_count = 0
+    failures = 0  # eScribe API errors (download misses are only retried)
 
     # Source 1: eScribe for 2026+ council meetings
     print("\n  eScribe API (2026+ council)...")
@@ -321,6 +337,7 @@ def cmd_fetch(args):
                 continue
 
             docs = item["docs"]
+            all_ok = True
             if docs.get("agenda_url"):
                 dest = docs_dir / f"{mid}-agenda.pdf"
                 if download_pdf(docs["agenda_url"], dest, verify=False):
@@ -328,6 +345,8 @@ def cmd_fetch(args):
                     if text:
                         doc_count += 1
                     time.sleep(0.3)
+                else:
+                    all_ok = False
 
             if docs.get("minutes_url"):
                 dest = docs_dir / f"{mid}-minutes.pdf"
@@ -336,10 +355,17 @@ def cmd_fetch(args):
                     if text:
                         doc_count += 1
                     time.sleep(0.3)
+                else:
+                    all_ok = False
 
-            state["meetings"][mid]["fetched"] = datetime.now().isoformat()
+            # Only mark fetched when every attempted download succeeded.
+            if all_ok:
+                state["meetings"][mid]["fetched"] = datetime.now().isoformat()
+            else:
+                print(f"    Download failed for {meta['body']} {meta['date']}; will retry next run")
     except Exception as e:
-        print(f"    eScribe error: {e}")
+        failures += 1
+        print(f"ERROR: Solana Beach: eScribe API failed: {e}")
 
     # Source 2: Drupal for historical + commissions
     print("\n  Drupal pages (historical + commissions)...")
@@ -397,16 +423,24 @@ def cmd_fetch(args):
                     doc_count += 1
                 time.sleep(0.3)
 
-        state["meetings"][mid] = {
+        # Update in place: keep any date/title already recorded.
+        state["meetings"].setdefault(mid, {}).update({
             "fetched": datetime.now().isoformat(),
             "body": meeting["body"],
-        }
+            "date": meeting["date"].strftime("%m/%d/%Y"),
+            "title": f"{meeting['body']} \u2014 {meeting['date'].strftime('%b %d, %Y')}",
+        })
 
     state["last_fetch"] = datetime.now().isoformat()
     rebuild_doc_index("solana_beach", state, docs_dir)
     save_json(state_file, state)
     log_discovery("solana_beach", meetings_new=new_count, docs_new=doc_count)
     print(f"\nDone. {new_count} new meetings, {doc_count} documents extracted.")
+    if not drupal_meetings:
+        print("ERROR: Solana Beach: listing parsed 0 meetings")
+        sys.exit(3)
+    if failures:
+        sys.exit(1)
 
 
 def cmd_list(args):

@@ -37,6 +37,21 @@ DEFAULT_PLAYLISTS = {
     "Planning Commission": "PLUunlla2QsxGU8lQ-GUqresB-pzfcXYhA",
 }
 PLAYLISTS = config.get("videos/playlists", DEFAULT_PLAYLISTS)
+# The playlists above belong to one agency's YouTube channel. Only that
+# agency's meetings may be matched against them (other cities also hold
+# "City Council" meetings on the same dates).
+PLAYLIST_AGENCY = config.get("videos/playlist_agency", "oceanside")
+
+# Only real video URLs are transcribable; channel pages (youtube.com/GoNCTD) are not.
+VIDEO_URL_RE = re.compile(
+    r"^https?://(?:(?:www\.|m\.)?youtube\.com/(?:watch\?(?:[^#]*&)?v=|live/)[\w-]{6,}"
+    r"|youtu\.be/[\w-]{6,})",
+    re.IGNORECASE,
+)
+
+
+def is_video_url(url):
+    return bool(url and VIDEO_URL_RE.match(url.strip()))
 
 # Bodies whose meetings always warrant transcription
 HIGH_PRIORITY_BODIES = {
@@ -78,19 +93,22 @@ def parse_date_from_title(title):
 
 
 def fetch_playlist_videos(playlist_id):
-    """Fetch video URLs and titles from a YouTube playlist using yt-dlp."""
+    """Fetch video URLs and titles from a YouTube playlist using yt-dlp.
+
+    Returns a list of videos, or None if yt-dlp could not be run or failed.
+    """
     try:
         result = subprocess.run(
             [
-                "yt-dlp", "--flat-playlist",
+                sys.executable, "-m", "yt_dlp", "--flat-playlist",
                 "--print", "%(id)s\t%(title)s\t%(upload_date)s",
                 f"https://www.youtube.com/playlist?list={playlist_id}",
             ],
             capture_output=True, text=True, timeout=120,
         )
         if result.returncode != 0:
-            print(f"  yt-dlp error: {result.stderr[:200]}")
-            return []
+            print(f"ERROR: yt-dlp failed: {result.stderr.strip()[:300]}")
+            return None
 
         videos = []
         for line in result.stdout.strip().split("\n"):
@@ -108,12 +126,12 @@ def fetch_playlist_videos(playlist_id):
                     "upload_date": upload_date,
                 })
         return videos
-    except FileNotFoundError:
-        print("  yt-dlp not found. Install: pip install yt-dlp")
-        return []
+    except (FileNotFoundError, OSError) as e:
+        print(f"ERROR: yt-dlp failed: {e}")
+        return None
     except subprocess.TimeoutExpired:
-        print("  yt-dlp timed out")
-        return []
+        print("ERROR: yt-dlp failed: timed out after 120s")
+        return None
 
 
 def load_meetings():
@@ -199,8 +217,8 @@ def load_existing_batch():
     return []
 
 
-def match_video_to_meeting(video, meetings, body_filter):
-    """Match a YouTube video to a meeting by date and body."""
+def match_video_to_meeting(video, meetings, body_filter, agency=None):
+    """Match a YouTube video to a meeting by date, body and (optionally) agency."""
     video_date = parse_date_from_title(video["title"])
     if not video_date:
         if video.get("upload_date") and len(video["upload_date"]) == 8:
@@ -215,6 +233,8 @@ def match_video_to_meeting(video, meetings, body_filter):
     best_match = None
     for mid, m in meetings.items():
         if not m["date"]:
+            continue
+        if agency and m.get("agency") != agency:
             continue
         if body_filter and body_filter.lower() not in m["body"].lower():
             continue
@@ -236,14 +256,18 @@ def discover_all(args):
     new_entries = []
 
     # YouTube playlists (Council + Planning Commission)
+    fetch_failures = 0
     for body, playlist_id in PLAYLISTS.items():
         print(f"\nFetching {body} playlist...")
         videos = fetch_playlist_videos(playlist_id)
+        if videos is None:
+            fetch_failures += 1
+            continue
         print(f"  Found {len(videos)} videos")
 
         matched = 0
         for video in videos:
-            match = match_video_to_meeting(video, meetings, body)
+            match = match_video_to_meeting(video, meetings, body, PLAYLIST_AGENCY)
             if not match:
                 continue
 
@@ -271,10 +295,14 @@ def discover_all(args):
     # NCTD (video URLs already in meeting.json)
     print(f"\nChecking NCTD meeting videos...")
     nctd_new = 0
+    nctd_skipped = 0
     for mid, m in meetings.items():
         if m["agency"] != "nctd":
             continue
         if not m.get("video_url"):
+            continue
+        if not is_video_url(m["video_url"]):
+            nctd_skipped += 1
             continue
         if mid in existing_ids:
             continue
@@ -293,7 +321,11 @@ def discover_all(args):
         existing_ids.add(mid)
         nctd_new += 1
 
-    print(f"  Found {nctd_new} new NCTD videos")
+    print(f"  Found {nctd_new} new NCTD videos ({nctd_skipped} skipped: not a video URL)")
+
+    if PLAYLISTS and fetch_failures == len(PLAYLISTS):
+        print(f"ERROR: all {fetch_failures} playlist fetches failed")
+        sys.exit(3)
 
     if not new_entries:
         print("\nNo new videos to add.")

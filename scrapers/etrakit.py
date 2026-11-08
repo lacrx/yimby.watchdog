@@ -356,30 +356,36 @@ def cmd_fetch(args):
     delay = args.delay
     print(f"Scanning eTRAKiT permits {prefix}{start_seq:04d} through {prefix}{max_seq:04d} (delay={delay}s)...", flush=True)
 
-    consecutive_failures = 0
+    # Two different stop conditions:
+    #  - misses: the page loaded but has no permit (eTRAKiT answers 500 or an
+    #    empty page for numbers that do not exist). Permit numbers have gaps
+    #    (voided/withdrawn), so tolerate max_misses in a row before concluding
+    #    we are past the frontier.
+    #  - errors: the request itself failed (timeout, connection reset, or 502/503
+    #    after retries). That is an outage, not a gap; bail after a few in a row
+    #    at the normal delay rather than sleeping through 50 of them.
+    MAX_CONSECUTIVE_ERRORS = 5
+    consecutive_errors = 0
     for i in range(start_seq, max_seq + 1):
         permit_no = f"{prefix}{i:04d}"
         try:
             p = fetch_permit(session, base_url, permit_no)
         except Exception as e:
-            consecutive_failures += 1
-            if consecutive_failures <= 3:
+            consecutive_errors += 1
+            if consecutive_errors <= 3:
                 print(f"  Error on {permit_no}: {e}", flush=True)
-            elif consecutive_failures == 4:
-                print(f"  (suppressing further errors...)", flush=True)
-            if consecutive_failures > max_misses and i > start_seq + 50:
-                print(f"  Stopping at {permit_no} after {consecutive_failures} consecutive failures", flush=True)
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+                print(f"  Stopping at {permit_no} after {consecutive_errors} consecutive request errors", flush=True)
                 break
-            time.sleep(10)
+            time.sleep(delay)
             continue
 
+        consecutive_errors = 0
         if p:
             new_results.append(p)
             misses = 0
-            consecutive_failures = 0
         else:
             misses += 1
-            consecutive_failures += 1
             if misses > max_misses and i > start_seq + 50:
                 print(f"  Stopping at {permit_no} after {max_misses} consecutive misses", flush=True)
                 break

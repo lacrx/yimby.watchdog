@@ -14,7 +14,7 @@ import argparse
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -28,6 +28,9 @@ from civic_utils import (
     cmd_list_meetings, log_discovery, USER_AGENT,
     meeting_needs_recheck,
 )
+import civic_utils
+
+RECHECK_DAYS = getattr(civic_utils, "RECHECK_DAYS", 90)
 
 PORTAL_BASE = "https://portal.laserfiche.com/Portal"
 
@@ -210,7 +213,8 @@ def cmd_fetch(args):
     state = load_json(state_file) or {"last_fetch": None, "meetings": {}}
     years = float(args.years) if args.years else 1
     now = datetime.now()
-    min_year = now.year - int(years) + 1
+    cutoff_dt = now - timedelta(days=365 * years)
+    min_year = cutoff_dt.year
     max_year = now.year + 1
 
     client = LaserficheClient(repo, browse_id)
@@ -242,7 +246,7 @@ def cmd_fetch(args):
                 doc_name = info.get("name", str(entry_id))
                 dt = extract_date(doc_name, info.get("metadata"))
 
-            if not dt or dt.year < min_year:
+            if not dt or dt < cutoff_dt:
                 continue
 
             mid = make_meeting_id(slug, body, dt)
@@ -273,7 +277,7 @@ def cmd_fetch(args):
                 print(f"    NEW: {meeting['title']}")
 
             if mid in state["meetings"] and not getattr(args, "deep", False):
-                if not meeting_needs_recheck(mid, docs_dir, meeting.get("date", "")):
+                if not meeting_needs_recheck(mid, docs_dir, meeting.get("date", ""), max_age_days=RECHECK_DAYS):
                     continue
                 print(f"    RECHECK: {meeting['title']} (no documents yet)")
 

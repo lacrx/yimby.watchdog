@@ -142,6 +142,44 @@ class AuthError(Exception):
     pass
 
 
+_REFUSAL_PHRASES = ("can't help with this", "cannot help with this",
+                    "i can't assist", "i cannot assist")
+_RATE_LIMIT_PHRASES = ("session limit", "rate limit", "you've reached",
+                       "start a new session", "new session to continue")
+
+
+def _extract_json(output):
+    """Parse JSON from claude output, tolerating prose around one object. None if no JSON."""
+    try:
+        return json.loads(output)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    brace_start = output.find("{")
+    brace_end = output.rfind("}")
+    if brace_start >= 0 and brace_end > brace_start:
+        try:
+            return json.loads(output[brace_start:brace_end + 1])
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return None
+
+
+def _normalize_record(raw):
+    """Return a valid extraction record dict, or None.
+
+    Valid = dict with a 'votes' list (rebuild_combined requires 'votes'). A list of
+    several chunk dicts is merged; a one-element list is unwrapped.
+    """
+    if isinstance(raw, list):
+        dicts = [r for r in raw if isinstance(r, dict)]
+        if not dicts:
+            return None
+        raw = dicts[0] if len(dicts) == 1 else _merge_records(dicts)
+    if not isinstance(raw, dict) or not isinstance(raw.get("votes"), list):
+        return None
+    return raw
+
+
 def _call_claude(prompt, max_retries=2, schema=None):
     """Call claude -p with retries. Returns (record, error_category) tuple.
 
@@ -165,13 +203,34 @@ def _call_claude(prompt, max_retries=2, schema=None):
 
             clean_out = _ANSI_RE.sub('', result.stdout)
             clean_err = _ANSI_RE.sub('', result.stderr)
-            combined_lower = (clean_err + " " + clean_out).lower()
-            if "session limit" in combined_lower or "rate limit" in combined_lower or "you've reached" in combined_lower:
-                raise RateLimitHit((clean_err.strip() or clean_out.strip())[:200])
+            combined_lower = (clean_err + " " + clean_out).lower().replace("’", "'")
+            output = clean_out.strip()
 
-            stderr_lower = clean_err.lower()
-            if "invalid authentication" in stderr_lower or "http 401" in stderr_lower or "http 403" in stderr_lower or "status 401" in stderr_lower or "status 403" in stderr_lower or ("401" in stderr_lower and "unauthorized" in stderr_lower) or ("403" in stderr_lower and "forbidden" in stderr_lower):
-                raise AuthError(clean_err.strip()[:200] or clean_out.strip()[:200])
+            # Parse first. Refusal / rate-limit phrase checks only apply when the run
+            # did not produce a usable record, so a valid JSON record that merely
+            # mentions "rate limit" is never discarded.
+            raw_json = _extract_json(output) if output else None
+            record = _normalize_record(raw_json)
+            clean_success = result.returncode == 0 and record is not None
+
+            if not clean_success:
+                stdout_is_json = raw_json is not None
+                # Content refusal BEFORE rate limit: "can't help with this. Start a new session"
+                # contains "new session" but is a per-doc refusal, not a session limit.
+                # Confirmed only when stdout is not JSON at all.
+                if not stdout_is_json and any(p in combined_lower for p in _REFUSAL_PHRASES):
+                    return None, "content_refused"
+
+                # Real limit messages are short, non-JSON text (e.g. "You've hit your
+                # session limit · resets 6am"). With rc 0, require non-JSON and short output.
+                if (result.returncode != 0 or not stdout_is_json) and \
+                        (result.returncode != 0 or len(combined_lower) < 1000) and \
+                        any(p in combined_lower for p in _RATE_LIMIT_PHRASES):
+                    raise RateLimitHit((clean_err.strip() or clean_out.strip())[:200])
+
+                stderr_lower = clean_err.lower()
+                if "invalid authentication" in stderr_lower or "http 401" in stderr_lower or "http 403" in stderr_lower or "status 401" in stderr_lower or "status 403" in stderr_lower or ("401" in stderr_lower and "unauthorized" in stderr_lower) or ("403" in stderr_lower and "forbidden" in stderr_lower):
+                    raise AuthError(clean_err.strip()[:200] or clean_out.strip()[:200])
 
             if result.returncode != 0:
                 if not clean_out.strip() and not clean_err.strip():
@@ -187,7 +246,6 @@ def _call_claude(prompt, max_retries=2, schema=None):
                     print(f"  stdout: {clean_out[:300]}")
                 return None, "exit_code"
 
-            output = clean_out.strip()
             if not output:
                 if attempt < max_retries:
                     print(f"  empty output, retrying ({attempt+1}/{max_retries})...")
@@ -196,31 +254,15 @@ def _call_claude(prompt, max_retries=2, schema=None):
                 print(f"  claude -p returned empty output")
                 return None, "empty_output"
 
-            try:
-                record = json.loads(output)
-            except json.JSONDecodeError:
-                # Fallback: extract JSON object from prose-wrapped output
-                brace_start = output.find("{")
-                brace_end = output.rfind("}")
-                if brace_start >= 0 and brace_end > brace_start:
-                    try:
-                        record = json.loads(output[brace_start:brace_end + 1])
-                    except json.JSONDecodeError:
-                        record = None
-                else:
-                    record = None
+            if record is None:
+                if attempt < max_retries:
+                    print(f"  JSON parse/validation error, retrying ({attempt+1}/{max_retries})...")
+                    time.sleep(5)
+                    continue
+                print(f"  JSON parse error: could not extract a valid record (needs a 'votes' list)")
+                print(f"  Raw output ({len(output)} chars): {output[:500]}")
+                return None, "json_parse"
 
-                if record is None:
-                    if attempt < max_retries:
-                        print(f"  JSON parse error, retrying ({attempt+1}/{max_retries})...")
-                        time.sleep(5)
-                        continue
-                    print(f"  JSON parse error: could not extract JSON")
-                    print(f"  Raw output ({len(output)} chars): {output[:500]}")
-                    return None, "json_parse"
-
-            if isinstance(record, list):
-                record = record[0] if len(record) == 1 else {"_chunks": record}
             return record, None
 
         except FileNotFoundError:
@@ -343,7 +385,7 @@ def extract_structured(text, meeting_meta):
     print(f"  Chunking: {len(text):,} chars → {len(chunks)} chunks", flush=True)
 
     records = []
-    last_error = None
+    errors = []
     for ci, chunk in enumerate(chunks):
         prompt = EXTRACTION_PROMPT + meta_context + "\n" + chunk
         try:
@@ -355,21 +397,43 @@ def extract_structured(text, meeting_meta):
                     merged["_partial"] = True
                     merged["_chunks_completed"] = ci
                     merged["_chunks_total"] = len(chunks)
+                    merged["_failed_chunks"] = len([e for e in errors if e != "content_refused"])
+                    refused = errors.count("content_refused")
+                    if refused:
+                        merged["_refused_chunks"] = refused
                     rl.partial_result = merged
                     print(f"  Rate limit at chunk {ci+1}/{len(chunks)}, {len(records)} partial chunks salvaged")
             raise
         if record:
             records.append(record)
         elif err:
-            last_error = err
+            errors.append(err)
+            print(f"  chunk {ci+1}/{len(chunks)} failed: {err}")
             if err == "exit_code_empty":
                 break
         time.sleep(1)
 
     merged = _merge_records(records)
     if merged:
+        # Chunks that failed, timed out, or were never attempted must not vanish silently.
+        # Refused chunks are permanent (retrying cannot help): recorded, but not "partial".
+        refused = errors.count("content_refused")
+        failed_chunks = len(chunks) - len(records) - refused
+        if refused or failed_chunks:
+            merged = dict(merged)
+            merged["_chunks_total"] = len(chunks)
+            merged["_chunks_completed"] = len(records)
+        if refused:
+            merged["_refused_chunks"] = refused
+        if failed_chunks:
+            merged["_partial"] = True
+            merged["_failed_chunks"] = failed_chunks
         return merged, None
-    return None, last_error or "unknown"
+    # Every chunk failed: return the error (content_refused only if all were refusals).
+    non_refused = [e for e in errors if e != "content_refused"]
+    if non_refused:
+        return None, non_refused[-1]
+    return None, errors[-1] if errors else "unknown"
 
 
 CHARS_PER_TOKEN = 4
@@ -650,6 +714,8 @@ def rebuild_combined(structured_dir):
                 continue
             if not record.get("date") and record.get("_source"):
                 idx_date = doc_index.get(record["_source"], "")
+                if not idx_date:
+                    idx_date = _parse_date_from_filename(record["_source"])
                 if idx_date:
                     record["date"] = idx_date
                     json_file.write_text(json.dumps(record, indent=2, default=str))
@@ -752,7 +818,10 @@ def needs_reextraction(source_path, out_path):
         return True
     try:
         data = json.loads(out_path.read_text())
-        return not isinstance(data, dict)
+        if not isinstance(data, dict):
+            return True
+        # Partial records (failed/timed-out chunks, rate-limit salvage) are not done.
+        return bool(data.get("_partial"))
     except (json.JSONDecodeError, OSError):
         return True
 
@@ -760,7 +829,7 @@ def needs_reextraction(source_path, out_path):
 def is_skippable(text):
     """Check if text is un-extractable garbage from PDF rendering."""
     stripped = text.strip()
-    if len(stripped) < 100:
+    if len(stripped) < MIN_DOC_CHARS:
         return "too_short"
     if len(stripped) > MAX_DOC_CHARS:
         return "oversized"
@@ -786,19 +855,75 @@ def is_skippable(text):
     return None
 
 
+MIN_DOC_CHARS = 100                 # below this a source is "too_short"
+REPEATED_FAILURE_EXPIRY_DAYS = 14   # repeated_failure markers are retried after this
+
+
 def write_skip_marker(source_path, reason):
-    """Write a .skip file so this source is never retried."""
+    """Write a .skip file recording why, plus the source size/mtime it was judged on.
+
+    A marker whose source later changed is ignored (see has_skip_marker).
+    """
     skip_path = source_path.with_suffix(source_path.suffix + SKIP_MARKER)
-    skip_path.write_text(json.dumps({"reason": reason, "skipped_at": datetime.now().isoformat()}))
+    data = {"reason": reason, "skipped_at": datetime.now().isoformat()}
+    try:
+        st = source_path.stat()
+        data["src_size"] = st.st_size
+        data["src_mtime"] = st.st_mtime
+    except OSError:
+        pass
+    skip_path.write_text(json.dumps(data))
+
+
+def clear_skip_marker(source_path):
+    """Remove a stale .skip marker (called after a successful extraction)."""
+    try:
+        source_path.with_suffix(source_path.suffix + SKIP_MARKER).unlink()
+    except OSError:
+        pass
 
 
 def has_skip_marker(source_path):
-    """Check if source has been permanently marked as skip or split."""
-    if source_path.with_suffix(source_path.suffix + SKIP_MARKER).exists():
-        return True
+    """Check if source has been permanently marked as skip or split.
+
+    A .skip marker is ignored when the source text changed since it was written
+    (src_size differs; mtime alone is not used because S3 sync resets mtimes),
+    when a too_short source has grown past MIN_DOC_CHARS, or when a
+    repeated_failure marker is older than REPEATED_FAILURE_EXPIRY_DAYS.
+    Legacy markers without src fields stay valid for every other reason.
+    """
     if source_path.with_suffix(source_path.suffix + ".split").exists():
         return True
-    return False
+    skip_path = source_path.with_suffix(source_path.suffix + SKIP_MARKER)
+    if not skip_path.exists():
+        return False
+    try:
+        marker = json.loads(skip_path.read_text())
+        if not isinstance(marker, dict):
+            marker = {}
+    except (json.JSONDecodeError, OSError):
+        return True
+    reason = marker.get("reason")
+    try:
+        size = source_path.stat().st_size
+    except OSError:
+        return True
+    if "src_size" in marker and marker["src_size"] != size:
+        return False
+    if reason == "too_short" and size >= MIN_DOC_CHARS:
+        try:
+            if len(source_path.read_text().strip()) >= MIN_DOC_CHARS:
+                return False
+        except OSError:
+            pass
+    if reason == "repeated_failure":
+        try:
+            age = datetime.now() - datetime.fromisoformat(marker.get("skipped_at", ""))
+            if age > timedelta(days=REPEATED_FAILURE_EXPIRY_DAYS):
+                return False
+        except (ValueError, TypeError):
+            pass
+    return True
 
 
 import re as _re
@@ -812,6 +937,20 @@ _SECTION_RE = _re.compile(
 )
 
 _ANSI_RE = _re.compile(r'\x1b\[[0-9;]*[a-zA-Z]')
+
+_FILENAME_DATE_RE = _re.compile(r'(\d{4})(\d{2})(\d{2})')
+
+
+def _parse_date_from_filename(filename):
+    """Extract YYYY-MM-DD from filenames like cb-planning-commission-20220615-agenda-part25.txt"""
+    for m in _FILENAME_DATE_RE.finditer(filename):
+        try:
+            d = datetime.strptime("".join(m.groups()), "%Y%m%d")
+        except ValueError:
+            continue
+        if 2000 <= d.year <= 2035:
+            return d.strftime("%Y-%m-%d")
+    return None
 
 
 def split_oversized_doc(source_path):
@@ -973,6 +1112,14 @@ def clear_failure(state, filename):
     state.pop(filename, None)
 
 
+def _source_size_key(item):
+    """Sort key: file size; files that vanished mid-run sort last."""
+    try:
+        return item[1].stat().st_size
+    except OSError:
+        return float("inf")
+
+
 def cmd_extract(args):
     """Extract structured records from all raw sources (documents + transcripts)."""
     STRUCTURED_DIR.mkdir(parents=True, exist_ok=True)
@@ -1024,7 +1171,10 @@ def cmd_extract(args):
     if skipped_markers:
         print(f"  {skipped_markers} sources permanently skipped (.skip marker)")
 
-    to_process.sort(key=lambda x: x[1].stat().st_size)
+    # Size ordering (small first) is for hot/default runs only; cold keeps the
+    # oldest-first order produced by collect_all_sources.
+    if queue != "cold":
+        to_process.sort(key=_source_size_key)
 
     if args.dry_run:
         already = len(all_sources) - len(to_process) - skipped_markers
@@ -1079,185 +1229,221 @@ def cmd_extract(args):
     MAX_AUTH_RETRIES = 2
 
     i = 0
-    while i < len(to_process):
-        source_type, sf, out_path = to_process[i]
-        if stop_hour and datetime.now().hour >= stop_hour:
-            remaining = len(to_process) - i
-            print(f"\nStopping at {datetime.now().strftime('%H:%M')} ({remaining} remaining, will resume next run)")
-            break
-        if getattr(args, "limit", None) and success >= args.limit:
-            remaining = len(to_process) - i
-            print(f"\nLimit reached ({args.limit} extractions). {remaining} remaining, will resume next run.")
-            break
+    try:
+        while i < len(to_process):
+            source_type, sf, out_path = to_process[i]
+            try:
+                if stop_hour and datetime.now().hour >= stop_hour:
+                    remaining = len(to_process) - i
+                    print(f"\nStopping at {datetime.now().strftime('%H:%M')} ({remaining} remaining, will resume next run)")
+                    break
+                if getattr(args, "limit", None) and success >= args.limit:
+                    remaining = len(to_process) - i
+                    print(f"\nLimit reached ({args.limit} extractions). {remaining} remaining, will resume next run.")
+                    break
 
-        prior = failure_state.get(sf.name, {})
-        if prior.get("fail_count", 0) >= MAX_FAIL_RETRIES:
-            last_err = prior.get("last_error", "unknown")
-            write_skip_marker(sf, "repeated_failure")
-            clear_failure(failure_state, sf.name)
-            failure_skipped += 1
-            print(f"[{i+1}/{len(to_process)}] {sf.name}")
-            print(f"  Auto-skipped: failed {prior['fail_count']} times (last: {last_err})")
-            i += 1
-            continue
+                prior = failure_state.get(sf.name, {})
+                if prior.get("fail_count", 0) >= MAX_FAIL_RETRIES:
+                    last_err = prior.get("last_error", "unknown")
+                    write_skip_marker(sf, "repeated_failure")
+                    clear_failure(failure_state, sf.name)
+                    failure_skipped += 1
+                    print(f"[{i+1}/{len(to_process)}] {sf.name}")
+                    print(f"  Auto-skipped: failed {prior['fail_count']} times (last: {last_err})")
+                    i += 1
+                    continue
 
-        label = f"[{source_type}]" if source_type == "transcript" else ""
-        print(f"[{i+1}/{len(to_process)}] {sf.name} {label}")
+                label = f"[{source_type}]" if source_type == "transcript" else ""
+                print(f"[{i+1}/{len(to_process)}] {sf.name} {label}")
 
-        text = sf.read_text()
+                text = sf.read_text()
 
-        skip_reason = is_skippable(text)
-        if skip_reason == "oversized":
-            name_lower = sf.name.lower()
-            skip_names = ["project_plans", "environmental_doc", "pavement",
-                          "plan_set", "architectural", "traffic_study",
-                          "transportation_assessment", "geotechnical"]
-            if any(s in name_lower for s in skip_names):
-                write_skip_marker(sf, "oversized_non_meeting")
-                skipped += 1
-                print(f"  Skipping permanently: oversized non-meeting ({len(text.strip()):,} chars)")
-            else:
-                parts_written = split_oversized_doc(sf)
-                print(f"  Split into {parts_written} parts ({len(text.strip()):,} chars)")
-                # Add split parts to current run queue
-                parent = sf.parent
-                for idx in range(1, parts_written + 1):
-                    part_path = parent / f"{sf.stem}-part{idx:02d}.txt"
-                    if part_path.exists():
-                        part_out = STRUCTURED_DIR / f"{part_path.stem}.json"
-                        if not part_out.exists():
-                            to_process.append((source_type, part_path, part_out))
-                if parts_written:
-                    to_process[i+1:] = sorted(to_process[i+1:], key=lambda x: x[1].stat().st_size)
-            i += 1
-            continue
-        elif skip_reason:
-            write_skip_marker(sf, skip_reason)
-            skipped += 1
-            print(f"  Skipping permanently: {skip_reason} ({len(text.strip())} chars)")
-            i += 1
-            continue
+                skip_reason = is_skippable(text)
+                if skip_reason == "oversized":
+                    name_lower = sf.name.lower()
+                    skip_names = ["project_plans", "environmental_doc", "pavement",
+                                  "plan_set", "architectural", "traffic_study",
+                                  "transportation_assessment", "geotechnical"]
+                    if any(s in name_lower for s in skip_names):
+                        write_skip_marker(sf, "oversized_non_meeting")
+                        skipped += 1
+                        print(f"  Skipping permanently: oversized non-meeting ({len(text.strip()):,} chars)")
+                    else:
+                        parts_written = split_oversized_doc(sf)
+                        print(f"  Split into {parts_written} parts ({len(text.strip()):,} chars)")
+                        # Add split parts to current run queue
+                        parent = sf.parent
+                        for idx in range(1, parts_written + 1):
+                            part_path = parent / f"{sf.stem}-part{idx:02d}.txt"
+                            if part_path.exists():
+                                part_out = STRUCTURED_DIR / f"{part_path.stem}.json"
+                                if not part_out.exists():
+                                    to_process.append((source_type, part_path, part_out))
+                        if parts_written:
+                            if queue != "cold":
+                                to_process[i+1:] = sorted(to_process[i+1:], key=_source_size_key)
+                    i += 1
+                    continue
+                elif skip_reason:
+                    write_skip_marker(sf, skip_reason)
+                    skipped += 1
+                    print(f"  Skipping permanently: {skip_reason} ({len(text.strip())} chars)")
+                    i += 1
+                    continue
 
-        if use_triage:
-            extract, prob = predict_relevance(text, sf.name)
-            if not extract:
-                triage_skipped += 1
-                print(f"  Triage skip (p={prob:.3f})")
-                i += 1
-                continue
-
-        meta = get_meeting_meta(sf)
-        try:
-            record, error_cat = extract_structured(text, meta)
-        except AuthError as e:
-            auth_failure_count += 1
-
-            if auth_failure_count <= MAX_AUTH_RETRIES:
-                wait = 60 * auth_failure_count
-                print(f"\n  Auth error ({auth_failure_count}/{MAX_AUTH_RETRIES}): {str(e)[:100]}")
-                print(f"  Waiting {wait}s then retrying...", flush=True)
-                time.sleep(wait)
-                continue  # retry same file (i not incremented)
-
-            remaining = len(to_process) - i
-            print(f"\n  Auth error (persistent): {str(e)[:100]}")
-            print(f"  Stopping — authentication broken after {auth_failure_count} attempts.")
-            print(f"  Run `claude /login` to re-authenticate, then re-run extraction.")
-            print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
-            break
-        except RateLimitHit as e:
-            partial = getattr(e, 'partial_result', None)
-            if partial:
-                if not partial.get("meeting_id"):
-                    mid = sf.stem.replace("-transcript", "").split("-")[0]
-                    partial["meeting_id"] = mid
-                partial["_source"] = sf.name
-                partial["_source_type"] = source_type
-                out_path.write_text(json.dumps(partial, indent=2, default=str))
-                success += 1
-                print(f"  Saved partial extraction ({len(partial.get('votes',[]))}v {len(partial.get('housing_items',[]))}h)")
-
-            remaining = len(to_process) - i
-            msg = str(e).lower()
-            # Parse reset time from "resets 6am" style messages
-            reset_hour = None
-            if "resets" in msg:
-                import re
-                m = re.search(r"resets\s+(\d+)(am|pm)", msg)
-                if m:
-                    h = int(m.group(1))
-                    if m.group(2) == "pm" and h != 12:
-                        h += 12
-                    reset_hour = h
-
-            now = datetime.now()
-            if reset_hour is not None and stop_hour is not None:
-                if reset_hour < stop_hour:
-                    wait_minutes = (reset_hour * 60 - now.hour * 60 - now.minute)
-                    if wait_minutes < 0:
-                        wait_minutes += 24 * 60
-                    if wait_minutes <= 120:
-                        print(f"\n  Rate limit hit — resets at {reset_hour}:00 ({wait_minutes} min). Waiting...", flush=True)
-                        time.sleep(wait_minutes * 60 + 30)
-                        print(f"  Resuming after rate limit reset.", flush=True)
+                if use_triage:
+                    extract, prob = predict_relevance(text, sf.name)
+                    if not extract:
+                        triage_skipped += 1
+                        print(f"  Triage skip (p={prob:.3f})")
+                        i += 1
                         continue
 
-            print(f"\n  Rate limit hit: {e}")
-            print(f"  Stopping — {remaining} sources remaining, will resume next run.")
-            print(f"  ({success} extracted, {failed} failed, {skipped} skipped this run)")
-            rate_limited = True
-            break
+                meta = get_meeting_meta(sf)
+                try:
+                    record, error_cat = extract_structured(text, meta)
+                except AuthError as e:
+                    auth_failure_count += 1
 
-        if record:
-            if not record.get("meeting_id"):
-                mid = sf.stem.replace("-transcript", "").split("-")[0]
-                record["meeting_id"] = mid
-            if not record.get("date"):
-                idx_date = doc_index.get(sf.name, "")
-                if idx_date:
-                    record["date"] = idx_date
-            record["_source"] = sf.name
-            record["_source_type"] = source_type
-            record = _sanitize_state_legislature_votes(record)
+                    if auth_failure_count <= MAX_AUTH_RETRIES:
+                        wait = 60 * auth_failure_count
+                        print(f"\n  Auth error ({auth_failure_count}/{MAX_AUTH_RETRIES}): {str(e)[:100]}")
+                        print(f"  Waiting {wait}s then retrying...", flush=True)
+                        time.sleep(wait)
+                        continue  # retry same file (i not incremented)
 
-            out_path.write_text(json.dumps(record, indent=2, default=str))
-            success += 1
-            consecutive_failures = 0
-            clear_failure(failure_state, sf.name)
-            print(f"  OK ({len(text)} chars, {len(record.get('votes',[]))}v {len(record.get('housing_items',[]))}h)")
-        else:
-            failed += 1
-            consecutive_failures += 1
-            record_failure(failure_state, sf.name, error_cat, queue=queue)
-            fc = failure_state[sf.name]["fail_count"]
-            print(f"  FAILED ({error_cat or 'unknown'}, attempt {fc}/{MAX_FAIL_RETRIES})")
+                    remaining = len(to_process) - i
+                    print(f"\n  Auth error (persistent): {str(e)[:100]}")
+                    print(f"  Stopping — authentication broken after {auth_failure_count} attempts.")
+                    print(f"  Run `claude /login` to re-authenticate, then re-run extraction.")
+                    print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
+                    break
+                except RateLimitHit as e:
+                    partial = getattr(e, 'partial_result', None)
+                    if partial:
+                        if not partial.get("meeting_id"):
+                            mid = sf.stem.replace("-transcript", "").split("-")[0]
+                            partial["meeting_id"] = mid
+                        partial["_source"] = sf.name
+                        partial["_source_type"] = source_type
+                        out_path.write_text(json.dumps(partial, indent=2, default=str))
+                        success += 1
+                        print(f"  Saved partial extraction ({len(partial.get('votes',[]))}v {len(partial.get('housing_items',[]))}h)")
 
-            if error_cat == "exit_code_empty" and consecutive_failures >= 2:
-                remaining = len(to_process) - i - 1
-                print(f"\n  Likely session limit: {consecutive_failures} consecutive empty-output failures.")
-                print(f"  Stopping — run `claude -p \"test\"` to check session status.")
-                print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
-                break
+                    remaining = len(to_process) - i
+                    msg = str(e).lower()
+                    # Parse reset time from "resets 6am" style messages
+                    reset_hour = None
+                    if "resets" in msg:
+                        import re
+                        m = re.search(r"resets\s+(\d+)(am|pm)", msg)
+                        if m:
+                            h = int(m.group(1))
+                            if m.group(2) == "pm" and h != 12:
+                                h += 12
+                            reset_hour = h
 
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                remaining = len(to_process) - i - 1
-                print(f"\n  Circuit breaker: {MAX_CONSECUTIVE_FAILURES} consecutive failures.")
-                print(f"  Stopping — something is broken (auth, network, CLI).")
-                print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
-                break
+                    now = datetime.now()
+                    if reset_hour is not None and stop_hour is not None:
+                        if reset_hour < stop_hour:
+                            wait_minutes = (reset_hour * 60 - now.hour * 60 - now.minute)
+                            if wait_minutes < 0:
+                                wait_minutes += 24 * 60
+                            if wait_minutes <= 120:
+                                print(f"\n  Rate limit hit — resets at {reset_hour}:00 ({wait_minutes} min). Waiting...", flush=True)
+                                time.sleep(wait_minutes * 60 + 30)
+                                print(f"  Resuming after rate limit reset.", flush=True)
+                                continue
 
-        auth_failure_count = 0  # reset on any successful claude call
-        time.sleep(1)
-        i += 1
+                    print(f"\n  Rate limit hit: {e}")
+                    print(f"  Stopping — {remaining} sources remaining, will resume next run.")
+                    print(f"  ({success} extracted, {failed} failed, {skipped} skipped this run)")
+                    rate_limited = True
+                    break
 
-    save_failure_state(failure_state)
+                if error_cat == "content_refused":
+                    write_skip_marker(sf, "content_refused")
+                    skipped += 1
+                    print(f"  Content refused by model — permanently skipped")
+                    i += 1
+                    continue
+
+                if record:
+                    if not record.get("meeting_id"):
+                        mid = sf.stem.replace("-transcript", "").split("-")[0]
+                        record["meeting_id"] = mid
+                    if not record.get("date"):
+                        idx_date = doc_index.get(sf.name, "")
+                        if idx_date:
+                            record["date"] = idx_date
+                        if not record.get("date"):
+                            record["date"] = _parse_date_from_filename(sf.name)
+                    record["_source"] = sf.name
+                    record["_source_type"] = source_type
+                    record = _sanitize_state_legislature_votes(record)
+
+                    out_path.write_text(json.dumps(record, indent=2, default=str))
+                    success += 1
+                    consecutive_failures = 0
+                    clear_skip_marker(sf)  # drop a stale marker that has_skip_marker ignored
+                    if record.get("_partial"):
+                        # Saved, but not done: needs_reextraction retries it next run.
+                        record_failure(failure_state, sf.name, "partial_chunks", queue=queue)
+                        print(f"  PARTIAL ({record.get('_failed_chunks', '?')} chunk(s) failed, "
+                              f"{len(record.get('votes',[]))}v {len(record.get('housing_items',[]))}h)")
+                    else:
+                        clear_failure(failure_state, sf.name)
+                        print(f"  OK ({len(text)} chars, {len(record.get('votes',[]))}v {len(record.get('housing_items',[]))}h)")
+                else:
+                    failed += 1
+                    consecutive_failures += 1
+                    record_failure(failure_state, sf.name, error_cat, queue=queue)
+                    fc = failure_state[sf.name]["fail_count"]
+                    print(f"  FAILED ({error_cat or 'unknown'}, attempt {fc}/{MAX_FAIL_RETRIES})")
+
+                    if error_cat == "exit_code_empty" and consecutive_failures >= 2:
+                        remaining = len(to_process) - i - 1
+                        print(f"\n  Likely session limit: {consecutive_failures} consecutive empty-output failures.")
+                        print(f"  Stopping — run `claude -p \"test\"` to check session status.")
+                        print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
+                        break
+
+                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                        remaining = len(to_process) - i - 1
+                        print(f"\n  Circuit breaker: {MAX_CONSECUTIVE_FAILURES} consecutive failures.")
+                        print(f"  Stopping — something is broken (auth, network, CLI).")
+                        print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
+                        break
+
+                auth_failure_count = 0  # reset on any successful claude call
+                time.sleep(1)
+                i += 1
+            except Exception as e:
+                print(f"ERROR: extract {sf}: {e}")
+                failed += 1
+                consecutive_failures += 1
+                record_failure(failure_state, sf.name, f"exception:{type(e).__name__}", queue=queue)
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    print(f"\n  Circuit breaker: {MAX_CONSECUTIVE_FAILURES} consecutive failures.")
+                    break
+                i += 1
+                continue
+    finally:
+        # Persist failure state and the combined file even on RateLimitHit / crash.
+        try:
+            save_failure_state(failure_state)
+        except Exception as e:
+            print(f"ERROR: save_failure_state: {e}")
+        if success > 0:
+            try:
+                rebuild_combined(STRUCTURED_DIR)
+            except Exception as e:
+                print(f"ERROR: rebuild_combined: {e}")
+
 
     triage_msg = f", {triage_skipped} triage-skipped" if triage_skipped else ""
     fail_skip_msg = f", {failure_skipped} auto-skipped (repeated failures)" if failure_skipped else ""
     print(f"\nDone. {success} extracted, {failed} failed, {skipped} permanently skipped{fail_skip_msg}{triage_msg}.")
-
-    if success > 0:
-        rebuild_combined(STRUCTURED_DIR)
 
     if rate_limited:
         sys.exit(2)

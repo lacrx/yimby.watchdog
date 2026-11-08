@@ -296,9 +296,22 @@ crontab -e
 - Python 3.10+
 - Claude Code CLI with active subscription (`claude -p` for extraction)
 - `pdftotext` (poppler-utils)
-- Python packages: `requests`, `feedparser`, `beautifulsoup4`, `lxml`, `pyyaml`, `yt-dlp`
+- Python packages: `pip install -r requirements.txt` (includes `playwright` and `yt-dlp`)
+- Google Chrome or Chromium (`playwright install chromium` works) for the eScribe Cloudflare bypass
 - AWS account with Terraform (S3 + SSM; Lambda only for the undeployed split mode)
 - Optional: `faster-whisper` (local transcription), `pyarrow` (Parquet export)
+
+## Reliability Conventions
+
+Every stage follows the same rules so failures are visible instead of silent:
+
+- **Phase failures:** `civic-pipeline` logs `[local] ERROR: <phase> failed (rc=N)` or `... timed out` and keeps going. "X done" is only logged on success. `pipeline_doctor.py` reports every ERROR line from the latest run.
+- **Empty scrapes:** a scraper whose listing parses 0 meetings prints `ERROR: <agency>: listing parsed 0 meetings` and exits 3.
+- **Cloudflare bypass:** `lib/cf_bypass.py` solves the eScribe challenge with a headless Playwright session, reuses the `cf_clearance` cookie, and logs `cf_bypass: OK <domain> (<method>)` or `cf_bypass: FAIL <domain>: <reason>`. Downloads are validated as PDF before they land on disk. One browser per machine (flock on `data/.cf_bypass.lock`).
+- **Meeting flags:** `meeting.json` may carry `cancelled: true`, `superseded_by: <id>` (Granicus `evt` rows replaced by `clip` rows, Oceanside hash ids replaced by numeric ids), `stale: true` or `no_assets: true`. The doctor skips flagged meetings when measuring coverage.
+- **Recheck window:** `civic_utils.RECHECK_DAYS` (90). Scrapers recheck meetings without documents for this long, and the doctor measures gaps over the same window. Per-agency `lookback_months` is floored at 3 so listings cover it.
+- **Skip markers:** extraction `.skip` files record the source size; a marker is ignored once the source text changes, and `repeated_failure` markers expire after 14 days. Partial extractions (`_partial`) are redone.
+- **Doctor dry run:** `pipeline_doctor.py --dry-run` writes nothing.
 
 ## Directory Structure
 
@@ -308,7 +321,6 @@ yimby.watchdog/
 ├── escribe-sweep               # Cron: retry Cloudflare-blocked eScribe downloads
 ├── extract-watch               # Split mode only (not deployed): S3 marker poller
 ├── extract-local               # Runs claude -p extraction, syncs to S3
-├── extract-backlog             # Backlog extraction runner
 ├── deploy-lambda               # Lambda deployment script
 ├── lambda_handler.py           # AWS Lambda entry point
 ├── civic_utils.py              # Shared utilities (PDF, text, agency helpers)
@@ -357,6 +369,7 @@ yimby.watchdog/
 │   ├── migrate_data_dirs.py    # Data directory migration
 │   └── verify_legistar.py      # Legistar connectivity check
 ├── lib/
+│   ├── cf_bypass.py            # Playwright Cloudflare bypass for eScribe
 │   └── storage.py              # Storage abstraction (local or S3)
 ├── infra/                      # Terraform (Lambda, S3, EventBridge, IAM)
 └── data/                       # All data (gitignored)

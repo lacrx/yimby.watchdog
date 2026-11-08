@@ -10,7 +10,7 @@ This repo is the ETL/pipeline layer for civic monitoring. It scrapes meeting age
 
 **Split-mode pipeline (designed, not deployed):** AWS Lambda scrapes on schedule → writes S3 marker → local machine polls for marker via `extract-watch` → runs `claude -p` extraction via `extract-local`. The Lambda and EventBridge schedules are not in Terraform state, so the `extract-watch` cron is disabled.
 
-**What actually runs:** the local `civic-pipeline` cron does scraping and extraction: `local --deep --extract-until 4` nightly at 1am, and `local --deep --hot-only` at 6pm Tue–Fri.
+**What actually runs:** the local `civic-pipeline` cron does scraping and extraction: `local --deep --extract-until 4` nightly at 1am, and `local --deep --hot-only` at 6pm Tue–Fri. `escribe-sweep` runs at 4:17, 8:17, 11:17, 14:17 and 21:17 to retry Cloudflare-blocked eScribe downloads.
 
 **Config:** Jurisdiction-specific settings (city name, council roster, feeds, advocacy lens) live in AWS SSM Parameter Store. Local dev uses `config.local.yaml` fallback. `agencies.yaml` is the structural scraper registry (platforms, URLs, bodies). See `config.py` for the loader.
 
@@ -21,7 +21,10 @@ This repo is the ETL/pipeline layer for civic monitoring. It scrapes meeting age
 - `lambda_handler.py` — Lambda entry point, dispatches by platform
 - `extract-watch` — cron-driven S3 marker poller
 - `extract-local` — runs `claude -p` extraction, syncs results to S3
-- `civic-pipeline` — legacy local orchestrator (still works for manual runs)
+- `civic-pipeline` — the local orchestrator cron runs (scrape, permits, merge, extract, S3 sync, doctor)
+- `escribe-sweep` — retries eScribe downloads blocked by Cloudflare
+- `lib/cf_bypass.py` — Playwright session that solves the eScribe Cloudflare challenge
+- `pipeline_doctor.py` — post-run diagnostics; `--dry-run` writes nothing
 - `civic_utils.py` — shared utilities (PDF extraction, text processing, agency helpers)
 - `lib/storage.py` — storage abstraction (local filesystem or S3 via `WATCHDOG_S3_BUCKET`)
 
@@ -72,6 +75,17 @@ python pipeline_estimate.py --csv              # CSV for spreadsheets
 # Deploy Lambda (after changing lambda_handler, scrapers, or agencies.yaml)
 ./deploy-lambda
 ```
+
+## Reliability Conventions
+
+Follow these when adding or changing a scraper or pipeline phase. README.md "Reliability Conventions" has the full list.
+
+- Never swallow errors into "no data". Log `ERROR: ...` and return nonzero; `run_with_timeout` in `civic-pipeline` propagates the rc and logs the failure.
+- A listing that parses 0 meetings is a failure: print `ERROR: <agency>: listing parsed 0 meetings` and exit 3.
+- Record cancelled meetings with `cancelled: true` instead of skipping them; mark duplicate rows with `superseded_by`.
+- Use `civic_utils.RECHECK_DAYS` for any "keep rechecking for docs" window. Don't hard-code day counts.
+- Validate downloads (`%PDF` magic) before writing to `data/`; `download_pdf` already does this.
+- The venv lives at `.venv`. If the repo is moved or renamed, fix it or console scripts like `yt-dlp` break on stale shebangs. Rewrite the old path in `.venv/bin/*` and `.venv/pyvenv.cfg`, or rebuild from `pip freeze` output (requirements.txt omits optional transcription packages like faster-whisper).
 
 ## Data Layout
 

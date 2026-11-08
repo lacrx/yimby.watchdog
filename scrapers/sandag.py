@@ -37,6 +37,10 @@ from civic_utils import (
     cmd_list_meetings, log_discovery,
 )
 
+CANCEL_RE = re.compile(r"cancel", re.IGNORECASE)
+_DOC_TYPES = ("Agenda", "AgendaCover", "MergedCover", "PostAgenda", "PostMinutes",
+              "AdditionalDocuments")
+
 SANDAG_BODIES = [
     "Board of Directors",
     "Regional Planning Committee",
@@ -79,11 +83,20 @@ def extract_document_urls(meeting_data, escribe_base):
     minutes_url = None
     video_url = None
     meeting_page_url = None
+    additional = []
+    doc_titles = []  # titles of every document-type PDF link, for cancellation detection
 
     for link in links:
         link_type = link.get("Type", "")
         fmt = link.get("Format", "")
         url = link.get("Url", "")
+
+        if link_type in _DOC_TYPES and fmt == ".pdf":
+            doc_titles.append(link.get("Title") or "")
+        if link_type == "AdditionalDocuments" and fmt == ".pdf" and url:
+            title = link.get("Title") or ""
+            if not CANCEL_RE.search(title):
+                additional.append({"title": title.strip(), "url": url})
 
         if link_type == "Agenda" and fmt == ".pdf":
             agenda_url = url
@@ -103,7 +116,17 @@ def extract_document_urls(meeting_data, escribe_base):
             return u
         return f"{escribe_base}/{u}"
 
+    for a in additional:
+        a["url"] = full_url(a["url"])
+        m = re.search(r"DocumentId=(\d+)", a["url"])
+        a["doc_id"] = m.group(1) if m else hashlib.md5(a["url"].encode()).hexdigest()[:8]
+
+    # Cancelled without the Cancelled flag: every document is a cancellation notice
+    only_cancel = bool(doc_titles) and all(CANCEL_RE.search(t) for t in doc_titles)
+
     return {
+        "additional_docs": additional,
+        "cancelled_by_doc": only_cancel,
         "agenda_url": full_url(agenda_url),
         "minutes_url": full_url(minutes_url),
         "video_url": full_url(video_url),
@@ -121,7 +144,9 @@ def normalize_meeting(api_meeting, slug, agency_name, body_name, escribe_base):
     mid = make_meeting_id(slug, body_name, date_str)
     urls = extract_document_urls(api_meeting, escribe_base)
 
-    return {
+    cancelled = bool(api_meeting.get("Cancelled")) or urls["cancelled_by_doc"]
+
+    meeting = {
         "id": mid,
         "body": f"{agency_name} {body_name}",
         "date": date_str,
@@ -132,11 +157,15 @@ def normalize_meeting(api_meeting, slug, agency_name, body_name, escribe_base):
         "video_url": urls["video_url"],
         "escribe_id": api_meeting.get("Id"),
         "escribe_meeting_url": api_meeting.get("MeetingUrl"),
+        "additional_docs": urls["additional_docs"],
     }
+    if cancelled:
+        meeting["cancelled"] = True
+    return meeting
 
 
 def fetch_past_meetings(session, escribe_base, slug, agency_name, body_name, min_year):
-    """Paginate PastMeetings API, filter by year, skip cancelled."""
+    """Paginate PastMeetings API, filter by year. Cancelled meetings are kept, flagged."""
     past_url = f"{escribe_base}/MeetingsCalendarView.aspx/PastMeetings"
     all_meetings = []
     page = 1
@@ -156,8 +185,6 @@ def fetch_past_meetings(session, escribe_base, slug, agency_name, body_name, min
 
         oldest_year = None
         for m in meetings:
-            if m.get("Cancelled"):
-                continue
             year = m.get("Year")
             if year and year < min_year:
                 oldest_year = year
@@ -258,6 +285,18 @@ def cmd_fetch(args):
 
         is_new = mid not in state.get("meetings", {})
 
+        if m.get("cancelled"):
+            # Nothing to download; recorded so the doctor can skip it.
+            state["meetings"][mid] = {
+                "body": m["body"],
+                "date": m["date"],
+                "fetched": datetime.now().isoformat(),
+                "cancelled": True,
+            }
+            if is_new:
+                new += 1
+            continue
+
         if m.get("agenda_url"):
             pdf_path = docs_dir / f"{mid}-agenda-packet.pdf"
             txt_path = docs_dir / f"{mid}-agenda-packet.txt"
@@ -282,6 +321,16 @@ def cmd_fetch(args):
                     text = extract_text(pdf_path)
                     if text and is_new:
                         print(f"      Extracted {len(text)} chars")
+                time.sleep(0.5)
+
+        for doc in m.get("additional_docs") or []:
+            pdf_path = docs_dir / f"{mid}-addl-{doc['doc_id']}.pdf"
+            txt_path = pdf_path.with_suffix(".txt")
+            if not txt_path.exists():
+                if is_new:
+                    print(f"    {m['date']} {body_name}: downloading {doc['title'][:50] or 'additional doc'}...")
+                if download_pdf(doc["url"], pdf_path, verify=False):
+                    extract_text(pdf_path)
                 time.sleep(0.5)
 
         if deep and m.get("escribe_id"):

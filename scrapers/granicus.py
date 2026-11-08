@@ -35,6 +35,9 @@ from civic_utils import (
     safe_filename, cmd_list_meetings, rebuild_doc_index, log_discovery,
     meeting_needs_recheck,
 )
+import civic_utils
+
+RECHECK_DAYS = getattr(civic_utils, "RECHECK_DAYS", 90)
 
 GRAN_NS = "https://www.granicus.com/schema/rss-supplements"
 
@@ -136,10 +139,10 @@ def fetch_viewpublisher_html(base_url, view_id, cutoff_date=None):
     seen_ids = set()
     current_body = None
 
-    for el in soup.find_all(["h2", "a"]):
-        if el.name == "h2":
+    for el in soup.find_all(["h2", "h3", "a"]):
+        if el.name in ("h2", "h3"):
             text = el.get_text(strip=True)
-            if text not in ("Upcoming Events", "Archived Meetings"):
+            if text and text not in ("Upcoming Events", "Archived Meetings"):
                 current_body = text
             continue
 
@@ -152,28 +155,47 @@ def fetch_viewpublisher_html(base_url, view_id, cutoff_date=None):
             continue
         seen_ids.add(mid)
 
-        # Walk up to the table-row to get date
-        row = el.find_parent("li", class_="table-row")
+        # Rows are <li class="table-row"> on some sites and <tr><td class="listItem">
+        # on others (San Marcos). The name is the first cell; the date cell has a
+        # hidden epoch <span> followed by the visible text.
+        row = el.find_parent("li", class_="table-row") or el.find_parent("tr")
         date_text = ""
+        name_text = ""
+        epoch = None
         dt = None
         if row:
-            date_cell = row.find("div", class_=re.compile(r"date"))
+            cells = row.find_all("td", recursive=False)
+            date_cell = row.find("div", class_=re.compile(r"date")) if not cells else None
+            name_cell = row.find("div", class_=re.compile(r"name")) if not cells else None
+            if cells:
+                name_cell = cells[0]
+                date_cell = cells[1] if len(cells) > 1 else None
             if date_cell:
-                date_text = date_cell.get_text(strip=True)
+                span = date_cell.find("span", style=re.compile(r"display:\s*none"))
+                if span and span.get_text(strip=True).isdigit():
+                    epoch = int(span.get_text(strip=True))
+                    span.extract()
+                date_text = date_cell.get_text(" ", strip=True)
+            if name_cell:
+                name_text = name_cell.get_text(" ", strip=True)
 
         if date_text:
             date_text = re.sub(r'\s+', ' ', date_text.replace('\xa0', ' ')).strip()
             dt = parse_date_from_title(date_text)
+        if dt is None and epoch:
+            try:
+                dt = datetime.fromtimestamp(epoch)
+            except (OverflowError, OSError, ValueError):
+                dt = None
 
         if cutoff_date and dt and dt < cutoff_date:
             continue
 
         link_url = href if href.startswith("http") else f"https:{href}"
-        body = current_body or ""
-        if not body and row:
-            name_cell = row.find("div", class_=re.compile(r"name"))
-            if name_cell:
-                body = extract_body_from_title(name_cell.get_text(strip=True))
+        body = ""
+        if name_text:
+            body = extract_body_from_title(re.sub(r'\s+', ' ', name_text.replace('\xa0', ' ')))
+        body = body or current_body or ""
         title = f"{body} - {date_text}" if body and date_text else body or date_text
 
         items.append({
@@ -289,6 +311,60 @@ def extract_pdf_links_from_agenda(agenda_url, base_url):
     return pdfs
 
 
+def _norm_body(body):
+    return re.sub(r"[^a-z0-9]+", " ", (body or "").lower()).strip()
+
+
+def _bodies_match(a, b):
+    a, b = _norm_body(a), _norm_body(b)
+    if not a or not b:
+        return False
+    return a == b or a in b or b in a
+
+
+def _mdate(date_str):
+    try:
+        return datetime.strptime(date_str, "%m/%d/%Y").strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return ""
+
+
+def reconcile_superseded(slug, meetings_dir, docs_dir):
+    """Mark evt-N rows superseded_by clip-M when an archived clip has the same
+    date and body, and copy evt docs onto the clip if the clip has none."""
+    import shutil
+    rows = []
+    for mdir in meetings_dir.iterdir():
+        mf = mdir / "meeting.json"
+        meta = load_json(mf) if mf.exists() else None
+        if meta:
+            rows.append((mdir.name, mf, meta))
+    clips = [(i, mf, m) for i, mf, m in rows if i.startswith("clip-") and m.get("date")]
+    marked = merged = 0
+    for eid, emf, em in rows:
+        if not eid.startswith("evt-") or em.get("superseded_by") or not em.get("date"):
+            continue
+        for cid, cmf, cm in clips:
+            if _mdate(cm["date"]) != _mdate(em["date"]) or not _bodies_match(cm.get("body"), em.get("body")):
+                continue
+            em["superseded_by"] = cid
+            save_json(emf, em)
+            marked += 1
+            clip_has_docs = any(f.name.startswith(cid + "-") and f.stat().st_size > 0
+                                for f in docs_dir.iterdir())
+            if not clip_has_docs:
+                for f in list(docs_dir.iterdir()):
+                    if f.name.startswith(eid + "-"):
+                        dest = docs_dir / (cid + f.name[len(eid):])
+                        if not dest.exists():
+                            shutil.copy2(f, dest)
+                            merged += 1
+            break
+    if marked:
+        print(f"  Superseded: marked {marked} evt rows, merged {merged} doc files onto clips")
+    return marked
+
+
 def cmd_fetch(args):
     agencies = load_agencies(enabled_only=False)
     slug = args.agency
@@ -312,6 +388,8 @@ def cmd_fetch(args):
         d.mkdir(parents=True, exist_ok=True)
 
     state = load_json(state_file) or {"last_fetch": None, "meetings": {}}
+    failed = state.setdefault("failed_fetches", {})
+    now = datetime.now()
 
     years = float(args.years) if args.years else 1
     cutoff = datetime.now() - timedelta(days=365 * years)
@@ -331,6 +409,44 @@ def cmd_fetch(args):
         new_from_html = [it for it in html_items if it["meeting_id"] not in rss_ids]
         print(f"  {len(html_items)} meetings in HTML archive, {len(new_from_html)} beyond RSS")
         items.extend(new_from_html)
+
+    # Drop undated archive items: they cannot be windowed or matched to anything.
+    undated = [it for it in items if not it["date"]]
+    if undated:
+        print(f"  Skipping {len(undated)} items with no parseable date")
+        items = [it for it in items if it["date"]]
+
+    # Retry list: failed fetches that have since left the RSS feed, plus any
+    # ids forced with --retry. Entries expire RECHECK_DAYS after first failure.
+    have = {it["meeting_id"] for it in items}
+    retry_ids = list(getattr(args, "retry", None) or [])
+    for rid, info in list(failed.items()):
+        try:
+            age = (now - datetime.fromisoformat(info["first_failure"])).days
+        except (KeyError, ValueError):
+            age = 0
+        if age > RECHECK_DAYS:
+            print(f"  Retry list: giving up on {rid} after {age} days ({info.get('url')})")
+            del failed[rid]
+        else:
+            retry_ids.append(rid)
+    for rid in retry_ids:
+        if rid in have:
+            continue
+        mf = meetings_dir / rid / "meeting.json"
+        meta = load_json(mf) if mf.exists() else None
+        if not meta:
+            print(f"  Retry: no meeting.json for {rid}, skipping")
+            continue
+        info = failed.get(rid, {})
+        url = info.get("url") or meta.get("agenda_url")
+        items.append({
+            "title": meta.get("title", ""), "link": url, "guid": "",
+            "date": datetime.strptime(meta["date"], "%m/%d/%Y") if _mdate(meta.get("date")) else None,
+            "body": meta.get("body", ""), "meeting_id": rid, "forced": True,
+        })
+        have.add(rid)
+        print(f"  RETRY: {rid} ({url})")
 
     new_count = 0
     doc_count = 0
@@ -354,10 +470,23 @@ def cmd_fetch(args):
             save_json(meeting_file, meeting_meta)
             new_count += 1
             print(f"  NEW: {item['title']}")
+        else:
+            # Heal rows written earlier without a date or body (old HTML parser).
+            meta = load_json(meeting_file) or {}
+            changed = False
+            if not meta.get("date") and item["date"]:
+                meta["date"] = item["date"].strftime("%m/%d/%Y")
+                changed = True
+            if not meta.get("body") and item["body"]:
+                meta["body"] = item["body"]
+                meta["title"] = item["title"]
+                changed = True
+            if changed:
+                save_json(meeting_file, meta)
 
-        if mid in state["meetings"] and not args.deep:
+        if mid in state["meetings"] and not args.deep and not item.get("forced"):
             meeting_date = state["meetings"][mid].get("date", "") or (item["date"].strftime("%m/%d/%Y") if item["date"] else "")
-            if not meeting_needs_recheck(mid, docs_dir, meeting_date):
+            if not meeting_needs_recheck(mid, docs_dir, meeting_date, max_age_days=RECHECK_DAYS):
                 continue
             print(f"  RECHECK: {item['title']} (no documents yet)")
 
@@ -367,7 +496,13 @@ def cmd_fetch(args):
             pdfs = extract_pdf_links_from_agenda(item["link"], base_url)
         except Exception as e:
             print(f"  Failed to fetch agenda page for {mid}: {e}")
+            rec = failed.setdefault(mid, {"url": item["link"], "attempts": 0,
+                                          "first_failure": now.isoformat()})
+            rec["attempts"] += 1
+            rec["last_error"] = str(e)[:200]
+            rec["last_attempt"] = now.isoformat()
             continue
+        agenda_failed = False
 
         has_agenda = any(p["type"] in ("agenda", "agenda_text") for p in pdfs)
 
@@ -391,6 +526,12 @@ def cmd_fetch(args):
                     agenda_text = BeautifulSoup(r.text, "lxml").get_text("\n", strip=True)
                 except Exception as e:
                     print(f"  Failed to fetch HTML agenda for {mid}: {e}")
+                    agenda_failed = True
+                    rec = failed.setdefault(mid, {"url": item["link"], "attempts": 0,
+                                                  "first_failure": now.isoformat()})
+                    rec["attempts"] += 1
+                    rec["last_error"] = str(e)[:200]
+                    rec["last_attempt"] = now.isoformat()
                     continue
                 if agenda_text:
                     dest.write_text(agenda_text)
@@ -424,6 +565,9 @@ def cmd_fetch(args):
                     doc_count += 1
                 time.sleep(0.5)
 
+        if agenda_failed:
+            continue
+        failed.pop(mid, None)
         state["meetings"][mid] = {
             "fetched": datetime.now().isoformat(),
             "title": item["title"],
@@ -432,6 +576,7 @@ def cmd_fetch(args):
         time.sleep(1)
 
     state["last_fetch"] = datetime.now().isoformat()
+    reconcile_superseded(slug, meetings_dir, docs_dir)
     rebuild_doc_index(slug, state, docs_dir)
     save_json(state_file, state)
     log_discovery(slug, meetings_new=new_count, docs_new=doc_count)
@@ -450,6 +595,8 @@ def main():
     p_fetch.add_argument("--agency", required=True)
     p_fetch.add_argument("--years", default="1")
     p_fetch.add_argument("--deep", action="store_true")
+    p_fetch.add_argument("--retry", action="append", default=[],
+                         help="force re-fetch of a meeting id (e.g. evt-8972); repeatable")
 
     p_list = sub.add_parser("list")
     p_list.add_argument("--agency", required=True)

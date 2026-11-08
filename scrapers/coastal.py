@@ -56,20 +56,22 @@ def save_state(state):
 
 
 def fetch_agenda(year, month):
+    """Return the month's agenda, or None when the month has no agenda (404/empty).
+
+    Network, HTTP and JSON errors propagate so the caller can tell a failure
+    apart from "no data".
+    """
     url = f"{API_BASE}/{year}/{month}"
-    try:
-        resp = requests.get(url, timeout=30, headers={
-            "User-Agent": "Mozilla/5.0 yimby-watchdog/1.0",
-        })
-        if resp.status_code == 404:
-            return None
-        resp.raise_for_status()
-        data = resp.json()
-        if not data:
-            return None
-        return data[0] if isinstance(data, list) else data
-    except (requests.RequestException, json.JSONDecodeError):
+    resp = requests.get(url, timeout=30, headers={
+        "User-Agent": "Mozilla/5.0 yimby-watchdog/1.0",
+    })
+    if resp.status_code == 404:
         return None
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        return None
+    return data[0] if isinstance(data, list) else data
 
 
 def find_relevant_items(agenda):
@@ -129,6 +131,8 @@ def cmd_fetch(args):
 
     total_items = 0
     city_items = 0
+    attempted = 0
+    failed_months = 0
 
     for year in range(min_year, now.year + 1):
         max_month = 12 if year < now.year else now.month
@@ -136,7 +140,13 @@ def cmd_fetch(args):
             mid = f"ccc-{year}-{month:02d}"
 
             print(f"Fetching CCC {year}/{month:02d}...", end=" ", flush=True)
-            agenda = fetch_agenda(year, month)
+            attempted += 1
+            try:
+                agenda = fetch_agenda(year, month)
+            except (requests.RequestException, ValueError) as e:
+                failed_months += 1
+                print(f"ERROR: CCC {year}/{month:02d} fetch failed: {e}")
+                continue
             if not agenda:
                 print("no data")
                 continue
@@ -159,6 +169,17 @@ def cmd_fetch(args):
             items = find_relevant_items(agenda)
             meeting["sd_items"] = len(items)
             meeting["city_items"] = sum(1 for i in items if i.get("is_primary_city"))
+
+            # Real hearing date: the day the primary-city item is heard, else the first meeting day.
+            city_days = [i["date"] for i in items if i.get("is_primary_city") and isinstance(i.get("date"), int)]
+            all_days = [d.get("date") for d in agenda.get("days", []) if isinstance(d.get("date"), int)]
+            day = min(city_days) if city_days else (min(all_days) if all_days else None)
+            if day:
+                meeting["date"] = f"{year}-{month:02d}-{day:02d}"
+            if meeting["city_items"] and not any(
+                i.get("assets") for i in items if i.get("is_primary_city")
+            ):
+                meeting["no_assets"] = True
 
             meta_file = meeting_dir / "meeting.json"
             meta_file.write_text(json.dumps(meeting, indent=2))
@@ -200,11 +221,15 @@ def cmd_fetch(args):
 
             time.sleep(0.5)
 
-    state["last_fetch"] = now.isoformat()
+    if failed_months < attempted:
+        state["last_fetch"] = now.isoformat()
     rebuild_doc_index("coastal", state, DOCS_DIR)
     save_state(state)
     log_discovery("coastal", meetings_found=total_items, meetings_new=city_items)
     print(f"\nDone. {total_items} SD district items, {city_items} {_primary_city}-specific.")
+    if attempted and failed_months == attempted:
+        print(f"ERROR: Coastal Commission: all {attempted} month fetches failed")
+        sys.exit(3)
 
 
 def cmd_list(args):

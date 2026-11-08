@@ -28,6 +28,9 @@ from civic_utils import (
     cmd_list_meetings, log_discovery, download_pdf,
     meeting_needs_recheck,
 )
+import civic_utils
+
+RECHECK_DAYS = getattr(civic_utils, "RECHECK_DAYS", 90)
 
 SLUG = "el_cajon"
 BASE_URL = "https://www.elcajon.gov"
@@ -103,8 +106,7 @@ def parse_events_page(html, cutoff):
             continue
 
         event_name = cells[0].get_text(strip=True)
-        if "canceled" in event_name.lower():
-            continue
+        cancelled = bool(re.search(r"cancel", event_name, re.I))
 
         body = parse_body(event_name)
 
@@ -136,13 +138,14 @@ def parse_events_page(html, cutoff):
                     "name": name,
                 })
 
-        if docs:
-            meetings.append({
-                "body": body,
-                "date": dt,
-                "type": meeting_type,
-                "docs": docs,
-            })
+        # Emit every parsed meeting (even docless ones) so gaps are visible.
+        meetings.append({
+            "body": body,
+            "date": dt,
+            "type": meeting_type,
+            "docs": docs,
+            "cancelled": cancelled,
+        })
 
     return meetings, total
 
@@ -164,18 +167,32 @@ def cmd_fetch(args):
     new_count = 0
     doc_count = 0
     all_meetings = {}
+    page_failures = 0
 
     for toggle in ["allupcoming", "allpast"]:
         page = 1
+        known_total = 0
         while True:
             url = f"{BASE_URL}{EVENTS_PATH}/-toggle-{toggle}/-npage-{page}"
-            try:
-                html = fetch_page(url)
-            except Exception as e:
-                print(f"  Page {page} failed: {e}")
+            html = None
+            for attempt in range(2):
+                try:
+                    html = fetch_page(url)
+                    break
+                except Exception as e:
+                    err = e
+                    time.sleep(2)
+            if html is None:
+                page_failures += 1
+                print(f"  ERROR: El Cajon {toggle} page {page} failed: {err}")
+                # Keep paginating past a bad page when the total is known.
+                if known_total and page * PER_PAGE < known_total:
+                    page += 1
+                    continue
                 break
 
             meetings, total = parse_events_page(html, cutoff)
+            known_total = total or known_total
 
             if not meetings and page > 1:
                 break
@@ -186,6 +203,7 @@ def cmd_fetch(args):
                     all_meetings[mid] = m
                 else:
                     all_meetings[mid]["docs"].extend(m["docs"])
+                    all_meetings[mid]["cancelled"] = all_meetings[mid]["cancelled"] and m["cancelled"]
 
             fetched_through = page * PER_PAGE
             print(f"  {toggle} page {page}: {len(meetings)} meetings (total {total})")
@@ -216,12 +234,22 @@ def cmd_fetch(args):
                 "source": "elcajon_cms",
                 "agency": SLUG,
             }
+            if meeting["cancelled"]:
+                meta["cancelled"] = True
             save_json(meeting_file, meta)
             new_count += 1
             print(f"    NEW: {body} — {dt.strftime('%Y-%m-%d')}")
+        else:
+            meta = load_json(meeting_file) or {}
+            if bool(meta.get("cancelled")) != meeting["cancelled"]:
+                if meeting["cancelled"]:
+                    meta["cancelled"] = True
+                else:
+                    meta.pop("cancelled", None)
+                save_json(meeting_file, meta)
 
         if mid in state["meetings"]:
-            if not meeting_needs_recheck(mid, docs_dir, dt.strftime("%m/%d/%Y")):
+            if not meeting_needs_recheck(mid, docs_dir, dt.strftime("%m/%d/%Y"), max_age_days=RECHECK_DAYS):
                 continue
             print(f"    RECHECK: {body} — {dt.strftime('%Y-%m-%d')} (no documents yet)")
 
@@ -243,11 +271,18 @@ def cmd_fetch(args):
         state["meetings"][mid] = {"fetched": datetime.now().isoformat(), "body": body, "date": dt.strftime("%m/%d/%Y")}
         time.sleep(0.3)
 
-    state["last_fetch"] = datetime.now().isoformat()
+    if page_failures == 0:
+        state["last_fetch"] = datetime.now().isoformat()
     rebuild_doc_index(SLUG, state, docs_dir)
     save_json(state_file, state)
     log_discovery(SLUG, meetings_new=new_count, docs_new=doc_count)
     print(f"\nDone. {new_count} new meetings, {doc_count} documents extracted.")
+    if not all_meetings:
+        print("ERROR: City of El Cajon: listing parsed 0 meetings")
+        sys.exit(3)
+    if page_failures:
+        print(f"ERROR: El Cajon: {page_failures} listing page(s) failed; results incomplete")
+        sys.exit(1)
 
 
 def cmd_list(args):

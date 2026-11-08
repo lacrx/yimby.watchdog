@@ -34,6 +34,10 @@ from civic_utils import (
     safe_filename, cmd_list_meetings, rebuild_doc_index, log_discovery,
     meeting_needs_recheck,
 )
+import civic_utils
+
+RECHECK_DAYS = getattr(civic_utils, 'RECHECK_DAYS', 90)
+MAX_LIST_PAGES = 60
 
 BODY_CODES = {
     "bc-citycouncil": "City Council",
@@ -50,12 +54,42 @@ BODY_CODES = {
 }
 
 
-def fetch_meeting_list(base_url):
-    """Fetch main meetings page and extract meeting links with dates."""
-    resp = requests.get(base_url + "/", timeout=30,
-                        headers={"User-Agent": USER_AGENT})
+def fetch_meeting_list(base_url, page=0):
+    """Fetch one page of the meetings listing (newest first)."""
+    url = base_url + "/" + (f"?page={page}" if page else "")
+    resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
     resp.raise_for_status()
     return resp.text
+
+
+def fetch_all_meetings(base_url, cutoff_date):
+    """Follow ?page=N until the listing runs out, repeats, or passes the cutoff.
+
+    Returns all parsed meetings on the pages visited (unfiltered by cutoff;
+    the caller filters). Raises on a page-0 failure; later page failures
+    just end pagination.
+    """
+    all_meetings = []
+    seen = set()
+    for page in range(MAX_LIST_PAGES):
+        try:
+            html = fetch_meeting_list(base_url, page)
+        except requests.RequestException:
+            if page == 0:
+                raise
+            print(f"  Listing page {page} failed; stopping pagination")
+            break
+        rows = parse_meeting_list(html, base_url, "")
+        new_rows = [m for m in rows if m["meeting_id"] not in seen]
+        if not new_rows:
+            break
+        seen.update(m["meeting_id"] for m in new_rows)
+        all_meetings.extend(new_rows)
+        if min(m["date"] for m in new_rows) < cutoff_date:
+            break
+        if "page=" not in html or not BeautifulSoup(html, "lxml").select("a[href*='page=']:not([href*='/bc-'])"):
+            break
+    return all_meetings
 
 
 def parse_meeting_list(html, base_url, cutoff_date):
@@ -82,7 +116,10 @@ def parse_meeting_list(html, base_url, cutoff_date):
         slug = body_match.group(2)
         body_name = BODY_CODES.get(body_code, body_code.replace("bc-", "").replace("-", " ").title())
 
-        date_el = link.find_next("span", attrs={"content": True})
+        # The date cell precedes the link inside the same table row, so take
+        # it from the link's own row (find_next would grab the NEXT row's date).
+        row = link.find_parent("tr") or link.find_parent(class_=re.compile(r"views-row"))
+        date_el = row.find("span", attrs={"content": True}) if row else None
         if not date_el:
             continue
 
@@ -90,8 +127,7 @@ def parse_meeting_list(html, base_url, cutoff_date):
         if date_str < cutoff_date:
             continue
 
-        if "cancelled" in slug.lower():
-            continue
+        cancelled = "cancelled" in slug.lower()
 
         meeting_id = hashlib.md5(f"{body_code}-{slug}".encode()).hexdigest()[:12]
 
@@ -103,6 +139,7 @@ def parse_meeting_list(html, base_url, cutoff_date):
             "body_code": body_code,
             "title": link.get_text(strip=True),
             "meeting_id": meeting_id,
+            "cancelled": cancelled,
         })
 
     return meetings
@@ -153,8 +190,12 @@ def cmd_fetch(args):
     cutoff_date = (datetime.now() - timedelta(days=365 * years)).strftime("%Y-%m-%d")
 
     print(f"Fetching {cfg['name']} meetings (Municode Meetings)...")
-    html = fetch_meeting_list(base_url)
-    meetings = parse_meeting_list(html, base_url, cutoff_date)
+    try:
+        listed = fetch_all_meetings(base_url, cutoff_date)
+    except requests.RequestException as e:
+        print(f"ERROR: {cfg['name']}: listing fetch failed: {e}")
+        sys.exit(3)
+    meetings = [m for m in listed if m["date"] >= cutoff_date]
     print(f"  {len(meetings)} meetings found (since {cutoff_date})")
 
     new_count = 0
@@ -167,15 +208,49 @@ def cmd_fetch(args):
 
         meeting_file = mdir / "meeting.json"
         is_new = not meeting_file.exists()
+        meeting_meta = load_json(meeting_file) if not is_new else {}
 
-        if mid in state["meetings"] and not args.deep and not is_new:
-            if not meeting_needs_recheck(mid, docs_dir, meeting["date"]):
+        # The live listing is authoritative for date/body: repair stale values.
+        if is_new:
+            meeting_meta = {
+                "body": meeting["body"],
+                "date": meeting["date"],
+                "id": mid,
+                "source": "municode",
+                "agency": slug,
+                "documents": [],
+                "url": meeting["url"],
+            }
+        else:
+            if meeting_meta.get("date") != meeting["date"]:
+                print(f"  FIX DATE: {mid} {meeting_meta.get('date')} -> {meeting['date']} ({meeting['body']})")
+            meeting_meta.update({"body": meeting["body"], "date": meeting["date"],
+                                 "url": meeting["url"]})
+        if meeting["cancelled"]:
+            meeting_meta["cancelled"] = True
+        save_json(meeting_file, meeting_meta)
+        if is_new:
+            new_count += 1
+
+        st = state["meetings"].setdefault(mid, {})
+        st["body"] = meeting["body"]
+        st["date"] = meeting["date"]
+
+        if meeting["cancelled"]:
+            continue
+
+        if st.get("fetched") and not args.deep and not is_new:
+            if not meeting_needs_recheck(mid, docs_dir, meeting["date"], max_age_days=RECHECK_DAYS):
                 continue
             print(f"  RECHECK: {meeting['date']} {meeting['body']} (no documents yet)")
         elif is_new or args.deep:
             print(f"  {'NEW: ' if is_new else ''}{meeting['date']} {meeting['body']}")
 
-        docs = fetch_meeting_documents(meeting["url"])
+        try:
+            docs = fetch_meeting_documents(meeting["url"])
+        except Exception as e:
+            print(f"  Detail page failed for {meeting['date']} {meeting['body']} ({mid}): {e}")
+            continue
         time.sleep(0.5)
 
         doc_meta = []
@@ -193,29 +268,19 @@ def cmd_fetch(args):
                 doc_meta.append({"title": doc["title"], "file": fname})
                 time.sleep(0.5)
 
-        if is_new:
-            meeting_meta = {
-                "body": meeting["body"],
-                "date": meeting["date"],
-                "id": mid,
-                "source": "municode",
-                "agency": slug,
-                "documents": doc_meta,
-            }
-            save_json(meeting_file, meeting_meta)
-            new_count += 1
+        meeting_meta["documents"] = doc_meta
+        save_json(meeting_file, meeting_meta)
 
-        state["meetings"][mid] = {
-            "fetched": datetime.now().isoformat(),
-            "body": meeting["body"],
-            "date": meeting["date"],
-        }
+        st["fetched"] = datetime.now().isoformat()
 
     state["last_fetch"] = datetime.now().isoformat()
     rebuild_doc_index(slug, state, docs_dir)
     save_json(state_file, state)
     log_discovery(slug, meetings_found=len(meetings), meetings_new=new_count, docs_new=doc_count)
     print(f"\nDone. {new_count} new meetings, {doc_count} documents extracted.")
+    if not listed:
+        print(f"ERROR: {cfg['name']}: listing parsed 0 meetings")
+        sys.exit(3)
 
 
 def cmd_list(args):

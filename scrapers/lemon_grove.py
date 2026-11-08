@@ -28,13 +28,18 @@ from civic_utils import (
     cmd_list_meetings, log_discovery, BROWSER_UA,
     meeting_needs_recheck,
 )
+import civic_utils
+
+RECHECK_DAYS = getattr(civic_utils, 'RECHECK_DAYS', 90)
 
 SLUG = "lemon_grove"
 BASE_URL = "https://events.lemongrove.ca.gov"
 LISTING_URL = f"{BASE_URL}/council"
 
 UUID_RE = re.compile(r'/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$', re.I)
-DETAIL_RE = re.compile(r'/council/Detail/(\d{4})-(\d{2})-(\d{2})-(\d{4})-(.+)')
+# Anchored: meeting detail URLs end at the slug. Document URLs append /<uuid>
+# and must not match (they created phantom "lg-agenda-pdf-*" meetings).
+DETAIL_RE = re.compile(r'/council/Detail/(\d{4})-(\d{2})-(\d{2})-(\d{4})-([^/?#]+)/?$')
 
 
 def _setup_dirs():
@@ -58,7 +63,7 @@ def _parse_listing(html):
     results = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        m = DETAIL_RE.search(href)
+        m = DETAIL_RE.search(href.split("?")[0].split("#")[0])
         if not m:
             continue
         text = a.get_text(strip=True)
@@ -84,6 +89,28 @@ def _parse_detail(html, detail_url):
     return docs
 
 
+def _guess_detail_url(session, body, dt):
+    """Best-effort detail URL for meetings stored before detail_url existed.
+
+    Pattern: /council/Detail/YYYY-MM-DD-HHMM-Body-Words[N]. Past meetings 302
+    to /council/Index when the slug is wrong.
+    """
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", body).strip("-")
+    if not slug:
+        return None
+    for hhmm in ("1800", "1700", "1900"):
+        for suffix in ("", "2", "3"):
+            url = f"{BASE_URL}/council/Detail/{dt.strftime('%Y-%m-%d')}-{hhmm}-{slug}{suffix}"
+            try:
+                r = session.get(url, timeout=30, allow_redirects=False)
+            except requests.RequestException:
+                continue
+            time.sleep(0.3)
+            if r.status_code == 200:
+                return url
+    return None
+
+
 def cmd_fetch(args):
     _, meetings_dir, docs_dir, state_file = _setup_dirs()
     state = load_json(state_file) or {"last_fetch": None, "meetings": {}}
@@ -96,26 +123,51 @@ def cmd_fetch(args):
     session = requests.Session()
     session.headers.update({"User-Agent": BROWSER_UA})
 
+    events = []
     try:
         resp = session.get(LISTING_URL, timeout=30)
         resp.raise_for_status()
-    except requests.HTTPError as e:
-        print(f"  Listing page returned {resp.status_code} — site may be blocking scrapers")
-        return
-    events = _parse_listing(resp.text)
+        events = _parse_listing(resp.text)
+    except requests.RequestException as e:
+        # HTTPError, Timeout, ConnectionError: fall through to rechecks of
+        # stored meetings; the empty-listing failure is emitted at the end.
+        print(f"  Listing page failed: {e}")
     print(f"  Found {len(events)} events on listing page")
+
+    # The listing only shows upcoming events, so past meetings drop off before
+    # their documents are posted. Add recheck candidates from stored detail URLs.
+    work = {}
+    for detail_url, dt, title in events:
+        work[f"lg-{_body_slug(title)}-{dt.strftime('%Y%m%d')}"] = (detail_url, dt, title)
+    for mdir in sorted(meetings_dir.iterdir()):
+        mid = mdir.name
+        if mid in work or mid.startswith("lg-agenda-pdf-"):
+            continue
+        meta = load_json(mdir / "meeting.json")
+        if not meta or meta.get("cancelled"):
+            continue
+        try:
+            dt = datetime.strptime(meta["date"], "%m/%d/%Y")
+        except (KeyError, ValueError):
+            continue
+        if (datetime.now() - dt).days > RECHECK_DAYS or dt < cutoff:
+            continue
+        if not meeting_needs_recheck(mid, docs_dir, meta["date"], max_age_days=RECHECK_DAYS):
+            continue
+        url = meta.get("detail_url")
+        if not url:
+            url = _guess_detail_url(session, meta.get("body", ""), dt)
+        if url:
+            work[mid] = (url, dt, meta.get("body", ""))
 
     new_count = 0
     doc_count = 0
 
-    for detail_url, dt, title in events:
+    for mid, (detail_url, dt, title) in sorted(work.items(), key=lambda kv: kv[1][1]):
         if dt < cutoff:
             continue
         if "cancelled" in title.lower():
             continue
-
-        body_s = _body_slug(title)
-        mid = f"lg-{body_s}-{dt.strftime('%Y%m%d')}"
 
         mdir = meetings_dir / mid
         mdir.mkdir(exist_ok=True)
@@ -126,18 +178,26 @@ def cmd_fetch(args):
                 "id": mid,
                 "body": title,
                 "date": dt.strftime("%m/%d/%Y"),
-                "title": f"{title} — {dt.strftime('%b %d, %Y')}",
+                "title": f"{title} \u2014 {dt.strftime('%b %d, %Y')}",
                 "source": "events_portal",
                 "agency": SLUG,
+                "detail_url": detail_url,
             }
+            if re.search(r"cancel", title, re.I):
+                meta["cancelled"] = True
             save_json(meeting_file, meta)
             new_count += 1
-            print(f"    NEW: {title} — {dt.strftime('%Y-%m-%d')}")
+            print(f"    NEW: {title} \u2014 {dt.strftime('%Y-%m-%d')}")
+        else:
+            meta = load_json(meeting_file)
+            if meta.get("detail_url") != detail_url:
+                meta["detail_url"] = detail_url
+                save_json(meeting_file, meta)
 
         if mid in state["meetings"]:
-            if not meeting_needs_recheck(mid, docs_dir, dt.strftime("%m/%d/%Y")):
+            if not meeting_needs_recheck(mid, docs_dir, dt.strftime("%m/%d/%Y"), max_age_days=RECHECK_DAYS):
                 continue
-            print(f"    RECHECK: {title} — {dt.strftime('%Y-%m-%d')} (no documents yet)")
+            print(f"    RECHECK: {title} \u2014 {dt.strftime('%Y-%m-%d')} (no documents yet)")
 
         # Fetch detail page for document links
         time.sleep(0.5)
@@ -173,6 +233,9 @@ def cmd_fetch(args):
     save_json(state_file, state)
     log_discovery(SLUG, meetings_new=new_count, docs_new=doc_count)
     print(f"\nDone. {new_count} new meetings, {doc_count} documents extracted.")
+    if not events:
+        print("ERROR: Lemon Grove: listing parsed 0 meetings")
+        sys.exit(3)
 
 
 def cmd_list(args):

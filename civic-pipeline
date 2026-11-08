@@ -17,7 +17,8 @@
 #   --hot-only          Extract recent meetings only (skip backlog). Use for forward-facing cron.
 #   --extract-until H   Stop cold extraction at hour H (0-23). Ignored with --hot-only.
 #
-# Cron (forward-facing only — backlog extraction is a separate job via extract-backlog):
+# Cron (forward-facing; cold-queue backlog is handled by --extract-until / the default
+# cold limit of 50 on non-hot-only runs):
 #   0 1 * * *    cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep --hot-only
 #   0 18 * * 2-5 cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep --hot-only
 
@@ -28,15 +29,36 @@ source .venv/bin/activate
 [ -f .env ] && set -a && source .env && set +a
 unset ANTHROPIC_API_KEY  # extraction uses claude -p via subscription, not paid API
 
+# ── Own process group ──
+# Re-exec under setsid so the whole run (bash + python/claude children) is one
+# session led by this PID. The next run can then kill the session (timeout puts its
+# child in its own process group, so killing the group would miss wrapped scrapers).
+# Skipped on a tty so manual runs keep Ctrl-C.
+if [ -z "${CIVIC_PIPELINE_SETSID:-}" ] && [ ! -t 0 ] && command -v setsid >/dev/null 2>&1; then
+    export CIVIC_PIPELINE_SETSID=1
+    exec setsid --wait "$0" "$@"
+fi
+
 # ── Overlap protection ──
 PIDFILE="data/.pipeline.pid"
 if [ -f "$PIDFILE" ]; then
     OLD_PID=$(cat "$PIDFILE")
-    if kill -0 "$OLD_PID" 2>/dev/null; then
+    if [ -n "$OLD_PID" ] && kill -0 "$OLD_PID" 2>/dev/null; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] Pipeline already running (PID $OLD_PID). Killing stale run."
-        kill "$OLD_PID" 2>/dev/null || true
-        sleep 2
-        kill -9 "$OLD_PID" 2>/dev/null || true
+        OLD_SID=$(ps -o sid= -p "$OLD_PID" 2>/dev/null | tr -d ' ' || true)
+        if [ "$OLD_SID" = "$OLD_PID" ]; then
+            # Session leader (setsid run): kill bash and every child in the session
+            pkill -TERM -s "$OLD_PID" 2>/dev/null || true
+            sleep 2
+            pkill -KILL -s "$OLD_PID" 2>/dev/null || true
+        else
+            # Pre-setsid run: no group of its own; kill its children, then it
+            pkill -TERM -P "$OLD_PID" 2>/dev/null || true
+            kill "$OLD_PID" 2>/dev/null || true
+            sleep 2
+            pkill -KILL -P "$OLD_PID" 2>/dev/null || true
+            kill -9 "$OLD_PID" 2>/dev/null || true
+        fi
     fi
 fi
 echo $$ > "$PIDFILE"
@@ -44,25 +66,70 @@ trap 'rm -f "$PIDFILE"' EXIT
 
 PHASE_TIMEOUT=1800  # 30 min max per scraper phase
 
+# Runs a command under the phase timeout and returns its exit code (124 = timed out).
+# Never logs; callers log, because the command's own output is redirected at the call site.
+# Callers must not rely on set -e: use `if ! run_with_timeout ...; then` or `|| rc=$?`.
 run_with_timeout() {
-    local label="$1"; shift
-    timeout "$PHASE_TIMEOUT" "$@" && return 0
-    local rc=$?
+    local rc=0
+    timeout -k 30 "$PHASE_TIMEOUT" "$@" < /dev/null || rc=$?
+    return "$rc"
+}
+
+# Contract: "ERROR: <desc> failed (rc=N)" or "ERROR: <desc> timed out".
+log_phase_error() {
+    local desc="$1" rc="$2"
     if [ "$rc" -eq 124 ]; then
-        log "$label timed out after ${PHASE_TIMEOUT}s — killed."
+        log "ERROR: $desc timed out"
     else
-        log "$label failed (exit $rc) — continuing."
+        log "ERROR: $desc failed (rc=$rc)"
     fi
-    return 0
+}
+
+# Emit a "slug|..." list from agencies.yaml on stdout. Returns 1 (and logs ERROR
+# to stderr) if python fails or the list is empty, so loops never silently run zero times.
+load_list() {
+    local desc="$1" code="$2" out rc=0
+    out=$(python3 -c "$code") || rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+        log "ERROR: $desc agency list failed (rc=$rc, empty=$([ -z "$out" ] && echo yes || echo no))" >&2
+        return 1
+    fi
+    printf '%s\n' "$out"
 }
 
 sync_to_s3() {
     local prefix="$1"; local local_path="$2"; local storage_class="${3:-STANDARD}"
     shift 3
     [ -z "${WATCHDOG_S3_BUCKET:-}" ] && return 0
+    # --size-only only for large immutable raw files (PDFs, audio). Metadata,
+    # operational and structured data are small and edited in place, often
+    # without a size change, so they must compare timestamps.
+    local size_only=()
+    case "$prefix" in
+        archive/*) size_only=(--size-only) ;;
+    esac
+    local rc=0
     aws s3 sync "$local_path" "s3://${WATCHDOG_S3_BUCKET}/${prefix}" \
-        --storage-class "$storage_class" --no-progress --size-only \
-        "$@" >> data/s3-sync.log 2>&1 || log "S3 sync failed for $prefix (non-fatal)"
+        --storage-class "$storage_class" --no-progress "${size_only[@]}" \
+        "$@" >> data/s3-sync.log 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "ERROR: S3 sync of $prefix failed (rc=$rc)"
+    fi
+    return 0
+}
+
+s3_cp() {
+    local src="$1" dest="$2" rc=0
+    [ -z "${WATCHDOG_S3_BUCKET:-}" ] && return 0
+    if [ ! -f "$src" ]; then
+        log "ERROR: S3 copy of $src skipped: file missing"
+        return 0
+    fi
+    aws s3 cp "$src" "s3://${WATCHDOG_S3_BUCKET}/${dest}" --quiet >> data/s3-sync.log 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "ERROR: S3 copy of $src failed (rc=$rc)"
+    fi
+    return 0
 }
 
 MODE="${1:-hybrid}"
@@ -134,7 +201,21 @@ log "Preflight done."
 # ═══════════════════════════════════════════
 
 # ── 1a: Fetch meeting documents (all enabled agencies) ──
-while IFS='|' read -r SLUG PLATFORM NAME AGENCY_YEARS; do
+AGENCY_LIST=$(load_list "Meeting fetch" "
+import math, yaml
+cfg = yaml.safe_load(open('agencies.yaml'))
+for slug, a in cfg['agencies'].items():
+    if a.get('enabled', True):
+        lb = a.get('lookback_months')
+        # Floor at 3 months so the listing still covers the 90-day recheck
+        # window (civic_utils.RECHECK_DAYS) for late-posted documents.
+        lb = max(lb, 3) if lb else lb
+        yi = str(-(-lb // 12)) if lb else ''
+        yf = str(math.ceil(lb / 12 * 10000) / 10000) if lb else ''
+        print(f\"{slug}|{a['platform']}|{a.get('name', slug)}|{yi}|{yf}\")
+") || AGENCY_LIST=""
+if [ -n "$AGENCY_LIST" ]; then
+while IFS='|' read -r SLUG PLATFORM NAME AGENCY_YEARS AGENCY_YEARS_F; do
     LOG_FILE="data/${SLUG}/watch.log"
     mkdir -p "data/${SLUG}"
     AGENCY_DEEP=""
@@ -143,80 +224,87 @@ while IFS='|' read -r SLUG PLATFORM NAME AGENCY_YEARS; do
         AGENCY_DEEP="$DEEP"
     fi
     # Per-agency lookback: use agency's lookback_months if set, else global --years
+    # Scrapers that parse --years as a float get the exact fraction of a year
+    # (lookback_months/12); the int-only ones (oceanside, sdcounty, sandag,
+    # coastal, primegov) get it rounded up to whole years. nctd takes neither.
     FETCH_YEARS="${AGENCY_YEARS:-$YEARS}"
+    FETCH_YEARS_F="${AGENCY_YEARS_F:-$YEARS}"
+    FETCH_CMD=()
 
     log "Fetching $NAME meetings (${FETCH_YEARS}y lookback)..."
     case "$PLATFORM" in
         legistar_html)
-            run_with_timeout "$NAME fetch" python3 scrapers/oceanside.py fetch $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/oceanside.py fetch $AGENCY_DEEP --years "$FETCH_YEARS")
             ;;
         legistar_odata)
-            run_with_timeout "$NAME fetch" python3 scrapers/sdcounty.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/sdcounty.py fetch --years "$FETCH_YEARS")
             ;;
         escribe)
-            run_with_timeout "$NAME fetch" python3 scrapers/sandag.py fetch --agency "$SLUG" --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/sandag.py fetch --agency "$SLUG" --years "$FETCH_YEARS")
             ;;
         custom_html)
-            run_with_timeout "$NAME fetch" python3 scrapers/nctd.py fetch >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/nctd.py fetch)
             ;;
         coastal_api)
-            run_with_timeout "$NAME fetch" python3 scrapers/coastal.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/coastal.py fetch --years "$FETCH_YEARS")
             ;;
         granicus)
-            run_with_timeout "$NAME fetch" python3 scrapers/granicus.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/granicus.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS_F")
             ;;
         civicplus)
-            run_with_timeout "$NAME fetch" python3 scrapers/civicplus.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/civicplus.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS_F")
             ;;
         civicclerk)
-            run_with_timeout "$NAME fetch" python3 scrapers/civicclerk.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/civicclerk.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS_F")
             ;;
         carlsbad_cms)
-            run_with_timeout "$NAME fetch" python3 scrapers/carlsbad.py fetch $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/carlsbad.py fetch $AGENCY_DEEP --years "$FETCH_YEARS_F")
             ;;
         swagit)
-            run_with_timeout "$NAME fetch" python3 scrapers/swagit.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/swagit.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS_F")
             ;;
         solana_drupal)
-            run_with_timeout "$NAME fetch" python3 scrapers/solana_beach.py fetch $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/solana_beach.py fetch $AGENCY_DEEP --years "$FETCH_YEARS_F")
             ;;
         municode)
-            run_with_timeout "$NAME fetch" python3 scrapers/municode.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/municode.py fetch --agency "$SLUG" $AGENCY_DEEP --years "$FETCH_YEARS_F")
             ;;
         primegov)
-            run_with_timeout "$NAME fetch" python3 scrapers/primegov.py fetch --agency "$SLUG" --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/primegov.py fetch --agency "$SLUG" --years "$FETCH_YEARS")
             ;;
         lemon_grove_events)
-            run_with_timeout "$NAME fetch" python3 scrapers/lemon_grove.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/lemon_grove.py fetch --years "$FETCH_YEARS_F")
             ;;
         santee_cms)
-            run_with_timeout "$NAME fetch" python3 scrapers/santee.py fetch $AGENCY_DEEP --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/santee.py fetch $AGENCY_DEEP --years "$FETCH_YEARS_F")
             ;;
         elcajon_cms)
-            run_with_timeout "$NAME fetch" python3 scrapers/elcajon.py fetch --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/elcajon.py fetch --years "$FETCH_YEARS_F")
             ;;
         laserfiche)
-            run_with_timeout "$NAME fetch" python3 scrapers/laserfiche.py fetch --agency "$SLUG" --years "$FETCH_YEARS" >> "$LOG_FILE" 2>&1
+            FETCH_CMD=(python3 scrapers/laserfiche.py fetch --agency "$SLUG" --years "$FETCH_YEARS_F")
             ;;
         *)
             log "  $NAME: unknown platform '$PLATFORM', skipping."
             ;;
     esac
-    log "$NAME fetch done."
-done < <(python3 -c "
-import yaml
-cfg = yaml.safe_load(open('agencies.yaml'))
-for slug, a in cfg['agencies'].items():
-    if a.get('enabled', True):
-        lb = a.get('lookback_months')
-        years = str(-(-lb // 12)) if lb else ''
-        print(f\"{slug}|{a['platform']}|{a.get('name', slug)}|{years}\")
-")
+    if [ "${#FETCH_CMD[@]}" -gt 0 ]; then
+        FETCH_RC=0
+        run_with_timeout "${FETCH_CMD[@]}" >> "$LOG_FILE" 2>&1 || FETCH_RC=$?
+        if [ "$FETCH_RC" -ne 0 ]; then
+            log_phase_error "$NAME fetch" "$FETCH_RC"
+        else
+            log "$NAME fetch done."
+        fi
+    fi
+done <<< "$AGENCY_LIST"
+fi
 
 # ── 1b: Intel feed — check RSS/web for relevant items ──
 log "Checking intel feeds..."
-run_with_timeout "Intel feed" python3 scrapers/intel_feed.py >> data/intel/feed.log 2>&1
-log "Intel feed done."
+INTEL_RC=0
+run_with_timeout python3 scrapers/intel_feed.py >> data/intel/feed.log 2>&1 || INTEL_RC=$?
+if [ "$INTEL_RC" -ne 0 ]; then log_phase_error "Intel feed" "$INTEL_RC"; else log "Intel feed done."; fi
 
 # ── 1c: Fetch building permits (agencies with permit config) ──
 CURRENT_YEAR=$(date '+%Y')
@@ -224,98 +312,102 @@ PREV_YEAR=$((CURRENT_YEAR - 1))
 # Previous year too: incremental scans are cheap, and permits/projects filed in
 # late December are otherwise missed once the calendar rolls over.
 PERMIT_YEARS="$PREV_YEAR $CURRENT_YEAR"
-while IFS='|' read -r SLUG NAME PLATFORM; do
-    mkdir -p "data/${SLUG}/permits"
-    for YEAR in $PERMIT_YEARS; do
-        log "Fetching $NAME permits ($YEAR, $PLATFORM, incremental)..."
-        case "$PLATFORM" in
-            etrakit)
-                CMD="python3 scrapers/etrakit.py fetch --agency $SLUG --year $YEAR"
-                ;;
-            arcgis)
-                CMD="python3 scrapers/arcgis_permits.py fetch --agency $SLUG --year $YEAR"
-                ;;
-            *)
-                log "  $NAME: unknown permit platform '$PLATFORM', skipping."
-                break
-                ;;
-        esac
-        if run_with_timeout "$NAME permits" $CMD >> "data/${SLUG}/permits/fetch.log" 2>&1; then
-            log "$NAME permits done."
-        else
-            log "$NAME permits failed — continuing pipeline."
-        fi
-    done
-done < <(python3 -c "
+PERMIT_LIST=$(load_list "Permit fetch" "
 import yaml
 cfg = yaml.safe_load(open('agencies.yaml'))
 for slug, a in cfg['agencies'].items():
     if a.get('enabled', True) and a.get('permits'):
         platform = a['permits'].get('platform', 'etrakit')
         print(f\"{slug}|{a.get('name', slug)}|{platform}\")
-")
+") || PERMIT_LIST=""
+if [ -n "$PERMIT_LIST" ]; then
+while IFS='|' read -r SLUG NAME PLATFORM; do
+    mkdir -p "data/${SLUG}/permits"
+    for YEAR in $PERMIT_YEARS; do
+        log "Fetching $NAME permits ($YEAR, $PLATFORM, incremental)..."
+        case "$PLATFORM" in
+            etrakit)
+                CMD=(python3 scrapers/etrakit.py fetch --agency "$SLUG" --year "$YEAR")
+                ;;
+            arcgis)
+                CMD=(python3 scrapers/arcgis_permits.py fetch --agency "$SLUG" --year "$YEAR")
+                ;;
+            *)
+                log "  $NAME: unknown permit platform '$PLATFORM', skipping."
+                break
+                ;;
+        esac
+        PERMIT_RC=0
+        run_with_timeout "${CMD[@]}" >> "data/${SLUG}/permits/fetch.log" 2>&1 || PERMIT_RC=$?
+        if [ "$PERMIT_RC" -ne 0 ]; then
+            log_phase_error "$NAME permits ($YEAR)" "$PERMIT_RC"
+        else
+            log "$NAME permits done."
+        fi
+    done
+done <<< "$PERMIT_LIST"
+fi
 
 # ── 1c.1: Fetch planning projects (eTRAKit only — development plans, density bonus, etc) ──
+ETRAKIT_LIST=$(load_list "eTRAKiT" "
+import yaml
+cfg = yaml.safe_load(open('agencies.yaml'))
+for slug, a in cfg['agencies'].items():
+    if a.get('enabled', True) and a.get('permits'):
+        if a['permits'].get('platform') == 'etrakit':
+            print(f\"{slug}|{a.get('name', slug)}\")
+") || ETRAKIT_LIST=""
+if [ -n "$ETRAKIT_LIST" ]; then
 while IFS='|' read -r SLUG NAME; do
     for YEAR in $PERMIT_YEARS; do
         log "Fetching $NAME planning projects ($YEAR)..."
-        if run_with_timeout "$NAME projects" python3 scrapers/etrakit.py projects --agency "$SLUG" --year "$YEAR" --delay 0.5 >> "data/${SLUG}/permits/projects.log" 2>&1; then
-            log "$NAME projects done."
+        PROJ_RC=0
+        run_with_timeout python3 scrapers/etrakit.py projects --agency "$SLUG" --year "$YEAR" --delay 0.5 >> "data/${SLUG}/permits/projects.log" 2>&1 || PROJ_RC=$?
+        if [ "$PROJ_RC" -ne 0 ]; then
+            log_phase_error "$NAME projects ($YEAR)" "$PROJ_RC"
         else
-            log "$NAME projects failed — continuing pipeline."
+            log "$NAME projects done."
         fi
     done
-done < <(python3 -c "
-import yaml
-cfg = yaml.safe_load(open('agencies.yaml'))
-for slug, a in cfg['agencies'].items():
-    if a.get('enabled', True) and a.get('permits'):
-        if a['permits'].get('platform') == 'etrakit':
-            print(f\"{slug}|{a.get('name', slug)}\")
-")
+done <<< "$ETRAKIT_LIST"
+fi
 
 # ── 1c.2: Enrich new infill permits (eTRAKit only — contacts, site info, linked activities) ──
+if [ -n "$ETRAKIT_LIST" ]; then
 while IFS='|' read -r SLUG NAME; do
     log "Enriching $NAME infill permits ($CURRENT_YEAR)..."
-    if run_with_timeout "$NAME enrich" python3 scrapers/etrakit.py enrich --agency "$SLUG" --year "$CURRENT_YEAR" --infill --delay 1.5 >> "data/${SLUG}/permits/enrich.log" 2>&1; then
-        log "$NAME permit enrichment done."
+    ENRICH_RC=0
+    run_with_timeout python3 scrapers/etrakit.py enrich --agency "$SLUG" --year "$CURRENT_YEAR" --infill --delay 1.5 >> "data/${SLUG}/permits/enrich.log" 2>&1 || ENRICH_RC=$?
+    if [ "$ENRICH_RC" -ne 0 ]; then
+        log_phase_error "$NAME permit enrichment" "$ENRICH_RC"
     else
-        log "$NAME permit enrichment failed — continuing pipeline."
+        log "$NAME permit enrichment done."
     fi
-done < <(python3 -c "
-import yaml
-cfg = yaml.safe_load(open('agencies.yaml'))
-for slug, a in cfg['agencies'].items():
-    if a.get('enabled', True) and a.get('permits'):
-        if a['permits'].get('platform') == 'etrakit':
-            print(f\"{slug}|{a.get('name', slug)}\")
-")
+done <<< "$ETRAKIT_LIST"
+fi
 
 # ── 1c.3: Refresh status of open permits/projects (eTRAKit only, nightly run) ──
 # fetch/projects only add new numbers; without this, status and issued/finaled
 # dates stay frozen at first sight. Rotates through ~300 open records per night.
-if [ -z "$HOT_ONLY" ]; then
+if [ -z "$HOT_ONLY" ] && [ -n "$ETRAKIT_LIST" ]; then
 while IFS='|' read -r SLUG NAME; do
     log "Refreshing $NAME permit/project status..."
-    if run_with_timeout "$NAME refresh" python3 scrapers/etrakit.py refresh --agency "$SLUG" --batch 300 --delay 1.5 >> "data/${SLUG}/permits/refresh.log" 2>&1; then
-        log "$NAME status refresh done."
+    REFRESH_RC=0
+    # 0.5s delay: ~600 requests per agency, so ~5 min instead of ~15
+    run_with_timeout python3 scrapers/etrakit.py refresh --agency "$SLUG" --batch 300 --delay 0.5 >> "data/${SLUG}/permits/refresh.log" 2>&1 || REFRESH_RC=$?
+    if [ "$REFRESH_RC" -ne 0 ]; then
+        log_phase_error "$NAME status refresh" "$REFRESH_RC"
     else
-        log "$NAME status refresh failed — continuing pipeline."
+        log "$NAME status refresh done."
     fi
-done < <(python3 -c "
-import yaml
-cfg = yaml.safe_load(open('agencies.yaml'))
-for slug, a in cfg['agencies'].items():
-    if a.get('enabled', True) and a.get('permits'):
-        if a['permits'].get('platform') == 'etrakit':
-            print(f\"{slug}|{a.get('name', slug)}\")
-")
+done <<< "$ETRAKIT_LIST"
 fi
 
 # ── 1d: Discover new meeting videos ──
 log "Discovering new meeting videos..."
-run_with_timeout "Video discovery" python3 scrapers/discover_videos.py >> data/video-discovery.log 2>&1
-log "Video discovery done."
+VIDEO_RC=0
+run_with_timeout python3 scrapers/discover_videos.py >> data/video-discovery.log 2>&1 || VIDEO_RC=$?
+if [ "$VIDEO_RC" -ne 0 ]; then log_phase_error "Video discovery" "$VIDEO_RC"; else log "Video discovery done."; fi
 
 # ── 1e: Transcribe audio (if enabled) ──
 # Only transcribe high-priority meetings by default (City Council, Planning Commission,
@@ -372,13 +464,21 @@ fi
 if [ -n "${WATCHDOG_S3_BUCKET:-}" ]; then
     log "Syncing raw sources to S3..."
     # Per-agency documents and meetings
+    S3_LIST=$(load_list "S3 sync" "
+import yaml
+cfg = yaml.safe_load(open('agencies.yaml'))
+for slug, a in cfg['agencies'].items():
+    if a.get('enabled', True):
+        print(f\"{slug}|{a.get('name', slug)}\")
+") || S3_LIST=""
     while IFS='|' read -r SLUG _; do
+        [ -z "$SLUG" ] && continue
         if [ -d "data/${SLUG}/documents" ]; then
             sync_to_s3 "archive/${SLUG}/documents/pdfs" "data/${SLUG}/documents" "STANDARD" --exclude "*.txt" --exclude "*.skip" --exclude "*.json"
             sync_to_s3 "raw/${SLUG}/documents/txt" "data/${SLUG}/documents" "STANDARD_IA" --exclude "*.pdf" --exclude "*.skip" --exclude "*.json"
         fi
         if [ -f "data/${SLUG}/doc-index.json" ]; then
-            aws s3 cp "data/${SLUG}/doc-index.json" "s3://${WATCHDOG_S3_BUCKET}/raw/${SLUG}/doc-index.json" --quiet || true
+            s3_cp "data/${SLUG}/doc-index.json" "raw/${SLUG}/doc-index.json"
         fi
         if [ -d "data/${SLUG}/meetings" ]; then
             sync_to_s3 "metadata/${SLUG}/meetings" "data/${SLUG}/meetings" "STANDARD"
@@ -386,13 +486,7 @@ if [ -n "${WATCHDOG_S3_BUCKET:-}" ]; then
         if [ -d "data/${SLUG}/permits" ]; then
             sync_to_s3 "operational/${SLUG}/permits" "data/${SLUG}/permits" "STANDARD"
         fi
-    done < <(python3 -c "
-import yaml
-cfg = yaml.safe_load(open('agencies.yaml'))
-for slug, a in cfg['agencies'].items():
-    if a.get('enabled', True):
-        print(f\"{slug}|{a.get('name', slug)}\")
-")
+    done <<< "$S3_LIST"
     # Shared resources
     sync_to_s3 "archive/audio" "data/audio" "STANDARD"
     sync_to_s3 "operational/intel" "data/intel" "STANDARD"
@@ -420,9 +514,10 @@ log "Permit project grouping done."
 
 # ── 2b.1: Enrich permits with GIS zoning data ──
 log "Enriching permits with zoning data..."
-run_with_timeout "Zone enrichment" python3 transforms/enrich_permits.py enrich --year "$CURRENT_YEAR" \
-    >> data/enrich-permits.log 2>&1
-log "Zone enrichment done."
+ZONE_RC=0
+run_with_timeout python3 transforms/enrich_permits.py enrich --year "$CURRENT_YEAR" \
+    >> data/enrich-permits.log 2>&1 || ZONE_RC=$?
+if [ "$ZONE_RC" -ne 0 ]; then log_phase_error "Zone enrichment" "$ZONE_RC"; else log "Zone enrichment done."; fi
 
 # ── 2b.2: HCD APR filings (monthly — runs on 1st of each month) ──
 if [ "$(date +%d)" = "01" ]; then
@@ -515,8 +610,8 @@ if [ -n "${WATCHDOG_S3_BUCKET:-}" ]; then
     sync_to_s3 "structured/records" "data/structured" "STANDARD" --exclude "meetings/*" --exclude "monthly/*" --exclude "*.jsonl" --exclude "*.log" --exclude "*.skip"
     sync_to_s3 "structured/meetings" "data/structured/meetings" "STANDARD"
     sync_to_s3 "structured/monthly" "data/structured/monthly" "STANDARD"
-    aws s3 cp data/structured/all-records.jsonl "s3://${WATCHDOG_S3_BUCKET}/structured/all-records.jsonl" --quiet 2>/dev/null || true
-    aws s3 cp data/structured/meetings-combined.jsonl "s3://${WATCHDOG_S3_BUCKET}/structured/meetings-combined.jsonl" --quiet 2>/dev/null || true
+    s3_cp data/structured/all-records.jsonl "structured/all-records.jsonl"
+    s3_cp data/structured/meetings-combined.jsonl "structured/meetings-combined.jsonl"
     log "S3 sync (structured) done."
 fi
 
@@ -525,7 +620,8 @@ fi
 # ═══════════════════════════════════════════
 
 log "Running pipeline doctor..."
-python3 pipeline_doctor.py >> data/pipeline-doctor-run.log 2>&1
-log "Doctor done."
+DOCTOR_RC=0
+run_with_timeout python3 pipeline_doctor.py >> data/pipeline-doctor-run.log 2>&1 || DOCTOR_RC=$?
+if [ "$DOCTOR_RC" -ne 0 ]; then log_phase_error "Pipeline doctor" "$DOCTOR_RC"; else log "Doctor done."; fi
 
 log "Pipeline complete."
