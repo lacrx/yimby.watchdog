@@ -607,7 +607,7 @@ fi
 # ── S3 sync: structured data ──
 if [ -n "${WATCHDOG_S3_BUCKET:-}" ]; then
     log "Syncing structured data to S3..."
-    sync_to_s3 "structured/records" "data/structured" "STANDARD" --exclude "meetings/*" --exclude "monthly/*" --exclude "*.jsonl" --exclude "*.log" --exclude "*.skip"
+    sync_to_s3 "structured/records" "data/structured" "STANDARD" --exclude "meetings/*" --exclude "monthly/*" --exclude "*.jsonl" --exclude "*.log" --exclude "*.skip" --exclude "*.chunks"
     sync_to_s3 "structured/meetings" "data/structured/meetings" "STANDARD"
     sync_to_s3 "structured/monthly" "data/structured/monthly" "STANDARD"
     s3_cp data/structured/all-records.jsonl "structured/all-records.jsonl"

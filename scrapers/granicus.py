@@ -35,6 +35,7 @@ from civic_utils import (
     safe_filename, cmd_list_meetings, rebuild_doc_index, log_discovery,
     meeting_needs_recheck,
 )
+from urllib.parse import quote
 import civic_utils
 
 RECHECK_DAYS = getattr(civic_utils, "RECHECK_DAYS", 90)
@@ -224,12 +225,102 @@ def _rewrite_host(url):
     return url
 
 
-def _get_with_rewrites(url, max_hops=5):
+class AgendaNotPublished(Exception):
+    """Granicus says the agenda for this clip is not published (video-only clip)."""
+
+
+_SESSION = None
+
+
+def _session():
+    """Shared session: Laserfiche WebLink bounces cookieless clients between
+    DocView.aspx and itself forever, so redirect hops must carry cookies."""
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = requests.Session()
+        _SESSION.headers["User-Agent"] = USER_AGENT
+    return _SESSION
+
+
+LASERFICHE_DOCVIEW = re.compile(
+    r'^(https?://[^/]+/Portal)/DocView\.aspx\?(?=.*\bid=(\d+))(?=.*\brepo=([\w-]+))', re.I)
+LASERFICHE_MAX_BYTES = 400 * 1024 * 1024  # rendered page-image packets reach ~270MB; refuse runaways
+
+
+class PermanentFetchError(Exception):
+    """Fetch can never succeed (record it in failed_fetches as permanent, don't retry)."""
+
+
+def fetch_laserfiche_pdf(doc_url, dest, poll_seconds=2, max_wait=300):
+    """Download a Laserfiche WebLink document as PDF.
+
+    Tries ElectronicFile.aspx (native PDF); if the entry is page images only
+    ("electronic file is empty"), asks the portal to render a PDF
+    (GeneratePDF10.aspx + PDFTransition polling + PDF10/<key>/<id>).
+    Requires a session cookie obtained from DocView.aspx first.
+    """
+    m = LASERFICHE_DOCVIEW.match(doc_url)
+    if not m:
+        raise ValueError(f"not a Laserfiche DocView url: {doc_url}")
+    base, doc_id, repo = m.groups()
+    s = _session()
+    s.get(doc_url, timeout=30)  # session cookie
+    r = s.get(f"{base}/ElectronicFile.aspx?docid={doc_id}&repo={repo}", timeout=120)
+    if r.content[:5] == b"%PDF-":
+        dest.write_bytes(r.content)
+        return True
+    hdrs = {"Content-Type": "application/json; charset=utf-8",
+            "X-Requested-With": "XMLHttpRequest", "Referer": doc_url}
+    info = s.post(f"{base}/DocumentService.aspx/GetBasicDocumentInfo",
+                  json={"repoName": repo, "entryId": int(doc_id)}, headers=hdrs, timeout=30)
+    pages = (info.json().get("data") or {}).get("pageCount") or 0
+    if not pages:
+        raise PermanentFetchError("Laserfiche entry has no electronic file and no pages")
+    r = s.post(f"{base}/GeneratePDF10.aspx?key={doc_id}&PageRange={quote(f'1 - {pages}')}"
+               f"&Watermark=0&repo={repo}", data="{}", headers=hdrs, timeout=60)
+    key = r.text.split("\n", 1)[0].strip()
+    if r.status_code != 200 or not key:
+        raise RuntimeError(f"Laserfiche PDF render refused ({r.status_code})")
+    deadline = time.time() + max_wait
+    while True:
+        st = s.post(f"{base}/DocumentService.aspx/PDFTransition", json={"Key": key},
+                    headers=hdrs, timeout=30).json().get("data") or {}
+        if st.get("finished"):
+            if not st.get("success"):
+                raise RuntimeError(f"Laserfiche PDF render failed: {st.get('errMsg')}")
+            break
+        if time.time() > deadline:
+            raise RuntimeError(f"Laserfiche PDF render timed out at {st.get('completion')}%")
+        time.sleep(poll_seconds)
+    with s.get(f"{base}/PDF10/{key}/{doc_id}", timeout=300, stream=True) as resp:
+        resp.raise_for_status()
+        total = 0
+        first = True
+        tmp = dest.with_suffix(dest.suffix + ".part")
+        try:
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_content(1 << 20):
+                    if first:
+                        if chunk[:5] != b"%PDF-":
+                            raise RuntimeError("Laserfiche render returned non-PDF")
+                        first = False
+                    total += len(chunk)
+                    if total > LASERFICHE_MAX_BYTES:
+                        raise PermanentFetchError(
+                            f"rendered PDF exceeds {LASERFICHE_MAX_BYTES // (1 << 20)}MB "
+                            f"({pages} page-image scan, no electronic file); skipped")
+                    f.write(chunk)
+            tmp.replace(dest)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return True
+
+
+def _get_with_rewrites(url, max_hops=8):
     """GET that follows redirects itself so dead hosts can be rewritten mid-chain."""
     url = _rewrite_host(url)
     for _ in range(max_hops):
-        resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT},
-                            allow_redirects=False)
+        resp = _session().get(url, timeout=30, allow_redirects=False)
         if resp.is_redirect and resp.headers.get("Location"):
             url = _rewrite_host(urljoin(url, resp.headers["Location"]))
             continue
@@ -244,6 +335,12 @@ def extract_pdf_links_from_agenda(agenda_url, base_url):
 
     pdfs = []
     text = resp.text
+    if "This agenda is not currently published" in text:
+        raise AgendaNotPublished(agenda_url)
+
+    # Type 00: Laserfiche WebLink document (Encinitas). Needs the session cookie.
+    if LASERFICHE_DOCVIEW.match(resp.url):
+        return [{"url": resp.url, "name": "agenda", "type": "agenda", "laserfiche": True}]
     from urllib.parse import unquote
 
     # Type 0: OnBase Agenda Online (San Diego). The meeting page is a JS shell;
@@ -342,27 +439,136 @@ def reconcile_superseded(slug, meetings_dir, docs_dir):
     clips = [(i, mf, m) for i, mf, m in rows if i.startswith("clip-") and m.get("date")]
     marked = merged = 0
     for eid, emf, em in rows:
-        if not eid.startswith("evt-") or em.get("superseded_by") or not em.get("date"):
+        if not eid.startswith("evt-") or not em.get("date"):
             continue
-        for cid, cmf, cm in clips:
-            if _mdate(cm["date"]) != _mdate(em["date"]) or not _bodies_match(cm.get("body"), em.get("body")):
-                continue
-            em["superseded_by"] = cid
-            save_json(emf, em)
-            marked += 1
-            clip_has_docs = any(f.name.startswith(cid + "-") and f.stat().st_size > 0
-                                for f in docs_dir.iterdir())
-            if not clip_has_docs:
-                for f in list(docs_dir.iterdir()):
-                    if f.name.startswith(eid + "-"):
-                        dest = docs_dir / (cid + f.name[len(eid):])
-                        if not dest.exists():
-                            shutil.copy2(f, dest)
-                            merged += 1
-            break
+        same_day = [c for c in clips if _mdate(c[2]["date"]) == _mdate(em["date"])]
+        # Prefer a clip whose body is identical; fall back to containment.
+        exact = [c for c in same_day if _norm_body(c[2].get("body")) == _norm_body(em.get("body"))]
+        loose = [c for c in same_day if _bodies_match(c[2].get("body"), em.get("body"))]
+        pick = (exact or loose or [None])[0]
+        if pick is None:
+            continue
+        cid, cmf, cm = pick
+        cur = em.get("superseded_by")
+        if cur == cid:
+            continue
+        if cur and (cur in [c[0] for c in exact] or not exact):
+            continue  # existing mark is already as good as the best candidate
+        em["superseded_by"] = cid
+        save_json(emf, em)
+        marked += 1
+        clip_has_docs = any(f.name.startswith(cid + "-") and f.stat().st_size > 0
+                            for f in docs_dir.iterdir())
+        if not clip_has_docs:
+            for f in list(docs_dir.iterdir()):
+                if f.name.startswith(eid + "-"):
+                    dest = docs_dir / (cid + f.name[len(eid):])
+                    if not dest.exists():
+                        shutil.copy2(f, dest)
+                        merged += 1
     if marked:
         print(f"  Superseded: marked {marked} evt rows, merged {merged} doc files onto clips")
     return marked
+
+
+def _heal_row(meta, item):
+    """Fill a missing date/body on a meeting row from a listing item. Returns True if changed."""
+    changed = False
+    if not meta.get("date") and item.get("date"):
+        meta["date"] = item["date"].strftime("%m/%d/%Y")
+        changed = True
+    if not meta.get("body") and item.get("body"):
+        meta["body"] = item["body"]
+        meta["title"] = item["title"]
+        changed = True
+    return changed
+
+
+FILENAME_DATE_PATTERNS = [
+    # 1349_A_City_Council_26-09-08_Regular_Agenda.pdf  (yy-mm-dd)
+    (r"(?<!\d)(\d{2})-(\d{2})-(\d{2})(?!\d)", "ymd2"),
+    (r"(?<!\d)(20\d{2})[-_.](\d{1,2})[-_.](\d{1,2})(?!\d)", "ymd4"),
+    (r"(?<!\d)(\d{1,2})[-_.](\d{1,2})[-_.](20\d{2})(?!\d)", "mdy4"),
+]
+
+
+def date_from_filename(name):
+    """Best-effort meeting date from a document filename; None if nothing plausible."""
+    for pat, kind in FILENAME_DATE_PATTERNS:
+        for m in re.finditer(pat, name):
+            a, b, c = (int(x) for x in m.groups())
+            try:
+                if kind == "ymd2":
+                    dt = datetime(2000 + a, b, c)
+                elif kind == "ymd4":
+                    dt = datetime(a, b, c)
+                else:
+                    dt = datetime(c, a, b)
+            except ValueError:
+                continue
+            if 2005 <= dt.year <= datetime.now().year + 1:
+                return dt
+    return None
+
+
+def cmd_backfill_dates(args):
+    """Date meeting rows that have none (rows older than the listing window).
+
+    1. Live ViewPublisher archive (whole history, one request): clip id -> date/body.
+    2. Dates embedded in document filenames.
+    3. Otherwise left undated.
+    """
+    agencies = load_agencies(enabled_only=False)
+    slug = args.agency
+    cfg = agencies.get(slug)
+    if not cfg or cfg["platform"] != "granicus":
+        print(f"ERROR: {slug} is not a Granicus agency")
+        sys.exit(1)
+    data_dir = agency_data_dir(slug)
+    meetings_dir = data_dir / "meetings"
+    docs_dir = data_dir / "documents"
+    undated = []
+    for mdir in sorted(meetings_dir.iterdir()):
+        mf = mdir / "meeting.json"
+        meta = load_json(mf) if mf.exists() else None
+        if meta and not meta.get("date"):
+            undated.append((mdir.name, mf, meta))
+    print(f"{cfg['name']}: {len(undated)} undated meeting rows")
+    if not undated:
+        return
+
+    try:
+        archive = fetch_viewpublisher_html(cfg["base_url"], cfg.get("view_id", 1))
+    except Exception as e:
+        print(f"ERROR: {slug}: archive fetch failed: {e}")
+        sys.exit(2)
+    if not archive:
+        print(f"ERROR: {slug}: archive parsed 0 meetings")
+        sys.exit(3)
+    by_id = {it["meeting_id"]: it for it in archive if it.get("date")}
+    print(f"  archive: {len(archive)} meetings, {len(by_id)} dated")
+
+    doc_names = sorted(f.name for f in docs_dir.iterdir()) if docs_dir.exists() else []
+    via_archive = via_filename = left = 0
+    for mid, mf, meta in undated:
+        item = by_id.get(mid)
+        if item and _heal_row(meta, item):
+            meta["date_source"] = "archive"
+            if not args.dry_run:
+                save_json(mf, meta)
+            via_archive += 1
+            continue
+        dts = [d for d in (date_from_filename(n) for n in doc_names if n.startswith(mid + "-")) if d]
+        if dts:
+            meta["date"] = min(dts).strftime("%m/%d/%Y")
+            meta["date_source"] = "filename"
+            if not args.dry_run:
+                save_json(mf, meta)
+            via_filename += 1
+            continue
+        left += 1
+    tag = " (dry run, nothing written)" if args.dry_run else ""
+    print(f"Backfilled dates{tag}: {via_archive} from archive, {via_filename} from filenames, {left} left undated")
 
 
 def cmd_fetch(args):
@@ -425,6 +631,8 @@ def cmd_fetch(args):
             age = (now - datetime.fromisoformat(info["first_failure"])).days
         except (KeyError, ValueError):
             age = 0
+        if info.get("permanent"):
+            continue
         if age > RECHECK_DAYS:
             print(f"  Retry list: giving up on {rid} after {age} days ({info.get('url')})")
             del failed[rid]
@@ -473,15 +681,7 @@ def cmd_fetch(args):
         else:
             # Heal rows written earlier without a date or body (old HTML parser).
             meta = load_json(meeting_file) or {}
-            changed = False
-            if not meta.get("date") and item["date"]:
-                meta["date"] = item["date"].strftime("%m/%d/%Y")
-                changed = True
-            if not meta.get("body") and item["body"]:
-                meta["body"] = item["body"]
-                meta["title"] = item["title"]
-                changed = True
-            if changed:
+            if _heal_row(meta, item):
                 save_json(meeting_file, meta)
 
         if mid in state["meetings"] and not args.deep and not item.get("forced"):
@@ -490,10 +690,30 @@ def cmd_fetch(args):
                 continue
             print(f"  RECHECK: {item['title']} (no documents yet)")
 
+        if failed.get(mid, {}).get("permanent") and not item.get("forced"):
+            continue
+
 
         # Fetch agenda PDFs
         try:
             pdfs = extract_pdf_links_from_agenda(item["link"], base_url)
+        except AgendaNotPublished:
+            # Video-only clip: nothing to fetch. Flag so the doctor skips it;
+            # the flag is cleared below if an agenda is ever published.
+            meta = load_json(meeting_file) or {}
+            has_docs = any(f.name.startswith(mid + "-") and f.stat().st_size > 0
+                           for f in docs_dir.iterdir())
+            if not has_docs and not meta.get("no_assets"):
+                meta["no_assets"] = True
+                meta["no_assets_reason"] = "granicus: agenda not published (video-only clip)"
+                save_json(meeting_file, meta)
+                print(f"  NO ASSETS: {mid} agenda not published (video-only)")
+            failed.pop(mid, None)
+            state["meetings"][mid] = {
+                "fetched": datetime.now().isoformat(), "title": item["title"],
+                "date": item["date"].strftime("%m/%d/%Y") if item["date"] else "",
+            }
+            continue
         except Exception as e:
             print(f"  Failed to fetch agenda page for {mid}: {e}")
             rec = failed.setdefault(mid, {"url": item["link"], "attempts": 0,
@@ -503,6 +723,12 @@ def cmd_fetch(args):
             rec["last_attempt"] = now.isoformat()
             continue
         agenda_failed = False
+        if pdfs:
+            cur = load_json(meeting_file) or {}
+            if cur.get("no_assets") and str(cur.get("no_assets_reason", "")).startswith("granicus:"):
+                cur.pop("no_assets", None)
+                cur.pop("no_assets_reason", None)
+                save_json(meeting_file, cur)
 
         has_agenda = any(p["type"] in ("agenda", "agenda_text") for p in pdfs)
 
@@ -550,6 +776,29 @@ def cmd_fetch(args):
             if dest.exists():
                 continue
 
+            if pdf_info.get("laserfiche"):
+                try:
+                    ok = fetch_laserfiche_pdf(pdf_info["url"], dest)
+                except Exception as e:
+                    permanent = isinstance(e, PermanentFetchError)
+                    print(f"  Failed to fetch Laserfiche doc for {mid}: {e}")
+                    agenda_failed = True
+                    rec = failed.setdefault(mid, {"url": item["link"], "attempts": 0,
+                                                  "first_failure": now.isoformat()})
+                    rec["attempts"] += 1
+                    rec["last_error"] = str(e)[:200]
+                    rec["last_attempt"] = now.isoformat()
+                    if permanent:
+                        rec["permanent"] = True
+                        meta = load_json(meeting_file) or {}
+                        meta["no_assets"] = True
+                        meta["no_assets_reason"] = f"laserfiche: {e}"[:200]
+                        save_json(meeting_file, meta)
+                    continue
+                if ok and extract_text(dest):
+                    doc_count += 1
+                continue
+
             # Without --deep: download agendas always; for clip_id meetings
             # (no main agenda PDF), download first 3 MetaViewer docs (agenda items)
             if not args.deep and pdf_info["type"] == "staff_report":
@@ -566,6 +815,11 @@ def cmd_fetch(args):
                 time.sleep(0.5)
 
         if agenda_failed:
+            if failed.get(mid, {}).get("permanent"):
+                state["meetings"][mid] = {
+                    "fetched": datetime.now().isoformat(), "title": item["title"],
+                    "date": item["date"].strftime("%m/%d/%Y") if item["date"] else "",
+                }
             continue
         failed.pop(mid, None)
         state["meetings"][mid] = {
@@ -598,11 +852,21 @@ def main():
     p_fetch.add_argument("--retry", action="append", default=[],
                          help="force re-fetch of a meeting id (e.g. evt-8972); repeatable")
 
+    p_bf = sub.add_parser("backfill-dates", aliases=["--backfill-dates"],
+                          help="date undated meeting rows from the live archive, then doc filenames")
+    p_bf.add_argument("--agency", required=True)
+    p_bf.add_argument("--dry-run", action="store_true")
+
     p_list = sub.add_parser("list")
     p_list.add_argument("--agency", required=True)
 
+    if "--backfill-dates" in sys.argv[1:]:
+        sys.argv = [a for a in sys.argv if a != "--backfill-dates"]
+        sys.argv.insert(1, "backfill-dates")
     args = parser.parse_args()
-    if args.command == "fetch":
+    if args.command == "backfill-dates" or args.command == "--backfill-dates":
+        cmd_backfill_dates(args)
+    elif args.command == "fetch":
         cmd_fetch(args)
     elif args.command == "list":
         cmd_list(args)

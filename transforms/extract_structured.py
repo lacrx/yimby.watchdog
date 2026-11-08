@@ -19,6 +19,7 @@ Combined: data/structured/all-records.jsonl (one line per record, for bulk reads
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -358,19 +359,8 @@ def _sanitize_state_legislature_votes(record):
     return record
 
 
-def extract_structured(text, meeting_meta):
-    """Extract structured JSON from document text, chunking if large.
-
-    Returns (record, error_category) tuple. error_category is None on success.
-    """
-    meta_context = ""
-    if meeting_meta:
-        meta_context = f"\nMeeting metadata: {json.dumps(meeting_meta, default=str)}\n"
-
-    if len(text) <= CHUNK_SIZE:
-        prompt = EXTRACTION_PROMPT + meta_context + text
-        return _call_claude(prompt, schema=EXTRACTION_SCHEMA)
-
+def _split_chunks(text):
+    """Split text into overlapping chunks (deterministic for a given text)."""
     chunks = []
     pos = 0
     while pos < len(text):
@@ -381,23 +371,103 @@ def extract_structured(text, meeting_meta):
                 end = newline + 1
         chunks.append(text[pos:end])
         pos = end - CHUNK_OVERLAP if end < len(text) else end
+    return chunks
 
+
+def chunk_cache_path(out_path):
+    """Sidecar holding per-chunk results. Suffix is not .json so *.json globs
+    (rebuild_combined, stats, doctor, meeting_merge) never treat it as a record."""
+    return out_path.with_name(out_path.stem + ".chunks")
+
+
+def _chunk_fingerprint(text, chunks):
+    return {
+        "version": 1,
+        "source_chars": len(text),
+        "chunk_size": CHUNK_SIZE,
+        "overlap": CHUNK_OVERLAP,
+        "chunks_total": len(chunks),
+        "chunk_hashes": [hashlib.sha1(c.encode("utf-8", "replace")).hexdigest() for c in chunks],
+    }
+
+
+def _load_chunk_cache(cache_path, fingerprint):
+    """Return {index: {"record":..}|{"error":..}} if the sidecar matches, else {}."""
+    if cache_path is None or not cache_path.exists():
+        return {}
+    try:
+        data = json.loads(cache_path.read_text())
+        if not isinstance(data, dict):
+            return {}
+        if any(data.get(k) != v for k, v in fingerprint.items()):
+            print("  Chunk cache stale (source changed); re-running all chunks")
+            return {}
+        return {int(k): v for k, v in (data.get("chunks") or {}).items() if isinstance(v, dict)}
+    except (json.JSONDecodeError, OSError, ValueError):
+        return {}
+
+
+def _save_chunk_cache(cache_path, fingerprint, results):
+    if cache_path is None:
+        return
+    try:
+        data = dict(fingerprint)
+        data["chunks"] = {str(k): v for k, v in sorted(results.items())}
+        tmp = cache_path.with_name(cache_path.name + ".tmp")
+        tmp.write_text(json.dumps(data, default=str))
+        tmp.replace(cache_path)
+    except OSError:
+        pass
+
+
+def extract_structured(text, meeting_meta, cache_path=None):
+    """Extract structured JSON from document text, chunking if large.
+
+    Returns (record, error_category) tuple. error_category is None on success.
+    If cache_path is given, per-chunk results are persisted there; a later call
+    on the same source re-runs only failed chunks (refusals are not retried).
+    The sidecar is removed once every chunk has a final result.
+    """
+    meta_context = ""
+    if meeting_meta:
+        meta_context = f"\nMeeting metadata: {json.dumps(meeting_meta, default=str)}\n"
+
+    if len(text) <= CHUNK_SIZE:
+        prompt = EXTRACTION_PROMPT + meta_context + text
+        return _call_claude(prompt, schema=EXTRACTION_SCHEMA)
+
+    chunks = _split_chunks(text)
     print(f"  Chunking: {len(text):,} chars → {len(chunks)} chunks", flush=True)
 
-    records = []
-    errors = []
+    fingerprint = _chunk_fingerprint(text, chunks)
+    results = _load_chunk_cache(cache_path, fingerprint)
+    if results:
+        redo = [i for i in range(len(chunks))
+                if "record" not in results.get(i, {}) and results.get(i, {}).get("error") != "content_refused"]
+        print(f"  Resuming from chunk cache: re-running {len(redo)}/{len(chunks)} chunk(s)", flush=True)
+
+    def _collect():
+        recs = [results[i]["record"] for i in sorted(results) if "record" in results[i]]
+        errs = [results[i]["error"] for i in sorted(results) if "error" in results[i]]
+        return recs, errs
+
     for ci, chunk in enumerate(chunks):
+        prev = results.get(ci)
+        if prev and ("record" in prev or prev.get("error") == "content_refused"):
+            continue
         prompt = EXTRACTION_PROMPT + meta_context + "\n" + chunk
         try:
             record, err = _call_claude(prompt, schema=EXTRACTION_SCHEMA)
         except RateLimitHit as rl:
+            records, errors = _collect()
             if records:
                 merged = _merge_records(records)
                 if merged:
+                    merged = dict(merged)
                     merged["_partial"] = True
-                    merged["_chunks_completed"] = ci
+                    merged["_chunks_completed"] = len(records)
                     merged["_chunks_total"] = len(chunks)
-                    merged["_failed_chunks"] = len([e for e in errors if e != "content_refused"])
+                    merged["_failed_chunks"] = len(chunks) - len(records) - errors.count("content_refused")
                     refused = errors.count("content_refused")
                     if refused:
                         merged["_refused_chunks"] = refused
@@ -405,14 +475,16 @@ def extract_structured(text, meeting_meta):
                     print(f"  Rate limit at chunk {ci+1}/{len(chunks)}, {len(records)} partial chunks salvaged")
             raise
         if record:
-            records.append(record)
+            results[ci] = {"record": record}
         elif err:
-            errors.append(err)
+            results[ci] = {"error": err}
             print(f"  chunk {ci+1}/{len(chunks)} failed: {err}")
-            if err == "exit_code_empty":
-                break
+        _save_chunk_cache(cache_path, fingerprint, results)
+        if not record and err == "exit_code_empty":
+            break
         time.sleep(1)
 
+    records, errors = _collect()
     merged = _merge_records(records)
     if merged:
         # Chunks that failed, timed out, or were never attempted must not vanish silently.
@@ -428,6 +500,14 @@ def extract_structured(text, meeting_meta):
         if failed_chunks:
             merged["_partial"] = True
             merged["_failed_chunks"] = failed_chunks
+        else:
+            merged.pop("_partial", None)
+            merged.pop("_failed_chunks", None)
+            if cache_path is not None:
+                try:
+                    cache_path.unlink()
+                except OSError:
+                    pass
         return merged, None
     # Every chunk failed: return the error (content_refused only if all were refusals).
     non_refused = [e for e in errors if e != "content_refused"]
@@ -1301,7 +1381,7 @@ def cmd_extract(args):
 
                 meta = get_meeting_meta(sf)
                 try:
-                    record, error_cat = extract_structured(text, meta)
+                    record, error_cat = extract_structured(text, meta, cache_path=None if args.force else chunk_cache_path(out_path))
                 except AuthError as e:
                     auth_failure_count += 1
 
