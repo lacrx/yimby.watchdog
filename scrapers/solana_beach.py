@@ -307,8 +307,17 @@ def cmd_fetch(args):
                 new_count += 1
                 print(f"    NEW: {meta['body']} — {meta['date']}")
 
+            # eScribe IDs are hashes, so rebuild_doc_index can only date these
+            # docs from the state entry. Always record date/title, even when
+            # the download step below is skipped.
+            state["meetings"].setdefault(mid, {}).update({
+                "body": meta["body"],
+                "date": meta["date"],
+                "title": meta["title"],
+            })
+
             has_docs = any(f.name.startswith(mid) for f in docs_dir.glob(f"{mid}-*.txt"))
-            if mid in state["meetings"] and has_docs and not args.deep:
+            if state["meetings"][mid].get("fetched") and has_docs and not args.deep:
                 continue
 
             docs = item["docs"]
@@ -328,10 +337,7 @@ def cmd_fetch(args):
                         doc_count += 1
                     time.sleep(0.3)
 
-            state["meetings"][mid] = {
-                "fetched": datetime.now().isoformat(),
-                "body": meta["body"],
-            }
+            state["meetings"][mid]["fetched"] = datetime.now().isoformat()
     except Exception as e:
         print(f"    eScribe error: {e}")
 

@@ -268,22 +268,61 @@ def check_auth_health():
         return "unavailable"
 
 
-def count_remaining():
-    """Count files still needing extraction."""
-    sources = []
-    for docs_dir in all_docs_dirs():
-        sources += list(docs_dir.glob("*.txt"))
+def _load_doc_dates(slug):
+    """Return {filename: meeting_date} from an agency's doc-index.json."""
+    try:
+        data = json.loads((agency_data_dir(slug) / "doc-index.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return {k: (v or {}).get("meeting_date", "") for k, v in data.get("documents", {}).items()}
 
+
+def count_remaining():
+    """Count files the extractor would actually pick up.
+
+    Mirrors extract_structured eligibility: skips .skip/.split markers,
+    tally_only agencies, and forward_only docs dated before enabled_date
+    (or undated, which the hot queue never takes). Triage is not applied.
+    """
     extracted = set(f.stem for f in STRUCTURED_DIR.glob("*.json"))
     remaining = []
-    for f in sources:
-        skip_path = f.with_suffix(f.suffix + ".skip")
-        if skip_path.exists():
+    for slug, cfg in load_agencies().items():
+        if cfg.get("tally_only"):
             continue
-        if f.stem in extracted:
+        docs_dir = agency_data_dir(slug) / "documents"
+        if not docs_dir.exists():
             continue
-        remaining.append(f)
+        forward_from = cfg.get("enabled_date", "") if cfg.get("forward_only") else None
+        dates = _load_doc_dates(slug) if forward_from is not None else {}
+        for f in docs_dir.glob("*.txt"):
+            if f.stem in extracted:
+                continue
+            if f.with_suffix(".txt.skip").exists() or f.with_suffix(".txt.split").exists():
+                continue
+            if forward_from is not None:
+                d = dates.get(f.name, "")
+                if not d or d < forward_from:
+                    continue
+            remaining.append(f)
     return remaining
+
+
+def find_stale_agencies(max_age_days=30):
+    """Agencies with no dated meeting document in the last max_age_days.
+
+    Catches scrapers that run without errors but stop producing documents
+    (blocked downloads, moved sites, dead DNS).
+    """
+    from datetime import timedelta
+    cutoff = (datetime.now().date() - timedelta(days=max_age_days)).isoformat()
+    today = datetime.now().date().isoformat()
+    stale = []
+    for slug, cfg in load_agencies().items():
+        dates = [d for d in _load_doc_dates(slug).values() if d and d <= today]
+        newest = max(dates) if dates else ""
+        if newest < cutoff:
+            stale.append((cfg.get("name", slug), newest or "never"))
+    return stale
 
 
 def build_autofix_prompt(findings, extraction_log_lines, pipeline_log_lines):
@@ -597,6 +636,13 @@ def diagnose(dry_run=False):
 
     elif auth_status == "rate_limited":
         finding = "claude -p is rate-limited — extraction will stall until reset"
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+
+    # ─── Finding: agencies that stopped producing documents ───
+
+    for name, newest in find_stale_agencies():
+        finding = f"{name}: no dated meeting document since {newest} (scraper may be blocked or broken)"
         diagnosis["findings"].append(finding)
         print(f"  FINDING: {finding}")
 

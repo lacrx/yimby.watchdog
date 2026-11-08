@@ -8,7 +8,9 @@ This repo is the ETL/pipeline layer for civic monitoring. It scrapes meeting age
 
 ## Architecture
 
-**Split-mode pipeline:** AWS Lambda scrapes on schedule → writes S3 marker → local machine polls for marker via `extract-watch` → runs `claude -p` extraction via `extract-local`.
+**Split-mode pipeline (designed, not deployed):** AWS Lambda scrapes on schedule → writes S3 marker → local machine polls for marker via `extract-watch` → runs `claude -p` extraction via `extract-local`. The Lambda and EventBridge schedules are not in Terraform state, so the `extract-watch` cron is disabled.
+
+**What actually runs:** the local `civic-pipeline` cron does scraping and extraction: `local --deep --extract-until 4` nightly at 1am, and `local --deep --hot-only` at 6pm Tue–Fri.
 
 **Config:** Jurisdiction-specific settings (city name, council roster, feeds, advocacy lens) live in AWS SSM Parameter Store. Local dev uses `config.local.yaml` fallback. `agencies.yaml` is the structural scraper registry (platforms, URLs, bodies). See `config.py` for the loader.
 

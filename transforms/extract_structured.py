@@ -684,7 +684,7 @@ def load_doc_index():
     return index
 
 
-def collect_all_sources(queue=None, hot_days=14, include_tally=False):
+def collect_all_sources(queue=None, hot_days=14, include_tally=False, skip_forward_backlog=False):
     """Collect raw source files, optionally filtered by queue.
 
     queue: None (all), "hot" (recent meetings), or "cold" (backlog).
@@ -692,7 +692,7 @@ def collect_all_sources(queue=None, hot_days=14, include_tally=False):
     include_tally: include tally-only agencies (for cost projection, not extraction).
 
     forward_only agencies use enabled_date as cutoff for hot queue;
-    cold queue includes their full backlog.
+    cold queue includes their full backlog unless skip_forward_backlog=True.
     """
     sources = []
     agencies = load_agencies(enabled_only=True)
@@ -709,6 +709,8 @@ def collect_all_sources(queue=None, hot_days=14, include_tally=False):
         enabled_date = cfg.get("enabled_date", "")
 
         if is_tally_only and not include_tally:
+            continue
+        if is_forward_only and queue == "cold" and skip_forward_backlog:
             continue
         for f in sorted(ddir.glob("*.txt"), reverse=True):
             if queue:
@@ -976,16 +978,17 @@ def cmd_extract(args):
     STRUCTURED_DIR.mkdir(parents=True, exist_ok=True)
 
     queue = getattr(args, "queue", None)
+    skip_fwd = getattr(args, "skip_forward_backlog", False)
     hot_days = getattr(args, "hot_days", 14)
 
-    all_sources = collect_all_sources(queue=queue, hot_days=hot_days)
+    all_sources = collect_all_sources(queue=queue, hot_days=hot_days, skip_forward_backlog=skip_fwd)
 
     # Pre-split oversized docs from ALL queues so they don't accumulate
     all_for_presplit = collect_all_sources(queue=None, hot_days=hot_days) if queue else all_sources
     split_count = presplit_oversized(all_for_presplit)
     if split_count:
         print(f"  Pre-split {split_count} oversized doc(s), re-scanning...")
-        all_sources = collect_all_sources(queue=queue, hot_days=hot_days)
+        all_sources = collect_all_sources(queue=queue, hot_days=hot_days, skip_forward_backlog=skip_fwd)
 
     if not all_sources:
         queue_label = f" ({queue})" if queue else ""
@@ -1319,6 +1322,8 @@ def main():
     parser.add_argument("--hot-days", type=int, default=14, help="Days back that counts as 'hot' (default: 14)")
     parser.add_argument("--cost-report", action="store_true", help="Project monthly API cost from discovery + tally history")
     parser.add_argument("--agency", metavar="SLUG", help="Only extract sources for this agency")
+    parser.add_argument("--skip-forward-backlog", action="store_true",
+                        help="Cold queue: exclude forward_only agencies (their pre-enable history)")
 
     args = parser.parse_args()
 

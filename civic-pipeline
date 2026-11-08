@@ -458,7 +458,7 @@ elif [ "$HOT_RC" -eq 0 ] && [ -n "$EXTRACT_CUTOFF" ]; then
     CURRENT_HOUR=$(date +%H)
     if [ "$CURRENT_HOUR" -lt "$EXTRACT_CUTOFF" ]; then
         log "Cold extraction (backlog, until ${EXTRACT_CUTOFF}:00)..."
-        python3 transforms/extract_structured.py --queue cold --stop-at "$EXTRACT_CUTOFF" --agency carlsbad $FORCE \
+        python3 transforms/extract_structured.py --queue cold --stop-at "$EXTRACT_CUTOFF" --skip-forward-backlog $FORCE \
             >> data/structured-extraction.log 2>&1 || true
         log "Cold extraction done."
     else
@@ -466,7 +466,7 @@ elif [ "$HOT_RC" -eq 0 ] && [ -n "$EXTRACT_CUTOFF" ]; then
     fi
 elif [ "$HOT_RC" -eq 0 ] && [ -z "$EXTRACT_CUTOFF" ]; then
     log "Cold extraction (backlog, limit 50)..."
-    python3 transforms/extract_structured.py --queue cold --limit 50 --agency carlsbad $FORCE \
+    python3 transforms/extract_structured.py --queue cold --limit 50 --skip-forward-backlog $FORCE \
         >> data/structured-extraction.log 2>&1 || true
     log "Cold extraction done."
 fi

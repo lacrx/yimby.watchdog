@@ -187,13 +187,48 @@ def fetch_viewpublisher_html(base_url, view_id, cutoff_date=None):
     return items
 
 
+# Agenda hosts that no longer resolve, mapped to their current location.
+# San Diego's OnBase Agenda Online moved to Hyland Cloud; meeting IDs carry over.
+HOST_REWRITES = {
+    "https://onbase.sandiego.gov/OnBaseAgendaOnline": "https://sandiego.hylandcloud.com/211agendaonlinecouncil",
+}
+
+
+def _rewrite_host(url):
+    for old, new in HOST_REWRITES.items():
+        if url and url.startswith(old):
+            return new + url[len(old):]
+    return url
+
+
+def _get_with_rewrites(url, max_hops=5):
+    """GET that follows redirects itself so dead hosts can be rewritten mid-chain."""
+    url = _rewrite_host(url)
+    for _ in range(max_hops):
+        resp = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT},
+                            allow_redirects=False)
+        if resp.is_redirect and resp.headers.get("Location"):
+            url = _rewrite_host(urljoin(url, resp.headers["Location"]))
+            continue
+        return resp
+    raise requests.TooManyRedirects(f"More than {max_hops} redirects for {url}")
+
+
 def extract_pdf_links_from_agenda(agenda_url, base_url):
     """Scrape AgendaViewer page for PDF download links."""
-    resp = requests.get(agenda_url, timeout=30, headers={"User-Agent": USER_AGENT})
+    resp = _get_with_rewrites(agenda_url)
     resp.raise_for_status()
 
     pdfs = []
     text = resp.text
+
+    # Type 0: OnBase Agenda Online (San Diego). The meeting page is a JS shell;
+    # the agenda itself is served as HTML from Documents/ViewAgenda.
+    onbase = re.search(r'^(https?://[^?]+?)/Meetings/ViewMeeting\?id=(\d+)', resp.url)
+    if onbase:
+        root, meeting_id = onbase.groups()
+        return [{"url": f"{root}/Documents/ViewAgenda?meetingId={meeting_id}&doctype=1",
+                 "name": "agenda", "type": "agenda_text"}]
 
     # Type 1: Google Docs Viewer embed → DocumentViewer.php?file=...
     # URL may be encoded (%3D for =, %26 for &, or double-encoded %253D)
@@ -306,10 +341,27 @@ def cmd_fetch(args):
             print(f"  Failed to fetch agenda page for {mid}: {e}")
             continue
 
-        has_agenda = any(p["type"] == "agenda" for p in pdfs)
+        has_agenda = any(p["type"] in ("agenda", "agenda_text") for p in pdfs)
 
         for i, pdf_info in enumerate(pdfs):
             if pdf_info["type"] == "agenda_html":
+                continue
+
+            if pdf_info["type"] == "agenda_text":
+                dest = docs_dir / f"{mid}-agenda.txt"
+                if dest.exists():
+                    continue
+                try:
+                    r = requests.get(pdf_info["url"], timeout=60, headers={"User-Agent": USER_AGENT})
+                    r.raise_for_status()
+                    agenda_text = BeautifulSoup(r.text, "lxml").get_text("\n", strip=True)
+                except Exception as e:
+                    print(f"  Failed to fetch HTML agenda for {mid}: {e}")
+                    continue
+                if agenda_text:
+                    dest.write_text(agenda_text)
+                    doc_count += 1
+                time.sleep(0.5)
                 continue
 
             if pdf_info["type"] == "agenda":
