@@ -116,6 +116,8 @@ ESCRIBE_MIN_INTERVAL = float(os.environ.get("ESCRIBE_MIN_INTERVAL", "6"))
 ESCRIBE_COOLDOWN_MIN = float(os.environ.get("ESCRIBE_COOLDOWN_MIN", "90"))
 _escribe_last_request = 0.0
 _escribe_notices = set()
+_cf_session = None  # lazy-init CloudflareSession for browser bypass
+_cf_cookies = {}    # domain -> {name: value} from last successful bypass
 
 
 def _escribe_state_file():
@@ -154,11 +156,75 @@ def _escribe_pace():
     _escribe_last_request = time.time()
 
 
+def _try_browser_bypass(url, dest_path):
+    """Attempt PDF download via Playwright browser session.
+
+    Solves the Cloudflare challenge once per domain, then reuses cookies.
+    Returns True if PDF was saved, False otherwise.
+    """
+    global _cf_session, _cf_cookies
+    try:
+        from lib.cf_bypass import CloudflareSession
+    except ImportError:
+        return False
+
+    if _cf_session is None:
+        _cf_session = CloudflareSession(headless=True)
+        import atexit
+        atexit.register(lambda: _cf_session.close() if _cf_session else None)
+
+    domain = _cf_session._domain(url)
+
+    # Step 1: try with cached cookies via requests
+    if domain in _cf_cookies:
+        try:
+            resp = requests.get(url, timeout=60, cookies=_cf_cookies[domain],
+                                headers={"User-Agent": BROWSER_UA}, allow_redirects=True,
+                                verify=False)
+            if resp.status_code == 200 and b"%PDF" in resp.content[:10]:
+                dest_path.write_bytes(resp.content)
+                return True
+        except Exception:
+            pass
+
+    # Step 2: solve challenge, get fresh cookies
+    print(f"  cf_bypass: solving Cloudflare challenge for {domain}...", flush=True)
+    cookies = _cf_session.get_request_cookies(url)
+    if cookies:
+        _cf_cookies[domain] = cookies
+        # Clear the cooldown since browser bypass works
+        try:
+            _escribe_state_file().unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            resp = requests.get(url, timeout=60, cookies=cookies,
+                                headers={"User-Agent": BROWSER_UA}, allow_redirects=True,
+                                verify=False)
+            if resp.status_code == 200 and b"%PDF" in resp.content[:10]:
+                dest_path.write_bytes(resp.content)
+                print(f"  cf_bypass: download succeeded with browser cookies", flush=True)
+                return True
+        except Exception:
+            pass
+
+    # Step 3: direct browser download as last resort
+    print(f"  cf_bypass: trying direct browser download...", flush=True)
+    try:
+        data = _cf_session.download(url, dest_path)
+        if data and b"%PDF" in data[:10]:
+            print(f"  cf_bypass: direct browser download succeeded", flush=True)
+            return True
+    except Exception as e:
+        print(f"  cf_bypass: browser download failed: {e}", flush=True)
+
+    return False
+
+
 def download_pdf(url, dest_path, headers=None, verify=True):
     """Download a PDF. Skips if already exists and non-empty.
 
-    eScribe URLs are paced and pause during a shared cooldown after a
-    Cloudflare challenge (see ESCRIBE_* above).
+    eScribe URLs are paced and attempt browser bypass on Cloudflare 403.
     """
     if dest_path.exists() and dest_path.stat().st_size > 0:
         return True
@@ -166,8 +232,11 @@ def download_pdf(url, dest_path, headers=None, verify=True):
     if is_escribe:
         until = escribe_blocked_until()
         if until:
-            _escribe_notice("cooldown", f"  eScribe challenged; downloads paused until "
-                                        f"{datetime.fromtimestamp(until):%H:%M}")
+            # Try browser bypass instead of waiting for cooldown
+            if _try_browser_bypass(url, dest_path):
+                return True
+            _escribe_notice("cooldown", f"  eScribe challenged; browser bypass failed; "
+                                        f"downloads paused until {datetime.fromtimestamp(until):%H:%M}")
             return False
         _escribe_pace()
     hdrs = {"User-Agent": USER_AGENT}
@@ -184,10 +253,14 @@ def download_pdf(url, dest_path, headers=None, verify=True):
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
         if status == 403 and is_escribe:
+            # Try browser bypass before giving up
+            if _try_browser_bypass(url, dest_path):
+                return True
             until = _escribe_mark_blocked()
-            print(f"  eScribe Cloudflare challenge (403); pausing eScribe downloads until "
-                  f"{datetime.fromtimestamp(until):%H:%M}", flush=True)
-        print(f"  download failed: {e}")
+            print(f"  eScribe Cloudflare challenge (403); browser bypass failed; "
+                  f"pausing until {datetime.fromtimestamp(until):%H:%M}", flush=True)
+        else:
+            print(f"  download failed: {e}")
         return False
 
 
