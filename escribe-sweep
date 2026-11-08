@@ -1,0 +1,58 @@
+#!/bin/bash
+# Retry pending eScribe downloads between pipeline runs.
+#
+# eScribe's Cloudflare challenge opens and closes platform-wide, so documents
+# only land when a run happens to hit an open window. This runs the eScribe
+# scrapers a few extra times a day. download_pdf() enforces request spacing and
+# a shared cooldown after any challenge, so a blocked sweep costs at most one
+# document request, and a sweep during an active cooldown makes none.
+#
+# Cron (avoid the 1am and 6pm pipeline runs):
+#   17 4,8,11,14,21 * * * cd ~/repos/yimby.watchdog && ./escribe-sweep >> data/escribe-sweep.log 2>&1
+
+set -uo pipefail
+cd "$(dirname "$0")"
+export PATH="$HOME/.local/bin:$PATH"
+[ -f .venv/bin/activate ] && source .venv/bin/activate
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [escribe-sweep] $*"; }
+
+exec 9>data/.escribe-sweep.lock
+if ! flock -n 9; then
+    log "Another sweep is running; exiting."
+    exit 0
+fi
+# Don't overlap a pipeline run (it holds the extraction pid file while active).
+if pgrep -f "civic-pipeline" >/dev/null; then
+    log "Pipeline running; exiting."
+    exit 0
+fi
+
+UNTIL=$(python3 -c "from civic_utils import escribe_blocked_until as f; print(int(f()))")
+if [ "$UNTIL" -gt 0 ]; then
+    log "Cooldown active until $(date -d "@$UNTIL" '+%H:%M'); skipping."
+    exit 0
+fi
+
+while IFS='|' read -r SLUG PLATFORM; do
+    case "$PLATFORM" in
+        escribe)       CMD=(python3 scrapers/sandag.py fetch --agency "$SLUG" --years 1) ;;
+        solana_drupal) CMD=(python3 scrapers/solana_beach.py fetch --years 1) ;;
+        *) continue ;;
+    esac
+    # Stop as soon as one agency trips the shared cooldown.
+    if [ "$(python3 -c "from civic_utils import escribe_blocked_until as f; print(int(f()))")" -gt 0 ]; then
+        log "Challenged; stopping sweep."
+        break
+    fi
+    BEFORE=$(find "data/$SLUG/documents" -name '*.txt' 2>/dev/null | wc -l)
+    timeout 1200 "${CMD[@]}" >> "data/$SLUG/watch.log" 2>&1
+    AFTER=$(find "data/$SLUG/documents" -name '*.txt' 2>/dev/null | wc -l)
+    log "$SLUG: $((AFTER - BEFORE)) new documents"
+done < <(python3 -c "
+import yaml
+for slug, a in yaml.safe_load(open('agencies.yaml'))['agencies'].items():
+    if a.get('enabled', True) and a.get('platform') in ('escribe', 'solana_drupal'):
+        print(f\"{slug}|{a['platform']}\")
+")
+log "Done."

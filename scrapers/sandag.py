@@ -236,69 +236,75 @@ def cmd_fetch(args):
     new = 0
 
     print(f"Fetching {agency_name} meetings (eScribe)...")
+    all_meetings = []
     for body_name in bodies:
         print(f"  {body_name}...")
         meetings = fetch_past_meetings(session, escribe_base, slug, agency_name, body_name, min_year)
         print(f"    {len(meetings)} meetings since {min_year}")
         total += len(meetings)
+        all_meetings.extend((body_name, m) for m in meetings)
 
-        for m in meetings:
-            mid = m["id"]
-            meeting_dir = meetings_dir / mid
-            meeting_dir.mkdir(exist_ok=True)
+    # Newest first across all bodies: eScribe downloads are intermittently
+    # blocked, so an open window should go to the most recent documents.
+    all_meetings.sort(key=lambda bm: bm[1].get("date", ""), reverse=True)
 
-            meta_file = meeting_dir / "meeting.json"
-            meta_file.write_text(json.dumps(m, indent=2))
+    for body_name, m in all_meetings:
+        mid = m["id"]
+        meeting_dir = meetings_dir / mid
+        meeting_dir.mkdir(exist_ok=True)
 
-            is_new = mid not in state.get("meetings", {})
+        meta_file = meeting_dir / "meeting.json"
+        meta_file.write_text(json.dumps(m, indent=2))
 
-            if m.get("agenda_url"):
-                pdf_path = docs_dir / f"{mid}-agenda-packet.pdf"
-                txt_path = docs_dir / f"{mid}-agenda-packet.txt"
-                if not txt_path.exists():
-                    if is_new:
-                        print(f"    {m['date']} {body_name}: downloading agenda...")
-                    if download_pdf(m["agenda_url"], pdf_path, verify=False):
-                        text = extract_text(pdf_path)
-                        if text and is_new:
-                            print(f"      Extracted {len(text)} chars")
-                    elif is_new:
-                        print(f"      Download failed")
-                    time.sleep(0.5)
+        is_new = mid not in state.get("meetings", {})
 
-            if m.get("minutes_url"):
-                pdf_path = docs_dir / f"{mid}-minutes.pdf"
-                txt_path = docs_dir / f"{mid}-minutes.txt"
-                if not txt_path.exists():
-                    if is_new:
-                        print(f"    {m['date']} {body_name}: downloading minutes...")
-                    if download_pdf(m["minutes_url"], pdf_path, verify=False):
-                        text = extract_text(pdf_path)
-                        if text and is_new:
-                            print(f"      Extracted {len(text)} chars")
-                    time.sleep(0.5)
+        if m.get("agenda_url"):
+            pdf_path = docs_dir / f"{mid}-agenda-packet.pdf"
+            txt_path = docs_dir / f"{mid}-agenda-packet.txt"
+            if not txt_path.exists():
+                if is_new:
+                    print(f"    {m['date']} {body_name}: downloading agenda...")
+                if download_pdf(m["agenda_url"], pdf_path, verify=False):
+                    text = extract_text(pdf_path)
+                    if text and is_new:
+                        print(f"      Extracted {len(text)} chars")
+                elif is_new:
+                    print(f"      Download failed")
+                time.sleep(0.5)
 
-            if deep and m.get("escribe_id"):
-                items = fetch_meeting_items(session, escribe_base, m["escribe_id"])
-                for i, item in enumerate(items, 1):
-                    for att in item["attachments"]:
-                        fname = safe_filename(att["name"], max_len=60)
-                        pdf_path = docs_dir / f"{mid}-{i:02d}-{fname}.pdf"
-                        txt_path = pdf_path.with_suffix(".txt")
-                        if not txt_path.exists():
-                            if is_new:
-                                print(f"      Item {i}: {att['name'][:60]}...")
-                            if download_pdf(att["url"], pdf_path, verify=False):
-                                extract_text(pdf_path)
-                            time.sleep(0.5)
+        if m.get("minutes_url"):
+            pdf_path = docs_dir / f"{mid}-minutes.pdf"
+            txt_path = docs_dir / f"{mid}-minutes.txt"
+            if not txt_path.exists():
+                if is_new:
+                    print(f"    {m['date']} {body_name}: downloading minutes...")
+                if download_pdf(m["minutes_url"], pdf_path, verify=False):
+                    text = extract_text(pdf_path)
+                    if text and is_new:
+                        print(f"      Extracted {len(text)} chars")
+                time.sleep(0.5)
 
-            state["meetings"][mid] = {
-                "body": m["body"],
-                "date": m["date"],
-                "fetched": datetime.now().isoformat(),
-            }
-            if is_new:
-                new += 1
+        if deep and m.get("escribe_id"):
+            items = fetch_meeting_items(session, escribe_base, m["escribe_id"])
+            for i, item in enumerate(items, 1):
+                for att in item["attachments"]:
+                    fname = safe_filename(att["name"], max_len=60)
+                    pdf_path = docs_dir / f"{mid}-{i:02d}-{fname}.pdf"
+                    txt_path = pdf_path.with_suffix(".txt")
+                    if not txt_path.exists():
+                        if is_new:
+                            print(f"      Item {i}: {att['name'][:60]}...")
+                        if download_pdf(att["url"], pdf_path, verify=False):
+                            extract_text(pdf_path)
+                        time.sleep(0.5)
+
+        state["meetings"][mid] = {
+            "body": m["body"],
+            "date": m["date"],
+            "fetched": datetime.now().isoformat(),
+        }
+        if is_new:
+            new += 1
 
     state["last_fetch"] = datetime.now().isoformat()
     rebuild_doc_index(slug, state, docs_dir)

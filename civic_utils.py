@@ -108,6 +108,56 @@ FIRECRAWL_FALLBACK_HOSTS = ("escribemeetings.com",)
 FIRECRAWL_FALLBACK_MAX_PER_NIGHT = int(os.environ.get("FIRECRAWL_FALLBACK_MAX_PER_NIGHT", "150"))
 
 
+# eScribe sits behind a Cloudflare challenge that opens and closes platform-wide
+# (successes arrive in clusters across agencies at the same time; once a run
+# hits a 403, nothing after it in that run has ever succeeded). So: space
+# requests out, and after a challenge stop asking every eScribe host for a
+# cooldown shared across processes. A blocked run then costs one request
+# instead of dozens, and escribe-sweep retries a few times a day to catch the
+# open windows.
+ESCRIBE_HOST = "escribemeetings.com"
+ESCRIBE_MIN_INTERVAL = float(os.environ.get("ESCRIBE_MIN_INTERVAL", "6"))
+ESCRIBE_COOLDOWN_MIN = float(os.environ.get("ESCRIBE_COOLDOWN_MIN", "90"))
+_escribe_last_request = 0.0
+_escribe_notices = set()
+
+
+def _escribe_state_file():
+    return DATA_DIR / ".escribe-blocked-until"
+
+
+def escribe_blocked_until():
+    """Epoch seconds until which eScribe downloads are paused, or 0."""
+    try:
+        until = float(_escribe_state_file().read_text().strip())
+    except (OSError, ValueError):
+        return 0.0
+    return until if until > time.time() else 0.0
+
+
+def _escribe_mark_blocked():
+    until = time.time() + ESCRIBE_COOLDOWN_MIN * 60
+    try:
+        _escribe_state_file().write_text(str(until))
+    except OSError:
+        pass
+    return until
+
+
+def _escribe_notice(key, msg):
+    if key not in _escribe_notices:
+        _escribe_notices.add(key)
+        print(msg, flush=True)
+
+
+def _escribe_pace():
+    global _escribe_last_request
+    wait = _escribe_last_request + ESCRIBE_MIN_INTERVAL - time.time()
+    if wait > 0:
+        time.sleep(wait)
+    _escribe_last_request = time.time()
+
+
 def _firecrawl_fallback(url, dest_path):
     """Fetch a Cloudflare-challenged document via Firecrawl, save text beside dest_path.
 
@@ -115,6 +165,7 @@ def _firecrawl_fallback(url, dest_path):
     Capped per day (FIRECRAWL_FALLBACK_MAX_PER_NIGHT) to protect the credit pool.
     """
     if not shutil.which("firecrawl"):
+        _escribe_notice("no-firecrawl", "  firecrawl CLI not on PATH; Cloudflare fallback disabled")
         return False
     counter = Path(__file__).parent / "data" / f".firecrawl-fallback-{datetime.now():%Y-%m-%d}"
     used = int(counter.read_text()) if counter.exists() else 0
@@ -145,6 +196,14 @@ def download_pdf(url, dest_path, headers=None, verify=True):
     txt_path = dest_path.with_suffix(".txt")
     if any(h in url for h in FIRECRAWL_FALLBACK_HOSTS) and txt_path.exists() and txt_path.stat().st_size > 0:
         return True
+    is_escribe = ESCRIBE_HOST in url
+    if is_escribe:
+        until = escribe_blocked_until()
+        if until:
+            _escribe_notice("cooldown", f"  eScribe challenged; downloads paused until "
+                                        f"{datetime.fromtimestamp(until):%H:%M}")
+            return _firecrawl_fallback(url, dest_path)
+        _escribe_pace()
     hdrs = {"User-Agent": USER_AGENT}
     if headers:
         hdrs.update(headers)
@@ -158,6 +217,10 @@ def download_pdf(url, dest_path, headers=None, verify=True):
         return False
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
+        if status == 403 and is_escribe:
+            until = _escribe_mark_blocked()
+            print(f"  eScribe Cloudflare challenge (403); pausing eScribe downloads until "
+                  f"{datetime.fromtimestamp(until):%H:%M}", flush=True)
         if status == 403 and any(h in url for h in FIRECRAWL_FALLBACK_HOSTS):
             if _firecrawl_fallback(url, dest_path):
                 return True
