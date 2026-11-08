@@ -25,7 +25,7 @@ import requests
 from civic_utils import (
     extract_text, save_json, load_json,
     safe_filename, agency_data_dir, load_agencies, rebuild_doc_index,
-    cmd_list_meetings, log_discovery,
+    cmd_list_meetings, log_discovery, USER_AGENT,
 )
 
 PORTAL_BASE = "https://portal.laserfiche.com/Portal"
@@ -38,9 +38,7 @@ class LaserficheClient:
     def __init__(self, repo, browse_id=None):
         self.repo = repo
         self.session = requests.Session()
-        self.session.headers["User-Agent"] = (
-            "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
-        )
+        self.session.headers["User-Agent"] = USER_AGENT
         self.api_headers = {
             "Content-Type": "application/json; charset=utf-8",
             "X-Requested-With": "XMLHttpRequest",

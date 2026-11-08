@@ -333,12 +333,11 @@ agencies:
   coronado:
     name: City of Coronado
     region: south_county
-    platform: primegov
-    base_url: https://coronado.primegov.com
+    platform: escribe  # moved from PrimeGov (coronado.primegov.com ends 2025-05-14)
+    base_url: https://pub-coronado.escribemeetings.com
     lookback_months: 2
     bodies:
-      - City Council
-      - Planning Commission
+      - City Council Meeting
     deep_fetch: false
     enabled: true
     tally_only: true
