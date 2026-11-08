@@ -25,24 +25,23 @@ The output is structured data that turns years of meeting records into accountab
 
 ## Architecture
 
-Split-mode pipeline. AWS Lambda handles scraping on schedule; local machine handles LLM extraction via `claude -p` (subscription, never API):
+Everything runs on the local machine via cron. `civic-pipeline local` scrapes, merges, extracts with `claude -p` (subscription, never API) and syncs to S3:
 
 ```
-AWS Lambda (EventBridge schedule)
+civic-pipeline local (cron: 1am nightly, 6pm Tue-Fri --hot-only)
   ├── Scrape all enabled agencies (agencies.yaml)
-  ├── Merge + rollup structured data
-  ├── Sync raw data to S3
-  └── Write S3 marker: pipeline/pending-extraction.json
+  ├── Permits + planning projects (current and previous year)
+  ├── eTRAKiT status refresh (nightly only, ~300 open records per kind)
+  ├── Merge + rollup structured data, Parquet export
+  ├── Extract via claude -p: hot queue (last 14 days), then cold backlog
+  ├── Sync raw + structured data to S3
+  └── pipeline_doctor health check
 
-Local machine (cron every 5 min)
-  extract-watch
-  ├── Poll S3 for marker
-  ├── If found: download marker, delete from S3
-  └── Run extract-local
-        ├── Sync new docs from S3
-        ├── Extract via claude -p (subscription, not API)
-        └── Push structured records back to S3
+escribe-sweep (cron, a few times a day)
+  └── Retry eScribe downloads blocked by the Cloudflare challenge
 ```
+
+A split mode (AWS Lambda scrapes on an EventBridge schedule, writes an S3 marker, and `extract-watch` picks it up locally) is designed in `infra/`, `lambda_handler.py` and `extract-watch`, but it is not deployed: Terraform state holds only the S3 bucket.
 
 Agencies marked `local_only: true` in `agencies.yaml` are scraped by `civic-pipeline` on the local machine (WAF-blocked sites that reject AWS IPs).
 
@@ -144,19 +143,20 @@ S3 (yimby-watchdog-data)
 
 ## Pipeline Schedule
 
-Lambda runs on EventBridge schedules:
+Local cron:
 
 | Time | What |
 |------|------|
-| 1:00 AM daily | Full pipeline: preflight, scrape all, merge + rollup |
-| 6:00 PM Tue-Fri | Evening catch: scrape + process (agendas often posted afternoon before meetings) |
-
-After Lambda finishes, `extract-watch` detects the S3 marker within 5 minutes and starts `claude -p` extraction locally.
+| 1:00 AM daily | Full pipeline: scrape all, permits, status refresh, merge + rollup, hot + cold extraction until 4:00 |
+| 6:00 PM Tue-Fri | Evening catch (`--hot-only`): scrape + recent-meeting extraction (agendas often posted afternoon before meetings) |
+| 4:17, 8:17, 11:17, 14:17, 21:17 | `escribe-sweep`: retry Cloudflare-blocked eScribe downloads |
 
 ### Cron Setup
 
 ```bash
-*/5 * * * * cd ~/repos/yimby.watchdog && ./extract-watch >> data/extract-watch.log 2>&1
+0 1 * * * cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep --extract-until 4 >> data/pipeline-cron.log 2>&1
+0 18 * * 2-5 cd ~/repos/yimby.watchdog && ./civic-pipeline local --deep --hot-only >> data/pipeline-cron.log 2>&1
+17 4,8,11,14,21 * * * cd ~/repos/yimby.watchdog && ./escribe-sweep >> data/escribe-sweep.log 2>&1
 ```
 
 ### Manual Pipeline Run
@@ -278,7 +278,7 @@ python scripts/seed_ssm.py --write
 python transforms/meeting_merge.py
 python transforms/monthly_rollup.py
 
-# Set up cron for extract-watch
+# Set up cron (see Cron Setup above)
 crontab -e
 ```
 
@@ -297,7 +297,7 @@ crontab -e
 - Claude Code CLI with active subscription (`claude -p` for extraction)
 - `pdftotext` (poppler-utils)
 - Python packages: `requests`, `feedparser`, `beautifulsoup4`, `lxml`, `pyyaml`, `yt-dlp`
-- AWS account with Terraform (for Lambda + S3 + SSM)
+- AWS account with Terraform (S3 + SSM; Lambda only for the undeployed split mode)
 - Optional: `faster-whisper` (local transcription), `pyarrow` (Parquet export)
 
 ## Directory Structure
@@ -305,7 +305,8 @@ crontab -e
 ```
 yimby.watchdog/
 ├── civic-pipeline              # Bash orchestrator (manual/local runs)
-├── extract-watch               # Cron poller: detects new docs via S3 marker
+├── escribe-sweep               # Cron: retry Cloudflare-blocked eScribe downloads
+├── extract-watch               # Split mode only (not deployed): S3 marker poller
 ├── extract-local               # Runs claude -p extraction, syncs to S3
 ├── extract-backlog             # Backlog extraction runner
 ├── deploy-lambda               # Lambda deployment script
