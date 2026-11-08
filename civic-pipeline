@@ -220,26 +220,32 @@ log "Intel feed done."
 
 # ── 1c: Fetch building permits (agencies with permit config) ──
 CURRENT_YEAR=$(date '+%Y')
+PREV_YEAR=$((CURRENT_YEAR - 1))
+# Previous year too: incremental scans are cheap, and permits/projects filed in
+# late December are otherwise missed once the calendar rolls over.
+PERMIT_YEARS="$PREV_YEAR $CURRENT_YEAR"
 while IFS='|' read -r SLUG NAME PLATFORM; do
-    log "Fetching $NAME permits ($CURRENT_YEAR, $PLATFORM, incremental)..."
     mkdir -p "data/${SLUG}/permits"
-    case "$PLATFORM" in
-        etrakit)
-            CMD="python3 scrapers/etrakit.py fetch --agency $SLUG --year $CURRENT_YEAR"
-            ;;
-        arcgis)
-            CMD="python3 scrapers/arcgis_permits.py fetch --agency $SLUG --year $CURRENT_YEAR"
-            ;;
-        *)
-            log "  $NAME: unknown permit platform '$PLATFORM', skipping."
-            continue
-            ;;
-    esac
-    if run_with_timeout "$NAME permits" $CMD >> "data/${SLUG}/permits/fetch.log" 2>&1; then
-        log "$NAME permits done."
-    else
-        log "$NAME permits failed — continuing pipeline."
-    fi
+    for YEAR in $PERMIT_YEARS; do
+        log "Fetching $NAME permits ($YEAR, $PLATFORM, incremental)..."
+        case "$PLATFORM" in
+            etrakit)
+                CMD="python3 scrapers/etrakit.py fetch --agency $SLUG --year $YEAR"
+                ;;
+            arcgis)
+                CMD="python3 scrapers/arcgis_permits.py fetch --agency $SLUG --year $YEAR"
+                ;;
+            *)
+                log "  $NAME: unknown permit platform '$PLATFORM', skipping."
+                break
+                ;;
+        esac
+        if run_with_timeout "$NAME permits" $CMD >> "data/${SLUG}/permits/fetch.log" 2>&1; then
+            log "$NAME permits done."
+        else
+            log "$NAME permits failed — continuing pipeline."
+        fi
+    done
 done < <(python3 -c "
 import yaml
 cfg = yaml.safe_load(open('agencies.yaml'))
@@ -251,12 +257,14 @@ for slug, a in cfg['agencies'].items():
 
 # ── 1c.1: Fetch planning projects (eTRAKit only — development plans, density bonus, etc) ──
 while IFS='|' read -r SLUG NAME; do
-    log "Fetching $NAME planning projects ($CURRENT_YEAR)..."
-    if run_with_timeout "$NAME projects" python3 scrapers/etrakit.py projects --agency "$SLUG" --year "$CURRENT_YEAR" --delay 0.5 >> "data/${SLUG}/permits/projects.log" 2>&1; then
-        log "$NAME projects done."
-    else
-        log "$NAME projects failed — continuing pipeline."
-    fi
+    for YEAR in $PERMIT_YEARS; do
+        log "Fetching $NAME planning projects ($YEAR)..."
+        if run_with_timeout "$NAME projects" python3 scrapers/etrakit.py projects --agency "$SLUG" --year "$YEAR" --delay 0.5 >> "data/${SLUG}/permits/projects.log" 2>&1; then
+            log "$NAME projects done."
+        else
+            log "$NAME projects failed — continuing pipeline."
+        fi
+    done
 done < <(python3 -c "
 import yaml
 cfg = yaml.safe_load(open('agencies.yaml'))
@@ -282,6 +290,27 @@ for slug, a in cfg['agencies'].items():
         if a['permits'].get('platform') == 'etrakit':
             print(f\"{slug}|{a.get('name', slug)}\")
 ")
+
+# ── 1c.3: Refresh status of open permits/projects (eTRAKit only, nightly run) ──
+# fetch/projects only add new numbers; without this, status and issued/finaled
+# dates stay frozen at first sight. Rotates through ~300 open records per night.
+if [ -z "$HOT_ONLY" ]; then
+while IFS='|' read -r SLUG NAME; do
+    log "Refreshing $NAME permit/project status..."
+    if run_with_timeout "$NAME refresh" python3 scrapers/etrakit.py refresh --agency "$SLUG" --batch 300 --delay 1.5 >> "data/${SLUG}/permits/refresh.log" 2>&1; then
+        log "$NAME status refresh done."
+    else
+        log "$NAME status refresh failed — continuing pipeline."
+    fi
+done < <(python3 -c "
+import yaml
+cfg = yaml.safe_load(open('agencies.yaml'))
+for slug, a in cfg['agencies'].items():
+    if a.get('enabled', True) and a.get('permits'):
+        if a['permits'].get('platform') == 'etrakit':
+            print(f\"{slug}|{a.get('name', slug)}\")
+")
+fi
 
 # ── 1d: Discover new meeting videos ──
 log "Discovering new meeting videos..."

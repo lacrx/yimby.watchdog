@@ -14,17 +14,19 @@ Usage:
     python etrakit.py enrich --year 2026        # re-fetch housing permits with extended fields
     python etrakit.py projects                  # scan planning projects for current year
     python etrakit.py projects --year 2024      # specific year
+    python etrakit.py refresh                   # re-check status of open permits/projects
 
 Requires: requests, beautifulsoup4, pyyaml
 """
 
 import argparse
 import json
+import os
 import re
 import sys
 import time
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, date
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -51,6 +53,32 @@ INFILL_TYPES = HOUSING_TYPES | {
 }
 
 PROJECT_PREFIXES = ["D", "RD", "DB", "ZA", "CUP", "RC", "RRP", "SC", "GPA", "EXT", "TPM", "H"]
+
+# Statuses that no longer change. Everything else is re-checked by `refresh`.
+TERMINAL_PERMIT_STATUSES = {"FINALED", "WITHDRAWN", "VOID", "EXPIRED", "CANCELED", "DENIED"}
+# Approved projects stay open: they can still expire or get time extensions.
+TERMINAL_PROJECT_STATUSES = {"CLOSED", "DENIED", "WITHDRAWN", "VOID", "EXPIRED",
+                             "CANCELED", "FINALED", "COMPLETE"}
+
+
+def write_jsonl(path, rows):
+    """Write JSONL atomically so an interrupted run never truncates a year file."""
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w") as f:
+        for r in rows:
+            f.write(json.dumps(r) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def read_jsonl(path):
+    path = Path(path)
+    if not path.exists():
+        return []
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
 
 
 def fetch_permit(session, base_url, permit_no, enrich=False):
@@ -81,6 +109,8 @@ def fetch_permit(session, base_url, permit_no, enrich=False):
         "applied": label("lblPermitAppliedDate"),
         "approved": label("lblPermitApprovedDate"),
         "issued": label("lblPermitIssuedDate"),
+        "finaled": label("lblPermitFinaledDate"),
+        "expires": label("lblPermitExpirationDate"),
         "address": addr,
         "apn": "",
         "owner": "",
@@ -186,11 +216,14 @@ def fetch_project(session, base_url, project_no):
     return {
         "project_no": project_no,
         "type": ptype,
-        "status": label("lblProjectStatus"),
+        "status": label("lblProjectstatus") or label("lblProjectStatus"),
+        "status_date": label("lblProjectStatusDate"),
         "name": label("lblProjectName"),
         "description": label("lblProjectDesc"),
         "applied": label("lblProjectAppliedDate"),
         "approved": label("lblProjectApprovedDate"),
+        "closed": label("lblProjectClosedDate"),
+        "expires": label("lblProjectExpiredDate"),
         "address": addr,
         "apn": apn,
         "planner": label("lblProjectPlanner"),
@@ -226,12 +259,23 @@ def search_project_numbers(session, base_url, prefix):
     return sorted(set(re.findall(rf'{escaped}\d{{5}}', resp2.text)))
 
 
-def _make_session():
+MAX_GAP_RECHECK = 200
+
+
+def _make_session(retry_500=True):
+    """HTTP session with retries.
+
+    eTRAKiT answers HTTP 500 for permit numbers that do not exist yet, so the
+    sequential scanner passes retry_500=False: retrying every miss past the
+    frontier with backoff cost ~20 minutes per run. The page then parses to
+    None and counts as a miss.
+    """
     session = requests.Session()
     session.headers["User-Agent"] = UA
+    statuses = [429, 500, 502, 503] if retry_500 else [429, 502, 503]
     retry_adapter = requests.adapters.HTTPAdapter(
         max_retries=requests.packages.urllib3.util.retry.Retry(
-            total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503]
+            total=3, backoff_factor=2, status_forcelist=statuses
         )
     )
     session.mount("https://", retry_adapter)
@@ -276,10 +320,34 @@ def cmd_fetch(args):
             start_seq = max_existing + 1
             print(f"Resuming from {prefix}{start_seq:04d} ({len(existing)} existing permits)", flush=True)
 
-    session = _make_session()
+    session = _make_session(retry_500=False)
 
     new_results = []
     misses = 0
+
+    # Re-check numbering gaps below the frontier. eTRAKiT sometimes returns a
+    # transient 500 for a real permit; incremental scans resume past the max,
+    # so without this those permits are never fetched. Voided numbers stay as
+    # gaps and cost one request per run each.
+    if existing:
+        have = {int(p["permit_no"].split("-")[1]) for p in existing
+                if p["permit_no"].startswith(prefix)}
+        gaps = sorted(set(range(1, start_seq)) - have)
+        if gaps and len(gaps) <= MAX_GAP_RECHECK:
+            print(f"Re-checking {len(gaps)} gap(s) below frontier...", flush=True)
+            for n in gaps:
+                permit_no = f"{prefix}{n:04d}"
+                try:
+                    p = fetch_permit(session, base_url, permit_no)
+                except Exception as e:
+                    print(f"  Gap {permit_no}: {e}", flush=True)
+                    p = None
+                if p:
+                    new_results.append(p)
+                    print(f"  Recovered {permit_no}", flush=True)
+                time.sleep(args.delay)
+        elif gaps:
+            print(f"  {len(gaps)} gaps below frontier; over {MAX_GAP_RECHECK}, skipping re-check", flush=True)
 
     if start_seq > max_seq:
         print(f"Already scanned up to {prefix}{start_seq - 1:04d}, checking for new permits...")
@@ -323,9 +391,7 @@ def cmd_fetch(args):
             time.sleep(3)
 
     all_results = existing + new_results
-    with open(out_file, "w") as f:
-        for p in all_results:
-            f.write(json.dumps(p) + "\n")
+    write_jsonl(out_file, all_results)
 
     housing = [p for p in all_results if
                any(h in p["type"].upper() for h in ["DWELLING", "RESIDENTIAL", "SFR", "MULTI", "DUPLEX"])]
@@ -403,7 +469,8 @@ def cmd_enrich(args):
             continue
 
         if result:
-            permit_index[permit_no] = result
+            permit_index[permit_no] = {**permit_index[permit_no], **result}
+            result = permit_index[permit_no]
             enriched_count += 1
             has_owner = bool(result.get("owner"))
             has_parent = bool(result.get("linked_parent"))
@@ -425,9 +492,7 @@ def cmd_enrich(args):
             time.sleep(2)
 
     all_results = [permit_index[p["permit_no"]] for p in permits]
-    with open(in_file, "w") as f:
-        for p in all_results:
-            f.write(json.dumps(p) + "\n")
+    write_jsonl(in_file, all_results)
 
     print(f"\nEnriched {enriched_count} permits, wrote {len(all_results)} to {in_file}")
 
@@ -490,11 +555,11 @@ def cmd_backfill_apn(args):
                 continue
 
             if result and result.get("apn"):
-                permit_index[permit_no] = result
+                permit_index[permit_no] = {**permit_index[permit_no], **result}
                 backfilled += 1
                 print(f"  {permit_no}: apn={result['apn']}", flush=True)
             elif result:
-                permit_index[permit_no] = result
+                permit_index[permit_no] = {**permit_index[permit_no], **result}
 
             time.sleep(args.delay)
 
@@ -503,14 +568,10 @@ def cmd_backfill_apn(args):
                 time.sleep(2)
                 # Checkpoint: save progress every 50 permits
                 all_results = [permit_index[p["permit_no"]] for p in permits]
-                with open(in_file, "w") as f:
-                    for p in all_results:
-                        f.write(json.dumps(p) + "\n")
+                write_jsonl(in_file, all_results)
 
         all_results = [permit_index[p["permit_no"]] for p in permits]
-        with open(in_file, "w") as f:
-            for p in all_results:
-                f.write(json.dumps(p) + "\n")
+        write_jsonl(in_file, all_results)
 
         print(f"  {year}: backfilled {backfilled} APNs")
         total_backfilled += backfilled
@@ -586,9 +647,7 @@ def cmd_projects(args):
             time.sleep(2)
 
     merged = {**existing, **new_results}
-    with open(out_file, "w") as f:
-        for pno in sorted(merged):
-            f.write(json.dumps(merged[pno]) + "\n")
+    write_jsonl(out_file, [merged[pno] for pno in sorted(merged)])
 
     print(f"\n{len(new_results)} new projects, {len(merged)} total for {year}")
 
@@ -596,6 +655,99 @@ def cmd_projects(args):
     print("\nBy type:")
     for t, c in type_counts.most_common():
         print(f"  {t}: {c}")
+
+
+def _refresh_candidates(records, key, terminal, housing_first):
+    """Open records ordered so the least recently checked go first."""
+    open_recs = [r for r in records if r.get("status", "") not in terminal]
+    def sort_key(r):
+        housing = r.get("type", "") in HOUSING_TYPES if housing_first else False
+        return (r.get("status_checked", ""), not housing, r.get(key, ""))
+    return sorted(open_recs, key=sort_key)
+
+
+def cmd_refresh(args):
+    """Re-check status of open permits and projects.
+
+    fetch/projects only add new numbers, so without this a permit keeps the
+    status it had on first sight (usually RECEIVED). Each run re-fetches up to
+    --batch open records per kind, least recently checked first, and merges
+    the basic fields into the stored record (enrichment fields are kept).
+    Status changes are appended to status_history.
+    """
+    agencies = load_agencies(enabled_only=False)
+    config = agencies.get(args.agency)
+    if not config or "permits" not in config:
+        print(f"No permit config for agency '{args.agency}'")
+        sys.exit(1)
+    base_url = config["permits"]["base_url"]
+    permits_dir = agency_data_dir(args.agency) / "permits"
+    this_year = datetime.now().year
+    years = list(range(this_year - args.years + 1, this_year + 1))
+    today = date.today().isoformat()
+
+    kinds = []
+    if not args.projects_only:
+        kinds.append(("permit", "permit_no", "etrakit-permits-{}.jsonl", fetch_permit,
+                      TERMINAL_PERMIT_STATUSES, True))
+    if not args.permits_only:
+        kinds.append(("project", "project_no", "etrakit-projects-{}.jsonl", fetch_project,
+                      TERMINAL_PROJECT_STATUSES, False))
+
+    session = _make_session()
+    for kind, key, pattern, fetcher, terminal, housing_first in kinds:
+        files = {y: permits_dir / pattern.format(y) for y in years}
+        data = {y: read_jsonl(f) for y, f in files.items()}
+        pool = [(y, r) for y, rows in data.items()
+                for r in _refresh_candidates(rows, key, terminal, housing_first)]
+        pool.sort(key=lambda yr: (yr[1].get("status_checked", ""), yr[0]))
+        batch = pool[:args.batch] if args.batch else pool
+        print(f"Refreshing {len(batch)} of {len(pool)} open {kind}s ({years[0]}-{years[-1]})...", flush=True)
+
+        changed = 0
+        errors = 0
+        consecutive_errors = 0
+        dirty = set()
+        transitions = Counter()
+        for i, (year, rec) in enumerate(batch):
+            num = rec[key]
+            try:
+                fresh = fetcher(session, base_url, num)
+                consecutive_errors = 0
+            except Exception as e:
+                errors += 1
+                consecutive_errors += 1
+                if errors <= 3:
+                    print(f"  Error on {num}: {e}", flush=True)
+                if consecutive_errors >= 10:
+                    print(f"  Stopping: {consecutive_errors} consecutive errors (site may be down)", flush=True)
+                    break
+                time.sleep(5)
+                continue
+
+            if fresh:
+                old_status = rec.get("status", "")
+                new_status = fresh.get("status", "")
+                rec.update({k: v for k, v in fresh.items() if v or k not in rec})
+                if new_status and new_status != old_status:
+                    rec.setdefault("status_history", []).append(
+                        {"date": today, "from": old_status, "to": new_status})
+                    transitions[f"{old_status or '(blank)'} -> {new_status}"] += 1
+                    changed += 1
+                rec["status_checked"] = today
+                dirty.add(year)
+            time.sleep(args.delay)
+
+            if (i + 1) % 100 == 0:
+                print(f"  ...{i + 1}/{len(batch)}: {changed} changed", flush=True)
+                for y in dirty:
+                    write_jsonl(files[y], data[y])
+
+        for y in dirty:
+            write_jsonl(files[y], data[y])
+        print(f"  {kind}s: {changed} status changes, {errors} errors", flush=True)
+        for t, n in transitions.most_common():
+            print(f"    {t}: {n}", flush=True)
 
 
 def main():
@@ -634,9 +786,19 @@ def main():
     bfill_p.add_argument("--housing-only", action="store_true", help="Only backfill housing types")
     bfill_p.add_argument("--delay", type=float, default=1.0, help="Seconds between requests")
 
+    ref_p = sub.add_parser("refresh", help="Re-check status of open permits and projects")
+    ref_p.add_argument("--agency", default="oceanside", help="Agency slug")
+    ref_p.add_argument("--years", type=int, default=2, help="Number of years back including current (default 2)")
+    ref_p.add_argument("--batch", type=int, default=300, help="Max records per kind per run (0=all)")
+    ref_p.add_argument("--delay", type=float, default=1.5, help="Seconds between requests")
+    ref_p.add_argument("--permits-only", action="store_true")
+    ref_p.add_argument("--projects-only", action="store_true")
+
     args = parser.parse_args()
 
-    if args.command == "fetch":
+    if args.command == "refresh":
+        cmd_refresh(args)
+    elif args.command == "fetch":
         cmd_fetch(args)
     elif args.command == "enrich":
         cmd_enrich(args)

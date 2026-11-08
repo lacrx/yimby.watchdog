@@ -152,6 +152,8 @@ def build_permits_table(permits, project_index, parcel_addrs, parcel_zones):
         "applied": [],
         "approved": [],
         "issued": [],
+        "finaled": [],
+        "expires": [],
         "apn": [],
         "owner": [],
         "address": [],
@@ -176,6 +178,8 @@ def build_permits_table(permits, project_index, parcel_addrs, parcel_zones):
         columns["applied"].append(parse_date(p.get("applied", "")))
         columns["approved"].append(parse_date(p.get("approved", "")))
         columns["issued"].append(parse_date(p.get("issued", "")))
+        columns["finaled"].append(parse_date(p.get("finaled", "")))
+        columns["expires"].append(parse_date(p.get("expires", "")))
         apn = p.get("apn", "") or ""
         columns["apn"].append(apn)
         columns["owner"].append(p.get("owner", "") or "")
@@ -568,7 +572,7 @@ def cmd_export(args):
 
     if args.dry_run:
         print("\n[dry run] Would export:")
-        print(f"  permits.parquet: {len(permits)} rows × 18 columns")
+        print(f"  permits.parquet: {len(permits)} rows × 21 columns")
         print(f"  permit_projects.parquet: {len(projects)} rows × 11 columns")
         print(f"  apr_filings.parquet: {apr_count} rows × 22 columns")
         print(f"  housing_projects.parquet: {housing_count} rows × 28 columns")
