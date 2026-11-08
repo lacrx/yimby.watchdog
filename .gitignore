@@ -39,8 +39,6 @@ Thumbs.db
 .claude/settings.local.json
 .claude/projects/
 
-# Firecrawl cache
-.firecrawl/
 
 # Jupyter
 .ipynb_checkpoints/

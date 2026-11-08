@@ -648,16 +648,11 @@ def diagnose(dry_run=False):
 
     # ─── Finding: eScribe Cloudflare challenge ───
 
-    import shutil
     from civic_utils import escribe_blocked_until
     until = escribe_blocked_until()
     if until:
         finding = (f"eScribe downloads paused (Cloudflare challenge) until "
                    f"{datetime.fromtimestamp(until):%H:%M}; escribe-sweep retries later")
-        diagnosis["findings"].append(finding)
-        print(f"  FINDING: {finding}")
-    if not shutil.which("firecrawl"):
-        finding = "firecrawl CLI not installed: Cloudflare fallback for eScribe documents is inactive"
         diagnosis["findings"].append(finding)
         print(f"  FINDING: {finding}")
 
