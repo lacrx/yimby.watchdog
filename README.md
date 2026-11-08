@@ -171,6 +171,10 @@ Local cron:
 # Just one agency
 python scrapers/oceanside.py fetch --deep
 
+# Granicus: force re-fetch specific meetings, or date undated rows from the live archive
+python scrapers/granicus.py fetch --agency san_diego --retry evt-8972 --retry evt-8973
+python scrapers/granicus.py backfill-dates --agency san_marcos --dry-run
+
 # Permits
 python scrapers/etrakit.py fetch                       # Oceanside (current year, incremental)
 python scrapers/arcgis_permits.py fetch --agency carlsbad --full  # Carlsbad
@@ -312,6 +316,9 @@ Every stage follows the same rules so failures are visible instead of silent:
 - **Recheck window:** `civic_utils.RECHECK_DAYS` (90). Scrapers recheck meetings without documents for this long, and the doctor measures gaps over the same window. Per-agency `lookback_months` is floored at 3 so listings cover it.
 - **Skip markers:** extraction `.skip` files record the source size; a marker is ignored once the source text changes, and `repeated_failure` markers expire after 14 days. Partial extractions (`_partial`) are redone.
 - **Doctor dry run:** `pipeline_doctor.py --dry-run` writes nothing.
+- **Granicus retries:** failed fetches go into `state.json` `failed_fetches` and are retried every run until `RECHECK_DAYS`, even after the meeting leaves the RSS feed. Unfetchable entries (empty Laserfiche records, over the 400MB cap) are marked `permanent` and get `no_assets`. Clips Granicus reports as "agenda not published" are video-only and also get `no_assets`.
+- **Laserfiche links:** Granicus agendas hosted on Laserfiche WebLink are fetched with a cookie-keeping session; image-only entries fall back to the portal's own PDF render.
+- **Chunked extraction cache:** large docs are extracted in chunks, and per-chunk results are cached in `data/structured/<record>.chunks` (keyed on source size and chunk hashes). Re-extracting a `_partial` record re-runs only the failed chunks; refused chunks are not retried. `--force` ignores the cache. Sidecars are excluded from S3 sync.
 
 ## Directory Structure
 
