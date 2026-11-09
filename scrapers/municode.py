@@ -163,6 +163,74 @@ def fetch_meeting_documents(meeting_url):
     return docs
 
 
+def _norm_body(b):
+    return re.sub(r"\s+", " ", (b or "")).strip().lower()
+
+
+def reconcile_orphans(slug, meetings_dir, docs_dir):
+    """Mark unreachable duplicate rows superseded_by the row that has the docs.
+
+    Municode renumbers a meeting's page slug (planning-commission-meeting-262
+    becomes -263, say), and meeting_id is a hash of that slug. A renumbered
+    meeting therefore lands in a brand new row while the old one is orphaned:
+    it has dropped out of the listing, so no later run ever revisits it, and
+    it keeps no url, so nothing can be fetched for it either. Those orphans
+    then read as meetings whose documents are missing when the documents are
+    in fact filed under the new id.
+
+    Only rows with no url are candidates (a row still in the listing gets its
+    url rewritten every run, so a missing one means the row has dropped out),
+    and only when a same-body row that does hold documents sits on the same
+    day or the next one. The off-by-one comes from the old listing parser
+    taking the date from the adjacent table row; every orphan here that has a
+    documented twin is exactly one day behind it, none are behind by two or
+    ahead by any. An orphan with no such sibling is left alone: that is a real
+    gap, not a duplicate, and hiding it would defeat the coverage check.
+    """
+    rows = []
+    for mdir in meetings_dir.iterdir():
+        mf = mdir / "meeting.json"
+        meta = load_json(mf) if mf.exists() else None
+        if isinstance(meta, dict):
+            rows.append((mdir.name, mf, meta))
+
+    def has_docs(mid):
+        return any(f.name.startswith(mid + "-") and f.stat().st_size > 0
+                   for f in docs_dir.iterdir()) if docs_dir.exists() else False
+
+    documented = [(i, m) for i, _, m in rows
+                  if m.get("date") and m.get("url") and has_docs(i)]
+    marked = 0
+    for oid, omf, om in rows:
+        if om.get("url") or om.get("superseded_by") or not om.get("date"):
+            continue
+        if has_docs(oid):
+            continue  # unreachable but not empty; leave it as its own record
+        try:
+            od = datetime.strptime(om["date"], "%Y-%m-%d")
+        except (ValueError, TypeError):
+            continue
+        pick = None
+        for offset in (0, 1):
+            want = (od + timedelta(days=offset)).strftime("%Y-%m-%d")
+            pick = next((i for i, m in documented
+                         if m["date"] == want
+                         and _norm_body(m.get("body")) == _norm_body(om.get("body"))), None)
+            if pick:
+                if offset:
+                    print(f"  Superseded: {oid} ({om['date']} {om.get('body')}) "
+                          f"-> {pick} on {want}")
+                break
+        if pick is None:
+            continue
+        om["superseded_by"] = pick
+        save_json(omf, om)
+        marked += 1
+    if marked:
+        print(f"  Superseded: marked {marked} orphaned row(s) that duplicate a documented meeting")
+    return marked
+
+
 def cmd_fetch(args):
     agencies = load_agencies(enabled_only=False)
     slug = args.agency
@@ -274,6 +342,7 @@ def cmd_fetch(args):
         st["fetched"] = datetime.now().isoformat()
 
     state["last_fetch"] = datetime.now().isoformat()
+    reconcile_orphans(slug, meetings_dir, docs_dir)
     rebuild_doc_index(slug, state, docs_dir)
     save_json(state_file, state)
     log_discovery(slug, meetings_found=len(meetings), meetings_new=new_count, docs_new=doc_count)

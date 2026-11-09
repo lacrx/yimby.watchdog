@@ -142,8 +142,11 @@ def get_extraction_errors(log_lines):
 def get_pipeline_errors(log_lines, now=None):
     """Parse pipeline cron log for phase-level errors.
 
-    zero_extraction_runs counts "No new extractions" lines whose own timestamp
-    is within RUN_WINDOW_DAYS of `now` (a time window, not a line window).
+    zero_extraction_runs counts CONSECUTIVE "No new extractions" lines at the
+    end of the log, within RUN_WINDOW_DAYS of `now`. A productive run resets
+    the count: runs that produce nothing because the queue is already drained
+    are normal, and scattered zeros among productive runs are not a stall.
+    Only an unbroken streak of them is.
     """
     now = now or datetime.now()
     window_start = now - timedelta(days=RUN_WINDOW_DAYS)
@@ -210,6 +213,7 @@ def get_pipeline_errors(log_lines, now=None):
         ext_m = re.search(r'Extractions: (\d+) hot \+ (\d+) cold = (\d+) total', line)
         if (ext_m and int(ext_m.group(3)) > 0) or re.search(r'New extractions: \d+', line):
             errors["last_productive_run"] = current_date
+            errors["zero_extraction_runs"] = 0  # streak broken
 
         # Track phase durations
         fetch_start_m = re.search(r'Fetching (.+?)\.\.\.', line)
@@ -536,6 +540,46 @@ def build_autofix_prompt(findings, extraction_log_lines, pipeline_log_lines):
     return "\n".join(prompt_parts)
 
 
+_CLOSED_RE = re.compile(r"closed", re.I)
+# How many closed-session meetings an agency needs on record before "this site
+# never posts closed-session documents" is a conclusion rather than a coincidence.
+CLOSED_EVIDENCE_MIN = 5
+
+
+def _is_closed_session(m):
+    return bool(_CLOSED_RE.search((m.get("body") or "") + " " + (m.get("title") or "")))
+
+
+def _docs_for(doc_names, meeting_id):
+    """Names in the sorted doc list that belong to meeting_id."""
+    prefix = meeting_id + "-"
+    k = bisect_left(doc_names, prefix)
+    out = []
+    while k < len(doc_names) and doc_names[k].startswith(prefix):
+        out.append(doc_names[k])
+        k += 1
+    return out
+
+
+def _closed_sessions_undocumented(rows, doc_names):
+    """True if this agency has never published a closed-session document.
+
+    Some sites post a short closed-session agenda and some post nothing at
+    all, so counting the second kind as a coverage gap is noise. A hardcoded
+    rule would be wrong either way (Encinitas 0/23 and Coronado 0/6 have
+    never posted one; San Marcos 78 and Solana Beach 21 regularly do), so
+    decide per agency from its own history and require real evidence.
+    """
+    closed = 0
+    for mid, m in rows:
+        if not _is_closed_session(m):
+            continue
+        closed += 1
+        if _docs_for(doc_names, mid):
+            return False  # one counterexample settles it
+    return closed >= CLOSED_EVIDENCE_MIN
+
+
 _backfill_spent = 0.0  # seconds of date-backfill used by the current diagnose() run
 
 
@@ -709,7 +753,7 @@ def diagnose(dry_run=False):
     print(f"  Auth status:         {auth_status}")
     print(f"  Failing extractions: {len(failing_files)}")
     print(f"  Last productive run: {pipe_errors['last_productive_run'] or 'unknown'}")
-    print(f"  Zero-extraction runs: {pipe_errors['zero_extraction_runs']} (last {RUN_WINDOW_DAYS}d)")
+    print(f"  Zero-extraction runs: {pipe_errors['zero_extraction_runs']} in a row")
     print()
 
     # ─── Finding: Blocking files ───
@@ -889,9 +933,7 @@ def diagnose(dry_run=False):
         if docs_dir_path.exists():
             doc_names = sorted(f.name for f in docs_dir_path.iterdir()
                                if f.suffix == ".txt" and f.stat().st_size > 0)
-        empty_count = 0
-        total_past = 0
-        undated = 0
+        rows = []
         for mdir in meetings_dir.iterdir():
             mf = mdir / "meeting.json"
             if not mf.exists():
@@ -900,13 +942,23 @@ def diagnose(dry_run=False):
                 m = json.loads(mf.read_text())
             except (json.JSONDecodeError, OSError):
                 continue
-            if not isinstance(m, dict):
-                continue
+            if isinstance(m, dict):
+                rows.append((mdir.name, m))
+
+        skip_closed = _closed_sessions_undocumented(rows, doc_names)
+        empty_count = 0
+        total_past = 0
+        undated = 0
+        closed_skipped = 0
+        for mid, m in rows:
             if (m.get("cancelled") or m.get("superseded_by")
                     or m.get("stale") or m.get("no_assets")):
                 continue
             if bodies and (m.get("body") or "").strip().lower() not in bodies:
                 continue
+            if skip_closed and _is_closed_session(m):
+                closed_skipped += 1
+                continue  # this site has never posted a closed-session document
             norm = normalize_date(m.get("date", "")) if m.get("date") else None
             mdt = None
             if norm:
@@ -920,22 +972,31 @@ def diagnose(dry_run=False):
             age_days = (now - mdt).days
             if age_days < 7 or age_days > RECHECK_DAYS:
                 continue
-            prefix = mdir.name + "-"
-            k = bisect_left(doc_names, prefix)
-            mine = []
-            while k < len(doc_names) and doc_names[k].startswith(prefix):
-                mine.append(doc_names[k])
-                k += 1
+            mine = _docs_for(doc_names, mid)
             if mine and all(cancel_re.search(n) for n in mine):
                 continue  # only doc is a cancellation notice
             if not mine and cancel_re.search(m.get("title") or ""):
+                continue
+            # Some scrapers record a cancellation as a documents[] entry with
+            # a title and no file (civicplus does), so the notice never reaches
+            # the two checks above and the meeting reads as a missing packet.
+            declared = [d.get("title") or "" for d in (m.get("documents") or [])
+                        if isinstance(d, dict)]
+            if declared and all(cancel_re.search(t) for t in declared):
+                continue
+            # An agency that only files documents for items relevant to this
+            # jurisdiction (the Coastal Commission scraper) records how many it
+            # found. Zero relevant items means nothing to file, not a gap.
+            if m.get("city_items") == 0:
                 continue
             total_past += 1
             if not mine:
                 empty_count += 1
         if empty_count > 0 and total_past > 0:
             pct = empty_count / total_past * 100
-            finding = f"{cfg.get('name', slug)}: {empty_count}/{total_past} past meetings ({pct:.0f}%) have no documents (7-{RECHECK_DAYS}d window)"
+            note = f", excl. {closed_skipped} closed session(s)" if closed_skipped else ""
+            finding = (f"{cfg.get('name', slug)}: {empty_count}/{total_past} past meetings "
+                       f"({pct:.0f}%) have no documents (7-{RECHECK_DAYS}d window{note})")
             diagnosis["findings"].append(finding)
             print(f"  FINDING: {finding}")
         if undated:
@@ -1116,9 +1177,13 @@ def diagnose(dry_run=False):
 
     # ─── Finding: Stalled pipeline ───
 
-    # Zero extractions with an empty queue is idle, not stalled.
+    # Zero extractions with an empty queue is idle, not stalled. Only an
+    # unbroken streak counts: a productive run resets it.
     if pipe_errors["zero_extraction_runs"] >= 3 and len(remaining) > 0:
-        finding = f"Pipeline produced zero extractions {pipe_errors['zero_extraction_runs']} recent runs"
+        since = pipe_errors["last_productive_run"] or "unknown"
+        finding = (f"Pipeline produced zero extractions "
+                   f"{pipe_errors['zero_extraction_runs']} runs in a row "
+                   f"(last productive run {since}) with {len(remaining)} file(s) queued")
         diagnosis["findings"].append(finding)
         print(f"  FINDING: {finding}")
 

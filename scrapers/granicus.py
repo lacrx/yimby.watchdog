@@ -715,6 +715,22 @@ def cmd_fetch(args):
             }
             continue
         except Exception as e:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (404, 410):
+                # Granicus redirects a clip with no agenda to its NotFound
+                # page, so a 404 here is a permanent answer, not a flaky
+                # fetch. Retrying it for RECHECK_DAYS cannot help and leaves
+                # the row reading as a coverage gap the whole time.
+                cur = load_json(meeting_file) or {}
+                has_docs = any(f.name.startswith(mid + "-") and f.stat().st_size > 0
+                               for f in docs_dir.iterdir())
+                if not has_docs and not cur.get("no_assets"):
+                    cur["no_assets"] = True
+                    cur["no_assets_reason"] = f"granicus: agenda page returns {status}"
+                    save_json(meeting_file, cur)
+                    print(f"  NO ASSETS: {mid} agenda page returns {status}")
+                failed.pop(mid, None)
+                continue
             print(f"  Failed to fetch agenda page for {mid}: {e}")
             rec = failed.setdefault(mid, {"url": item["link"], "attempts": 0,
                                           "first_failure": now.isoformat()})
@@ -729,6 +745,19 @@ def cmd_fetch(args):
                 cur.pop("no_assets", None)
                 cur.pop("no_assets_reason", None)
                 save_json(meeting_file, cur)
+        else:
+            # An agenda page that lists no PDFs is as empty as one that was
+            # never published; AgendaNotPublished only covers the latter. Left
+            # unflagged, the row reads as a coverage gap on every run and
+            # nothing ever resolves it. The flag clears above if PDFs appear.
+            cur = load_json(meeting_file) or {}
+            has_docs = any(f.name.startswith(mid + "-") and f.stat().st_size > 0
+                           for f in docs_dir.iterdir())
+            if not has_docs and not cur.get("no_assets"):
+                cur["no_assets"] = True
+                cur["no_assets_reason"] = "granicus: agenda page listed no documents"
+                save_json(meeting_file, cur)
+                print(f"  NO ASSETS: {mid} agenda page listed no documents")
 
         has_agenda = any(p["type"] in ("agenda", "agenda_text") for p in pdfs)
 

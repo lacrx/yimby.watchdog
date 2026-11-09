@@ -120,7 +120,14 @@ _escribe_notices = set()
 _cf_session = None  # lazy-init CloudflareSession for browser bypass
 _cf_cookies = {}    # domain -> {name: value} from last successful bypass
 _cf_busy_until = 0.0     # epoch; bypass skipped until then after BrowserBusy
-_cf_bypass_dead = False  # set after the first full bypass failure in this process
+_cf_bypass_dead = False  # set only by process-wide causes (no playwright)
+_cf_dead_domains = set()  # domains that gave up after CF_DOMAIN_FAIL_LIMIT failures
+_cf_fail_counts = {}      # domain -> consecutive bypass failures this run
+# One unreachable document used to disable the bypass for every remaining
+# document and agency in the run. Tiers 1-3 work, so a single failure is far
+# more likely to be a bad document than a systemic block: give each domain a
+# few tries and keep the other domains working.
+CF_DOMAIN_FAIL_LIMIT = int(os.environ.get("CF_DOMAIN_FAIL_LIMIT", "3"))
 _CF_CHALLENGE_STATUSES = (403, 429, 503)
 RECHECK_DAYS = 90        # re-visit window for meetings with no extracted docs
 
@@ -190,33 +197,52 @@ def _clear_escribe_cooldown():
         pass
 
 
-def _disable_bypass():
+def _disable_bypass(domain=None):
+    """Record a bypass failure. domain=None means a process-wide cause."""
     global _cf_bypass_dead
-    _cf_bypass_dead = True
-    _escribe_notice("bypass-dead", "  cf_bypass: disabled for the rest of this run")
+    if domain is None:
+        _cf_bypass_dead = True
+        _escribe_notice("bypass-dead", "  cf_bypass: disabled for the rest of this run")
+        return
+    n = _cf_fail_counts.get(domain, 0) + 1
+    _cf_fail_counts[domain] = n
+    if n >= CF_DOMAIN_FAIL_LIMIT:
+        _cf_dead_domains.add(domain)
+        _escribe_notice(f"bypass-dead-{domain}",
+                        f"  cf_bypass: disabled for {domain} for the rest of this run "
+                        f"({n} consecutive failures)")
 
 
-def _bypass_fail(domain, reason):
-    """Log a FAIL line and stop further bypass attempts in this process."""
+def _bypass_fail(domain, reason, fatal=False):
+    """Log a FAIL line and count it against the domain (or the whole run)."""
     print(f"cf_bypass: FAIL {domain}: {reason}", flush=True)
-    _disable_bypass()
+    _disable_bypass(None if fatal else domain)
+
+
+def _bypass_ok(domain, tier):
+    """A document came through: clear the cooldown and the domain's failure streak."""
+    _clear_escribe_cooldown()
+    _cf_fail_counts.pop(domain, None)
+    _cf_dead_domains.discard(domain)
+    print(f"cf_bypass: OK {domain} ({tier})", flush=True)
 
 
 def _try_browser_bypass(url, dest_path):
     """Attempt PDF download via Playwright browser session.
 
     Solves the Cloudflare challenge once per domain, then reuses cookies.
-    Returns True only if a validated PDF was saved. After the first full
-    failure the bypass is disabled for the rest of the process.
+    Returns True only if a validated PDF was saved. A domain is given up on
+    after CF_DOMAIN_FAIL_LIMIT consecutive failures; a success resets its
+    streak, and only a process-wide cause stops every domain at once.
     """
     global _cf_session, _cf_cookies, _cf_busy_until
-    if _cf_bypass_dead or time.time() < _cf_busy_until:
-        return False
     domain = urlparse(url).netloc
+    if _cf_bypass_dead or domain in _cf_dead_domains or time.time() < _cf_busy_until:
+        return False
     try:
         from lib.cf_bypass import CloudflareSession, BrowserBusy
     except ImportError:
-        _bypass_fail(domain, "playwright not importable")
+        _bypass_fail(domain, "playwright not importable", fatal=True)
         return False
 
     if _cf_session is None:
@@ -241,8 +267,7 @@ def _try_browser_bypass(url, dest_path):
     if domain in _cf_cookies:
         status, content, challenged = _fetch(_cf_cookies[domain])
         if status == 200 and _save_pdf(content, dest_path):
-            _clear_escribe_cooldown()
-            print(f"cf_bypass: OK {domain} (cached-cookies)", flush=True)
+            _bypass_ok(domain, "cached-cookies")
             return True
         if not challenged:
             # 404/410, 5xx, network error, non-PDF 200: cookies are fine, this doc is not
@@ -261,19 +286,18 @@ def _try_browser_bypass(url, dest_path):
         _escribe_notice("bypass-busy", f"cf_bypass: skipped {domain}: browser busy in another process (retry in 5 min)")
         return False
     except ImportError:
-        _bypass_fail(domain, "playwright not importable")
+        _bypass_fail(domain, "playwright not importable", fatal=True)
         return False
     if not cookies:
         # solve() already logged its FAIL line; only a real challenge disables the bypass
         if getattr(_cf_session, "last_fail_challenge", True):
-            _disable_bypass()
+            _disable_bypass(domain)
         return False
 
     _cf_cookies[domain] = cookies
     status, content, challenged = _fetch(cookies)
     if status == 200 and _save_pdf(content, dest_path):
-        _clear_escribe_cooldown()
-        print(f"cf_bypass: OK {domain} (fresh-cookies)", flush=True)
+        _bypass_ok(domain, "fresh-cookies")
         return True
     if not challenged:
         # Challenge is cleared; this document is missing/broken. Not a bypass failure.
@@ -285,8 +309,7 @@ def _try_browser_bypass(url, dest_path):
     try:
         data = _cf_session.download(url, dest_path)
         if _is_pdf_bytes(data) and dest_path.exists() and _is_pdf_file(dest_path):
-            _clear_escribe_cooldown()
-            print(f"cf_bypass: OK {domain} (browser-download)", flush=True)
+            _bypass_ok(domain, "browser-download")
             return True
     except BrowserBusy:
         _cf_busy_until = time.time() + 300
