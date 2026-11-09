@@ -1,8 +1,9 @@
 """Cloudflare challenge bypass using Playwright.
 
 Provides a browser session that solves Cloudflare challenges once and
-extracts cookies for use with plain requests. Falls back to direct
-browser download when cookies alone don't work.
+extracts cookies for use with plain requests. When cookies alone keep
+getting challenged, falls back to fetching the document from inside a
+same-origin page, which Cloudflare sees as a genuine browser request.
 
 Usage:
     from lib.cf_bypass import CloudflareSession
@@ -18,6 +19,7 @@ Usage:
 """
 
 import atexit
+import base64
 import fcntl
 import os
 import shutil
@@ -36,6 +38,59 @@ LOCK_WAIT_S = 10
 _FALLBACK_UA_VERSION = "131.0.0.0"
 _printed = set()
 _busy_until = 0.0  # epoch; fail fast with BrowserBusy until then
+MAX_BROWSER_FETCH_BYTES = 100 * 1024 * 1024  # cap on what a page will buffer in memory
+DOWNLOAD_EVENT_TIMEOUT_MS = 20000  # inline PDFs fire no download event; do not wait long
+_RETRY_STATUSES = (401, 403, 408, 429)  # 4xx worth a second attempt through the browser
+
+# Runs in the page, so Cloudflare sees a genuine same-origin browser request.
+_FETCH_JS = """
+async ([u, maxBytes]) => {
+  let r;
+  try {
+    r = await fetch(u, {credentials: 'include'});
+  } catch (e) {
+    return {status: 0, error: String(e)};
+  }
+  if (!r.ok) return {status: r.status};
+  const declared = parseInt(r.headers.get('content-length') || '0', 10);
+  if (declared && declared > maxBytes) return {status: r.status, tooBig: declared};
+  const bytes = new Uint8Array(await r.arrayBuffer());
+  if (bytes.length > maxBytes) return {status: r.status, tooBig: bytes.length};
+  let s = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    s += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return {status: r.status, b64: btoa(s)};
+}
+"""
+
+
+def _is_pdf(data):
+    return bool(data) and b"%PDF" in data[:1024]
+
+
+def _write_pdf(data, dest_path):
+    """Atomically write data to dest_path if it is a PDF. Returns True on write."""
+    if not _is_pdf(data):
+        return False
+    dest_path = Path(dest_path)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(dest_path.parent),
+                                   prefix=dest_path.name + ".", suffix=".part")
+        os.close(fd)
+    except OSError:
+        return False
+    try:
+        Path(tmp).write_bytes(data)
+        os.replace(tmp, dest_path)
+        return True
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
 
 
 class BrowserBusy(Exception):
@@ -277,62 +332,121 @@ class CloudflareSession:
 
         return False
 
-    def download(self, url, dest_path=None):
-        """Download a file through the browser. Returns bytes or writes to dest_path.
+    def _fetch_in_page(self, page, url):
+        """fetch(url) from inside the page. Returns (bytes, http_status).
 
-        Use when cookie-based requests still fail (rare, but some CDN
-        paths require the full browser context).
+        bytes is b"" on any failure. http_status is the response status, 0 on
+        a network/JS error, or None if the page could not be evaluated at all.
+
+        The request originates from a real document in the page, so it carries
+        the browser's TLS fingerprint, cookie jar, Referer and Sec-Fetch-*
+        headers. Playwright's APIRequestContext (page.request / context.request)
+        carries none of that and Cloudflare 403s it exactly like a bare
+        requests call, which is why it is not used here.
+        """
+        try:
+            res = page.evaluate(_FETCH_JS, [url, MAX_BROWSER_FETCH_BYTES])
+        except Exception as e:
+            print(f"  cf_bypass: in-page fetch error: {type(e).__name__}: {str(e)[:120]}",
+                  flush=True)
+            return b"", None
+        if not isinstance(res, dict):
+            return b"", None
+        status = res.get("status")
+        if res.get("tooBig"):
+            # The download-event tier streams to disk instead of buffering.
+            print(f"  cf_bypass: in-page fetch skipped: {res['tooBig']:,} bytes "
+                  f"over {MAX_BROWSER_FETCH_BYTES:,} limit", flush=True)
+            return b"", status
+        if res.get("b64"):
+            try:
+                return base64.b64decode(res["b64"]), status
+            except Exception:
+                return b"", status
+        detail = res.get("error") or f"HTTP {status}"
+        print(f"  cf_bypass: in-page fetch failed ({detail})", flush=True)
+        return b"", status
+
+    def _download_via_event(self, page, url, dest_path):
+        """Catch a real browser download event. Returns bytes, or b"" on failure.
+
+        Only endpoints that send Content-Disposition: attachment get here:
+        Chrome renders an inline PDF in its own viewer and fires no download
+        event at all, so this is kept behind a short timeout rather than being
+        the primary path.
+        """
+        try:
+            with page.expect_download(timeout=DOWNLOAD_EVENT_TIMEOUT_MS) as info:
+                try:
+                    page.goto(url, timeout=self._timeout_ms)
+                except Exception:
+                    pass  # a download navigation aborts the goto; the event still fires
+            dl = info.value
+        except Exception:
+            return b""
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix="cf-dl-", suffix=".part")
+            os.close(fd)
+            dl.save_as(tmp)
+            data = Path(tmp).read_bytes()
+            if not _is_pdf(data):
+                return b""
+            if dest_path is not None and not _write_pdf(data, dest_path):
+                return b""
+            return data
+        except Exception:
+            return b""
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def download(self, url, dest_path=None):
+        """Fetch a file through the browser. Returns bytes, or b"" on failure.
+
+        Used when cookies alone keep getting challenged. Loads the origin root
+        so the challenge can clear, then fetches the document from inside that
+        page; falls back to a real download event for attachment endpoints.
+        When dest_path is given the file is written only after it validates as
+        a PDF, so a challenge page is never left at dest_path.
         """
         self._ensure_browser()
         domain = self._domain(url)
-
-        # Solve challenge first if we haven't for this domain
         if domain not in self._solved_domains:
             self.solve(url)
 
+        scheme = urlparse(url).scheme or "https"
         page = self._context.new_page()
-        tmp_name = None
         try:
-            # Set up download handling
-            with page.expect_download(timeout=60000) as download_info:
-                page.goto(url, timeout=self._timeout_ms)
-            download = download_info.value
+            # A same-origin document is what makes the fetch below a browser
+            # request rather than a bare HTTP call.
+            try:
+                page.goto(f"{scheme}://{domain}/", wait_until="domcontentloaded",
+                          timeout=self._timeout_ms)
+                self._wait_for_challenge(page)
+            except Exception as e:
+                _log_once(f"origin-{domain}",
+                          f"  cf_bypass: could not load {domain} origin: {type(e).__name__}")
 
-            if dest_path:
-                dest_path = Path(dest_path)
-                fd, tmp_name = tempfile.mkstemp(dir=str(dest_path.parent),
-                                                prefix=dest_path.name + ".", suffix=".part")
-                os.close(fd)
-                download.save_as(tmp_name)
-                data = Path(tmp_name).read_bytes()
-                if b"%PDF" in data[:1024]:
-                    os.replace(tmp_name, dest_path)
-                    tmp_name = None
+            data, status = self._fetch_in_page(page, url)
+            if data:
+                if not _is_pdf(data):
+                    print(f"  cf_bypass: in-page fetch returned non-PDF for {url}", flush=True)
+                    return b""
+                if dest_path is None:
                     return data
-                return b""  # not a PDF (challenge page etc): never leave it at dest_path
-            else:
-                tmp = download.path()
-                data = Path(tmp).read_bytes() if tmp else b""
-                return data
-        except Exception:
-            # Fallback: some PDFs render in-browser instead of downloading
-            resp = page.request.get(url)
-            data = resp.body()
-            if dest_path:
-                if data and b"%PDF" in data[:1024]:
-                    dest_path = Path(dest_path)
-                    part = dest_path.with_name(dest_path.name + ".part")
-                    part.write_bytes(data)
-                    os.replace(part, dest_path)
-                    return data
+                return data if _write_pdf(data, dest_path) else b""
+
+            # A definite answer from the server means the document is not
+            # there; the download-event tier cannot do better and costs a
+            # 20s timeout. Auth/challenge/throttle statuses are worth a retry.
+            if status and 400 <= status < 500 and status not in _RETRY_STATUSES:
                 return b""
-            return data
+            return self._download_via_event(page, url, dest_path)
         finally:
-            if tmp_name:
-                try:
-                    os.unlink(tmp_name)
-                except OSError:
-                    pass
             page.close()
 
     def get_request_cookies(self, url):
