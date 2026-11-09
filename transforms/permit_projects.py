@@ -135,23 +135,88 @@ def load_entitlements():
     return index
 
 
+# Lodging is not housing. ROOM used to sit in the unit-count alternation, which
+# scored the Marriott Fairfield at 99 units and the Hilton Home2 Suites at 136.
+LODGING_RE = re.compile(r"\bHOTEL\b|\bMOTEL\b|\bINN\b|SUITES|MARRIOTT|MARIOTT|HILTON")
+
+# Group quarters are not dwelling units and HCD does not count them as such,
+# so beds in an assisted living facility must not land in a housing total.
+GROUP_QUARTERS_RE = re.compile(
+    r"ASSISTED LIVING|SKILLED NURSING|MEMORY CARE|CONGREGATE CARE|NURSING HOME|"
+    r"CONVALESCENT|DORMITORY|\bDORM\b"
+)
+
+# A building or phase number sits immediately before the word UNITS in these
+# descriptions ("BLDG 30 UNITS 75-78"), so a bare count must never be read when
+# one of these precedes it.
+ORDINAL_PREFIX_RE = re.compile(r"(?:BLDG|BUILDING|BLD|PH|PHASE|LOT|PA)\s*#?\s*$")
+
+UNIT_RANGE_RE = re.compile(r"UNITS?\s*#?\s*(\d+)\s*[-–]\s*(\d+)")
+PLEX_RE = re.compile(r"(\d+)\s*[-\s]?PLEX")
+# A bare count must sit immediately before the unit word, optionally wrapped in
+# parentheses: "34 UNIT", "(6) RESIDENTIAL UNITS" does NOT qualify and is left
+# to the type default. Allowing descriptive words in between was tried and
+# rejected: these descriptions are truncated and inconsistent enough that a
+# backward scan reads square footage ("488 S.Q. FT. ATTACHED ACCESSORY
+# DWELLING") and case numbers ("CE21-1099") as unit counts. Undercounting a
+# handful of rows is recoverable; inventing a 488-unit permit is not.
+BARE_COUNT_RE = re.compile(
+    r"(?<![\w.])\(?(\d{1,3})\)?[-\s]*(?:UNITS?|DU|DWELLINGS?|APTS?|APARTMENTS?|CONDOS?|CONDOMINIUMS?)\b"
+)
+# No single Oceanside permit creates more than ~550 units.
+MAX_PLAUSIBLE_UNITS = 600
+
+# Descriptions whose stated count this deliberately does not parse, because no
+# safe adjacent pattern covers them. They are undercounted to the type default.
+# Recover them in analysis/filed_units.py in yimby.analysis, which carries
+# hand-verified counts, or widen this only with a test that proves no
+# regression on the sweep in that repo.
+KNOWN_UNPARSED = (
+    "20 NEW RESIDENTIAL UNITS",                  # 20
+    "CONSISTING OF (4) ADU UNITS",               # 4
+    "W/ (6) RESIDENTIAL UNITS",                  # 6
+    "PROPOSED 20 ATTACHED SFR CONDO UNITS",      # 20
+    "CONSTRUCT (8) 3-STORY CONDOMINIUMS",        # 8
+)
+
+
 def estimate_units(permit):
-    """Estimate unit count from a single permit."""
-    desc = permit.get("description", "").upper()
+    """Estimate unit count from a single permit.
+
+    Order matters. An explicit unit range is the most reliable signal, then the
+    plex pattern, and only then a bare "N UNITS" count, because building and
+    phase numbers in these descriptions sit directly before the word UNITS and
+    would otherwise be read as the unit count. Returns 0 for lodging, which is
+    not housing.
+    """
+    desc = (permit.get("description") or "").upper()
     ptype = permit.get("type", "")
 
-    unit_match = re.search(r"(\d+)\s*(?:UNIT|DU|DWELLING|APT|APARTMENT|CONDO|ROOM)", desc)
-    if unit_match:
-        return int(unit_match.group(1))
+    if LODGING_RE.search(desc) or GROUP_QUARTERS_RE.search(desc):
+        return 0
 
-    plex_match = re.search(r"(\d+)\s*[-\s]?PLEX", desc)
-    if plex_match:
-        return int(plex_match.group(1))
+    rng = UNIT_RANGE_RE.search(desc)
+    if rng:
+        low, high = int(rng.group(1)), int(rng.group(2))
+        if 0 < high - low < 100:
+            return high - low + 1
+
+    plex = PLEX_RE.search(desc)
+    if plex:
+        return int(plex.group(1))
 
     if "TRIPLEX" in desc:
         return 3
-    if "DUPLEX" in desc:
+    if "DUPLEX" in desc and ptype != "BLD SFD OR DUPLEX":
         return 2
+
+    for m in BARE_COUNT_RE.finditer(desc):
+        count = int(m.group(1))
+        if count < 1 or count > MAX_PLAUSIBLE_UNITS:
+            continue
+        if ORDINAL_PREFIX_RE.search(desc[max(0, m.start() - 14):m.start()]):
+            continue
+        return count
 
     if ptype == "BLD ACCESSORY DWELLING":
         return 1
@@ -161,6 +226,31 @@ def estimate_units(permit):
         return 1
 
     return 1
+
+
+def project_units(permits_list):
+    """Total units for a group of permits, collapsing repeated project totals.
+
+    A large project is often filed as several permits whose descriptions each
+    state the whole project's unit count rather than that building's share, so
+    summing them multiplies the project. Olive Park's two permits both read
+    "(2) BUILDINGS, 199 UNITS" and summed to 398. When permits in a group share
+    an identical description and a large stated count, that count is the
+    project, not the per-permit contribution.
+    """
+    groups = defaultdict(list)
+    for p in permits_list:
+        key = (p.get("description") or "").strip().upper()[:60]
+        groups[key].append(p)
+
+    total = 0
+    for key, members in groups.items():
+        counts = [estimate_units(p) for p in members]
+        if len(members) > 1 and len(set(counts)) == 1 and counts[0] >= 20:
+            total += counts[0]
+        else:
+            total += sum(counts)
+    return total
 
 
 def parse_date(date_str):
@@ -301,7 +391,7 @@ def build_project(name, permits_list, source, entitlements):
 
     type_counts = Counter(p.get("type", "") for p in permits_list)
     status_counts = Counter(p.get("status", "") for p in permits_list)
-    total_units = sum(estimate_units(p) for p in permits_list)
+    total_units = project_units(permits_list)
 
     permit_nos = [p.get("permit_no", "") for p in permits_list]
 
