@@ -57,6 +57,8 @@ SAFE_SKIP_REASONS = {
 
 MAX_SOURCE_SIZE_FOR_SKIP = 2_000_000  # 2MB — anything bigger is almost certainly not meeting text
 RUN_WINDOW_DAYS = 7  # window for zero-extraction run counting
+DATE_BACKFILL_TIMEOUT_SEC = 300  # per-agency cap on a granicus archive backfill
+DATE_BACKFILL_BUDGET_SEC = 600   # total backfill spend per doctor run
 CADENCE_QUIET_DAYS = 21  # regular-cadence agencies silent longer than this are flagged
 
 
@@ -534,8 +536,112 @@ def build_autofix_prompt(findings, extraction_log_lines, pipeline_log_lines):
     return "\n".join(prompt_parts)
 
 
+_backfill_spent = 0.0  # seconds of date-backfill used by the current diagnose() run
+
+
+def _row_in_coverage_scope(m, bodies):
+    """Mirror the coverage check's row filter so undated counts stay comparable."""
+    if not isinstance(m, dict):
+        return False
+    if (m.get("cancelled") or m.get("superseded_by")
+            or m.get("stale") or m.get("no_assets")):
+        return False
+    if bodies and (m.get("body") or "").strip().lower() not in bodies:
+        return False
+    return True
+
+
+def count_undated_rows(slug, bodies):
+    """Count in-scope meeting rows whose date is missing or unparseable."""
+    meetings_dir = agency_meetings_dir(slug)
+    if not meetings_dir.exists():
+        return 0
+    undated = 0
+    for mdir in meetings_dir.iterdir():
+        mf = mdir / "meeting.json"
+        if not mf.exists():
+            continue
+        try:
+            m = json.loads(mf.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not _row_in_coverage_scope(m, bodies):
+            continue
+        if not (m.get("date") and normalize_date(m.get("date", ""))):
+            undated += 1
+    return undated
+
+
+def heal_undated_rows(slug, cfg, bodies, undated, diagnosis, dry_run):
+    """Backfill missing meeting dates so undated rows rejoin the coverage check.
+
+    Granicus rows can be healed from the ViewPublisher archive (or from dated
+    document filenames); other platforms have no backfill path yet, so they
+    stay a plain finding.
+    """
+    label = cfg.get("name", slug)
+    base = f"{label}: {undated} meeting row(s) have no parseable date"
+
+    if cfg.get("platform") != "granicus":
+        finding = f"{base} (excluded from coverage check)"
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+        return
+
+    if dry_run:
+        finding = f"{base} (would run granicus.py backfill-dates --agency {slug})"
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+        return
+
+    global _backfill_spent
+    remaining = DATE_BACKFILL_BUDGET_SEC - _backfill_spent
+    if remaining < 30:
+        finding = f"{base} (backfill budget spent this run; deferred to next run)"
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+        return
+    timeout = min(DATE_BACKFILL_TIMEOUT_SEC, remaining)
+
+    print(f"  BACKFILL: {label} — {undated} undated row(s), healing from archive...")
+    started = time.monotonic()
+    try:
+        result = subprocess.run(
+            ["python3", "scrapers/granicus.py", "backfill-dates", "--agency", slug],
+            capture_output=True, text=True, timeout=timeout, cwd=str(REPO_ROOT),
+        )
+    except subprocess.TimeoutExpired:
+        _backfill_spent += time.monotonic() - started
+        finding = f"{base}; backfill timed out ({timeout:.0f}s)"
+        diagnosis["findings"].append(finding)
+        print(f"  BACKFILL TIMEOUT: {label}")
+        return
+    _backfill_spent += time.monotonic() - started
+
+    if result.returncode != 0:
+        err_tail = (result.stderr or result.stdout or "").strip()[-200:]
+        finding = f"{base}; backfill failed (exit {result.returncode}): {err_tail}"
+        diagnosis["findings"].append(finding)
+        print(f"  BACKFILL FAILED: {label} — {err_tail}")
+        return
+
+    left = count_undated_rows(slug, bodies)
+    healed = undated - left
+    if healed > 0:
+        fix = f"{label}: backfilled dates on {healed} meeting row(s)"
+        diagnosis["fixes_applied"].append(fix)
+        print(f"  FIX: {fix}")
+    if left > 0:
+        finding = (f"{label}: {left} meeting row(s) still have no parseable date "
+                   f"after backfill (not in archive, no dated documents)")
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+
+
 def diagnose(dry_run=False):
     """Run full diagnosis and apply safe fixes."""
+    global _backfill_spent
+    _backfill_spent = 0.0
     now = datetime.now()
     diagnosis = {
         "timestamp": now.isoformat(),
@@ -833,9 +939,7 @@ def diagnose(dry_run=False):
             diagnosis["findings"].append(finding)
             print(f"  FINDING: {finding}")
         if undated:
-            finding = f"{cfg.get('name', slug)}: {undated} meeting row(s) have no parseable date (excluded from coverage check)"
-            diagnosis["findings"].append(finding)
-            print(f"  FINDING: {finding}")
+            heal_undated_rows(slug, cfg, bodies, undated, diagnosis, dry_run)
 
     # ─── Finding: phase errors / empty listings in latest run ───
 
