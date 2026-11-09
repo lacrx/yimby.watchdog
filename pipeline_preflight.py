@@ -105,11 +105,17 @@ def probe_escribe(cfg):
     if resp.status_code != 200:
         return False, f"HTTP {resp.status_code}"
     try:
-        data = resp.json()
-        groups = data.get("d", {}).get("MeetingGroup", [])
-        return True, f"OK ({len(groups)} meeting groups)"
+        data = resp.json().get("d", {})
     except Exception:
         return False, "response is not JSON"
+    if "Meetings" not in data:
+        return False, f"unexpected response shape (keys: {sorted(data.keys()) or 'none'})"
+    meetings = data.get("Meetings") or []
+    if not meetings:
+        return False, f"no meetings returned for body '{body_name}'"
+    total = data.get("TotalCount")
+    suffix = f" of {total} total" if total else ""
+    return True, f"OK ({len(meetings)} meetings on page 1{suffix})"
 
 
 def probe_granicus(cfg):
@@ -222,10 +228,16 @@ def probe_solana_drupal(cfg):
                 timeout=PROBE_TIMEOUT, verify=False,
                 headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
             )
-            if er.status_code == 200:
-                escribe_ok = " + eScribe OK"
-        except Exception:
-            pass
+            if er.status_code != 200:
+                escribe_ok = f" + eScribe HTTP {er.status_code}"
+            else:
+                meetings = (er.json().get("d", {}) or {}).get("Meetings") or []
+                if meetings:
+                    escribe_ok = f" + eScribe OK ({len(meetings)} meetings)"
+                else:
+                    escribe_ok = " + eScribe returned 0 meetings"
+        except Exception as e:
+            escribe_ok = f" + eScribe probe failed ({type(e).__name__})"
     return True, f"OK ({row_count} rows{escribe_ok})"
 
 

@@ -749,7 +749,11 @@ def diagnose(dry_run=False):
         "command_not_found": len(pipe_errors["command_not_found"]),
     }
 
-    print(f"  Remaining files:     {len(remaining)}")
+    if triage_skipped:
+        print(f"  Remaining files:     {len(remaining)} relevant "
+              f"({len(remaining) + triage_skipped} unextracted, {triage_skipped} triage-skip)")
+    else:
+        print(f"  Remaining files:     {len(remaining)}")
     print(f"  Auth status:         {auth_status}")
     print(f"  Failing extractions: {len(failing_files)}")
     print(f"  Last productive run: {pipe_errors['last_productive_run'] or 'unknown'}")
