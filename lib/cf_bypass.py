@@ -273,7 +273,17 @@ class CloudflareSession:
         self._ensure_browser()
         page = self._context.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=self._timeout_ms)
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=self._timeout_ms)
+            except Exception as e:
+                if "Download is starting" not in str(e):
+                    raise
+                # An attachment endpoint hands Chrome a download instead of a
+                # page, so it never renders a challenge and goto() aborts. The
+                # origin root does render one, and the cookies are per-domain.
+                root = f"{urlparse(url).scheme or 'https'}://{domain}/"
+                page.goto(root, wait_until="domcontentloaded",
+                          timeout=self._timeout_ms)
             self._wait_for_challenge(page)
 
             cookies = {}
@@ -416,7 +426,15 @@ class CloudflareSession:
         self._ensure_browser()
         domain = self._domain(url)
         if domain not in self._solved_domains:
-            self.solve(url)
+            try:
+                self.solve(url)
+            except (BrowserBusy, ImportError):
+                raise
+            except Exception as e:
+                # A failed solve is not fatal here: the fetch below may still
+                # succeed on cookies already in the context.
+                _log_once(f"solve-{domain}",
+                          f"  cf_bypass: solve failed for {domain}: {type(e).__name__}")
 
         scheme = urlparse(url).scheme or "https"
         page = self._context.new_page()
