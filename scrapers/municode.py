@@ -167,7 +167,7 @@ def _norm_body(b):
     return re.sub(r"\s+", " ", (b or "")).strip().lower()
 
 
-def reconcile_orphans(slug, meetings_dir, docs_dir):
+def reconcile_orphans(slug, meetings_dir, docs_dir, listed=None):
     """Mark unreachable duplicate rows superseded_by the row that has the docs.
 
     Municode renumbers a meeting's page slug (planning-commission-meeting-262
@@ -184,8 +184,15 @@ def reconcile_orphans(slug, meetings_dir, docs_dir):
     day or the next one. The off-by-one comes from the old listing parser
     taking the date from the adjacent table row; every orphan here that has a
     documented twin is exactly one day behind it, none are behind by two or
-    ahead by any. An orphan with no such sibling is left alone: that is a real
-    gap, not a duplicate, and hiding it would defeat the coverage check.
+    ahead by any.
+
+    An orphan with no documented twin is marked stale instead, but only on the
+    evidence of `listed` (the listing parsed in this same run): its body has to
+    appear in the listing, so a partial or failed parse cannot condemn anything,
+    and its own date has to be absent for that body. A row holding no url, no
+    documents and no place in the listing describes a meeting the portal no
+    longer says happened. Without `listed` the orphan is left alone, because a
+    real gap read as stale would defeat the coverage check.
     """
     rows = []
     for mdir in meetings_dir.iterdir():
@@ -200,7 +207,22 @@ def reconcile_orphans(slug, meetings_dir, docs_dir):
 
     documented = [(i, m) for i, _, m in rows
                   if m.get("date") and m.get("url") and has_docs(i)]
+
+    # (body, date) pairs the portal currently advertises, and the bodies it
+    # advertised at all. A body missing from the second set means this run
+    # never saw its pages, so none of its rows can be judged.
+    live_pairs, live_bodies, live_dates = set(), set(), []
+    for r in (listed or []):
+        if r.get("body") and r.get("date"):
+            live_pairs.add((_norm_body(r["body"]), r["date"]))
+            live_bodies.add(_norm_body(r["body"]))
+            live_dates.append(r["date"])
+    # The listing is cut off at a year boundary, so a row older than anything
+    # it carries is outside the evidence, not missing from it.
+    oldest_listed = min(live_dates) if live_dates else None
+
     marked = 0
+    staled = 0
     for oid, omf, om in rows:
         if om.get("url") or om.get("superseded_by") or not om.get("date"):
             continue
@@ -222,13 +244,27 @@ def reconcile_orphans(slug, meetings_dir, docs_dir):
                           f"-> {pick} on {want}")
                 break
         if pick is None:
+            body = _norm_body(om.get("body"))
+            if (oldest_listed and om["date"] >= oldest_listed
+                    and body in live_bodies
+                    and (body, om["date"]) not in live_pairs
+                    and not om.get("stale")):
+                om["stale"] = True
+                om["stale_reason"] = ("municode: no url, no documents, and no "
+                                      "listing entry for this body on this date")
+                save_json(omf, om)
+                staled += 1
+                print(f"  Stale: {oid} ({om['date']} {om.get('body')}) "
+                      f"is not in the listing")
             continue
         om["superseded_by"] = pick
         save_json(omf, om)
         marked += 1
     if marked:
         print(f"  Superseded: marked {marked} orphaned row(s) that duplicate a documented meeting")
-    return marked
+    if staled:
+        print(f"  Stale: marked {staled} orphaned row(s) the listing no longer carries")
+    return marked + staled
 
 
 def cmd_fetch(args):
@@ -342,7 +378,7 @@ def cmd_fetch(args):
         st["fetched"] = datetime.now().isoformat()
 
     state["last_fetch"] = datetime.now().isoformat()
-    reconcile_orphans(slug, meetings_dir, docs_dir)
+    reconcile_orphans(slug, meetings_dir, docs_dir, listed=listed)
     rebuild_doc_index(slug, state, docs_dir)
     save_json(state_file, state)
     log_discovery(slug, meetings_found=len(meetings), meetings_new=new_count, docs_new=doc_count)
