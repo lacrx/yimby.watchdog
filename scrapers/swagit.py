@@ -45,6 +45,89 @@ def _body_from_title(title):
     return body or None
 
 
+def _duration_seconds(text):
+    """Parse a Swagit duration string like '03h 29m' or '01m 45s' into seconds."""
+    total = 0
+    for value, unit in re.findall(r"(\d+)\s*([hms])", text or "", flags=re.I):
+        total += int(value) * {"h": 3600, "m": 60, "s": 1}[unit.lower()]
+    return total
+
+
+def _is_special(title):
+    """True for a special or closed-session listing row."""
+    return bool(re.search(r"\bspecial\b|\bclosed\b", title or "", flags=re.I))
+
+
+def _row_rank(m):
+    """Sort key deciding which same-day row owns the canonical date-only ID.
+
+    A regular meeting outranks a special/closed session, and a longer video
+    outranks a stub, so the substantive meeting keeps the plain ID. Closed
+    sessions are not broadcast, so their rows are typically under two minutes.
+    """
+    return (
+        _is_special(m.get("title")),
+        -_duration_seconds(m.get("duration")),
+        int(m["video_id"]),
+    )
+
+
+def _assign_meeting_ids(prefix, rows):
+    """Return [(row, meeting_id, sibling_ids)] with same-day collisions resolved.
+
+    Swagit routinely lists two meetings for one body on one day: a short
+    closed-session special plus the regular meeting. A date-only ID collapses
+    them onto a single record, so the second row is either skipped as
+    already-seen or clobbers the first one's agenda PDF.
+
+    A date-only ID is unique for the overwhelming majority of meetings and is
+    kept as-is so existing records stay addressable. When a body does meet
+    twice in a day, the primary row keeps the plain ID and each other row gets
+    a 'v{video_id}' suffix appended with no separator, so prefix matching on
+    '{mid}-' (used by meeting_needs_recheck and the doc index) cannot mistake
+    one meeting's documents for another's.
+    """
+    groups = {}
+    for m in rows:
+        groups.setdefault((m["effective_body"], m["date"]), []).append(m)
+
+    assigned = []
+    for (body, dt), group in groups.items():
+        base = make_meeting_id(prefix, body, dt)
+        ordered = sorted(group, key=_row_rank)
+        ids = [base] + [f"{base}v{m['video_id']}" for m in ordered[1:]]
+        for idx, (m, mid) in enumerate(zip(ordered, ids)):
+            m["_same_day_primary"] = idx == 0
+            assigned.append((m, mid, [i for i in ids if i != mid]))
+
+    assigned.sort(key=lambda t: (-t[0]["date"].timestamp(), _row_rank(t[0])))
+    return assigned
+
+
+def _supersede_stale_docs(docs_dir, mid):
+    """Move this scraper's agenda files for mid aside when they belong to another video.
+
+    Used when a date-only ID previously resolved to a different meeting, so the
+    wrong agenda text is not left attached to the ID. Only the agenda files
+    this scraper produces are moved, including the pre-split '-agenda-partNN'
+    chunks, which extraction reads directly and would otherwise be left behind
+    describing the wrong meeting. Documents other scrapers filed under the same
+    ID (action agendas, minutes) are left alone, since nothing here can
+    regenerate them. Files are moved to documents/_superseded/ rather than
+    deleted. These globs cannot match a sibling's '{mid}v{video_id}-*' files.
+    """
+    stale = sorted(
+        set(docs_dir.glob(f"{mid}-agenda.*")) | set(docs_dir.glob(f"{mid}-agenda-part*"))
+    )
+    if not stale:
+        return 0
+    attic = docs_dir / "_superseded"
+    attic.mkdir(exist_ok=True)
+    for f in stale:
+        f.rename(attic / f.name)
+    return len(stale)
+
+
 def get_agency_config(slug):
     cfg = load_agencies(enabled_only=False).get(slug)
     if not cfg:
@@ -230,6 +313,18 @@ def cmd_fetch(args):
     new_count = 0
     doc_count = 0
 
+    # video_id -> every meeting_id already claiming it on disk. Used to tell a
+    # contested ID (whose previous video now has a record of its own) from a
+    # genuine mismatch that nothing explains. It has to be a set of owners, not
+    # one: the stale record under examination still claims its old video, so
+    # asking "who owns it" would just name that record back.
+    video_owner = {}
+    for mdir in sorted(p for p in meetings_dir.iterdir() if p.is_dir()):
+        meta_on_disk = load_json(mdir / "meeting.json") or {}
+        vid = meta_on_disk.get("video_id")
+        if vid:
+            video_owner.setdefault(str(vid), set()).add(mdir.name)
+
     bodies_config = cfg.get("bodies", [])
     archive_slugs = cfg.get("swagit_archive_slugs", {})
 
@@ -253,52 +348,102 @@ def cmd_fetch(args):
                 else:
                     slugs_to_scrape.append(archive_slug)
 
+        # Collect every listing row for this body before minting IDs, so a body
+        # that meets twice on one day gets one record per meeting instead of
+        # one row silently displacing the other.
+        rows = []
+        seen_videos = set()
         for current_slug in slugs_to_scrape:
             for m in paginate_body(base_url, view_id, current_slug, cutoff):
-                meeting_count += 1
-                dt = m["date"]
+                if m["video_id"] in seen_videos:
+                    continue
+                seen_videos.add(m["video_id"])
                 # For mixed-body slugs, derive body from meeting title
-                effective_body = _body_from_title(m["title"]) or body_name
-                mid = make_meeting_id(prefix, effective_body, dt)
-                mdir = meetings_dir / mid
-                mdir.mkdir(exist_ok=True)
+                m["effective_body"] = _body_from_title(m["title"]) or body_name
+                rows.append(m)
+                meeting_count += 1
 
-                meeting_file = mdir / "meeting.json"
-                if not meeting_file.exists():
-                    meta = {
-                        "body": effective_body,
-                        "date": dt.strftime("%m/%d/%Y"),
-                        "title": f"{effective_body} — {dt.strftime('%b %d, %Y')}",
-                        "id": mid,
-                        "source": "swagit",
-                        "agency": slug,
-                        "video_id": m["video_id"],
-                        "video_url": f"{base_url}/videos/{m['video_id']}",
-                        "duration": m["duration"],
-                    }
-                    save_json(meeting_file, meta)
-                    new_count += 1
-                    print(f"    NEW: {effective_body} — {dt.strftime('%Y-%m-%d')}")
+        for m, mid, siblings in _assign_meeting_ids(prefix, rows):
+            dt = m["date"]
+            effective_body = m["effective_body"]
+            if siblings:
+                print(f"    SAME-DAY: {effective_body} — {dt.strftime('%Y-%m-%d')} "
+                      f"video {m['video_id']} ({m['duration']}) -> {mid}")
+            mdir = meetings_dir / mid
+            mdir.mkdir(exist_ok=True)
 
-                if mid in state["meetings"] and not getattr(args, "force", False):
-                    if not meeting_needs_recheck(mid, docs_dir, dt.strftime("%m/%d/%Y")):
-                        continue
-                    print(f"    RECHECK: {effective_body} — {dt.strftime('%Y-%m-%d')} (no documents yet)")
+            meta = {
+                "body": effective_body,
+                "date": dt.strftime("%m/%d/%Y"),
+                "title": f"{effective_body} — {dt.strftime('%b %d, %Y')}",
+                "id": mid,
+                "source": "swagit",
+                "agency": slug,
+                "video_id": m["video_id"],
+                "video_url": f"{base_url}/videos/{m['video_id']}",
+                "duration": m["duration"],
+            }
+            if siblings:
+                meta["same_day_meetings"] = siblings
+                meta["same_day_role"] = "primary" if m.get("_same_day_primary") else "additional"
 
-                pdf_name = f"{mid}-agenda.pdf"
-                pdf_path = docs_dir / pdf_name
-                if download_agenda_pdf(base_url, m["video_id"], pdf_path):
-                    text = extract_text(pdf_path)
-                    if text:
-                        doc_count += 1
-                    time.sleep(0.3)
+            meeting_file = mdir / "meeting.json"
+            existing = load_json(meeting_file) or {}
+            if not existing:
+                save_json(meeting_file, meta)
+                new_count += 1
+                print(f"    NEW: {effective_body} — {dt.strftime('%Y-%m-%d')}")
+            elif not existing.get("video_id"):
+                # Metadata predates video_id tracking. Backfill the field only;
+                # the documents already on disk are this meeting's.
+                save_json(meeting_file, {**meta, **{k: v for k, v in existing.items() if v}})
+            elif existing.get("video_id") != m["video_id"] and (
+                siblings
+                or any(o != mid for o in video_owner.get(str(existing["video_id"]), ()))
+            ):
+                # A contested date-only ID that used to resolve to a different
+                # meeting. Either the listing says another meeting shares this
+                # body and date, or the video this ID used to describe now has a
+                # record of its own (the archive slugs title some rows
+                # differently, e.g. "City Council Closed", which mints a second
+                # ID for what used to collide). Either way the old occupant is
+                # safely homed elsewhere, so re-file this ID and move the wrong
+                # agenda text aside so the right one is fetched.
+                moved = _supersede_stale_docs(docs_dir, mid)
+                save_json(meeting_file, meta)
+                state["meetings"].pop(mid, None)
+                print(f"    REPAIR: {mid} was video {existing.get('video_id')}, "
+                      f"now video {m['video_id']} ({moved} stale agenda files superseded)")
+            elif existing.get("video_id") != m["video_id"]:
+                # Unexplained: the video this ID describes is not accounted for
+                # anywhere else. Touch nothing at all — not the metadata, not
+                # the agenda, not the state entry. Updating only some of those
+                # is how meeting.json and state.json end up disagreeing.
+                print(f"    WARNING: {mid} metadata says video {existing.get('video_id')}, "
+                      f"listing says {m['video_id']}, and nothing explains it; skipped entirely")
+                continue
+            elif existing.get("same_day_meetings") != meta.get("same_day_meetings"):
+                save_json(meeting_file, {**existing, **meta})
 
-                state["meetings"][mid] = {
-                    "fetched": datetime.now().isoformat(),
-                    "body": effective_body,
-                    "video_id": m["video_id"],
-                    "date": dt.strftime("%m/%d/%Y"),
-                }
+            if mid in state["meetings"] and not getattr(args, "force", False):
+                if not meeting_needs_recheck(mid, docs_dir, dt.strftime("%m/%d/%Y")):
+                    continue
+                print(f"    RECHECK: {effective_body} — {dt.strftime('%Y-%m-%d')} (no documents yet)")
+
+            pdf_name = f"{mid}-agenda.pdf"
+            pdf_path = docs_dir / pdf_name
+            if download_agenda_pdf(base_url, m["video_id"], pdf_path):
+                text = extract_text(pdf_path)
+                if text:
+                    doc_count += 1
+                time.sleep(0.3)
+
+            state["meetings"][mid] = {
+                "fetched": datetime.now().isoformat(),
+                "body": effective_body,
+                "video_id": m["video_id"],
+                "date": dt.strftime("%m/%d/%Y"),
+            }
 
         print(f"    {meeting_count} meetings")
         time.sleep(0.5)

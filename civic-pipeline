@@ -203,10 +203,21 @@ log "Preflight done."
 # ── 1a: Fetch meeting documents (all enabled agencies) ──
 AGENCY_LIST=$(load_list "Meeting fetch" "
 import math, yaml
+from datetime import date
 cfg = yaml.safe_load(open('agencies.yaml'))
+today = date.today()
 for slug, a in cfg['agencies'].items():
     if a.get('enabled', True):
         lb = a.get('lookback_months')
+        # history_start is an absolute floor: how far back we intend to hold
+        # this agency. A rolling lookback_months window cannot express that —
+        # its start date creeps forward every night, so history silently falls
+        # out of range. Whichever reaches further back wins.
+        hs = a.get('history_start')
+        if hs:
+            hs = hs if isinstance(hs, date) else date.fromisoformat(str(hs))
+            months = (today.year - hs.year) * 12 + today.month - hs.month
+            lb = max(lb or 0, months)
         # Floor at 3 months so the listing still covers the 90-day recheck
         # window (civic_utils.RECHECK_DAYS) for late-posted documents.
         lb = max(lb, 3) if lb else lb

@@ -75,6 +75,11 @@ def get_video_duration(url):
     return None
 
 
+# Long meetings are large: a muxed 720p stream for a 3.5h council meeting is
+# ~6.5GB. Overridable so a batch run can cap it.
+DOWNLOAD_TIMEOUT = int(os.environ.get("TRANSCRIBE_DOWNLOAD_TIMEOUT", "5400"))
+
+
 def download_audio(url, output_path):
     """Download audio from YouTube video as MP3."""
     if output_path.exists() and output_path.stat().st_size > 0:
@@ -89,10 +94,17 @@ def download_audio(url, output_path):
                 "--js-runtimes", "node",
                 "-x", "--audio-format", "mp3",
                 "--audio-quality", "5",  # lower quality = smaller file
+                # Swagit serves one muxed HLS rendition with no audio-only
+                # format, so a 3.5h meeting is ~6.5GB on the wire before -x
+                # throws the video away. Fetch fragments in parallel and allow
+                # for it: the old fixed 600s timeout killed exactly that case
+                # mid-download, reporting only "Download timed out".
+                "--concurrent-fragments", "5",
+                "--continue",
                 "-o", str(output_path.with_suffix(".%(ext)s")),
                 url,
             ],
-            capture_output=True, text=True, timeout=600,
+            capture_output=True, text=True, timeout=DOWNLOAD_TIMEOUT,
         )
         if result.returncode != 0:
             print(f"  yt-dlp error: {result.stderr[:200]}")

@@ -120,16 +120,57 @@ MAX_FAIL_RETRIES = 3   # auto-skip after this many extraction failures
 FAILURE_STATE_FILE = None  # set in cmd_extract() after STRUCTURED_DIR is available
 
 
-def get_meeting_meta(doc_path):
-    """Try to find meeting metadata for a document."""
-    stem = doc_path.stem
-    mid = stem.split("-")[0]
+def resolve_meeting_id(stem):
+    """Meeting ID for a document or transcript stem, or the stem's first dash-part.
 
-    for meetings_dir in all_meetings_dirs():
-        meta_file = meetings_dir / mid / "meeting.json"
+    Hash-based IDs contain no dash, so splitting on the first one worked for
+    them and silently truncated slug-based IDs to the agency prefix (every
+    Carlsbad record used to be filed under `cb`). Match the longest known
+    meeting ID the stem starts with instead.
+    """
+    stem = stem.replace("-transcript", "")
+    best = None
+    for mid in _meeting_dirs_by_id():
+        if stem == mid or stem.startswith(mid + "-"):
+            if best is None or len(mid) > len(best):
+                best = mid
+    return best or stem.split("-")[0]
+
+
+_MEETING_DIR_CACHE = None
+
+
+def _meeting_dirs_by_id():
+    """Map meeting_id -> meeting directory, built once per run."""
+    global _MEETING_DIR_CACHE
+    if _MEETING_DIR_CACHE is None:
+        index = {}
+        for meetings_dir in all_meetings_dirs():
+            if not meetings_dir.exists():
+                continue
+            for mdir in meetings_dir.iterdir():
+                if mdir.is_dir():
+                    index.setdefault(mdir.name, mdir)
+        _MEETING_DIR_CACHE = index
+    return _MEETING_DIR_CACHE
+
+
+def get_meeting_meta(doc_path):
+    """Try to find meeting metadata for a document.
+
+    Document filenames are '{meeting_id}-{document name}'. Hash-based meeting
+    IDs contain no dash, but slug-based ones do (cb-city-council-20261110), so
+    splitting on the first dash yielded just the agency prefix and never
+    matched a meeting directory. Match the longest meeting ID that the filename
+    starts with instead.
+    """
+    index = _meeting_dirs_by_id()
+    mid = resolve_meeting_id(doc_path.stem)
+    mdir = index.get(mid)
+    if mdir:
+        meta_file = mdir / "meeting.json"
         if meta_file.exists():
             return json.loads(meta_file.read_text())
-
     return {}
 
 
@@ -1402,7 +1443,7 @@ def cmd_extract(args):
                     partial = getattr(e, 'partial_result', None)
                     if partial:
                         if not partial.get("meeting_id"):
-                            mid = sf.stem.replace("-transcript", "").split("-")[0]
+                            mid = resolve_meeting_id(sf.stem)
                             partial["meeting_id"] = mid
                         partial["_source"] = sf.name
                         partial["_source_type"] = source_type
@@ -1450,7 +1491,7 @@ def cmd_extract(args):
 
                 if record:
                     if not record.get("meeting_id"):
-                        mid = sf.stem.replace("-transcript", "").split("-")[0]
+                        mid = resolve_meeting_id(sf.stem)
                         record["meeting_id"] = mid
                     if not record.get("date"):
                         idx_date = doc_index.get(sf.name, "")

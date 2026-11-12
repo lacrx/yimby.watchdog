@@ -559,7 +559,12 @@ def _match_meeting_id(filename, meeting_ids):
 
 
 def _date_from_meeting_id(mid):
-    """Extract YYYY-MM-DD from meeting IDs like cb-body-20260623 or ccc-2022-02."""
+    """Extract YYYY-MM-DD from meeting IDs like cb-body-20260623 or ccc-2022-02.
+
+    Tolerates the 'v{video_id}' suffix that marks the second and later meetings
+    of one body on one day (e.g. cb-city-council-20261110v408378).
+    """
+    mid = re.sub(r"v\d+$", "", mid)
     m = re.search(r"(\d{4})(\d{2})(\d{2})$", mid)
     if m:
         return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"

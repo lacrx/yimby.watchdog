@@ -48,6 +48,11 @@ agencies:
 
   carlsbad:
     name: City of Carlsbad
+    # Absolute floor for how far back we hold this agency, not a rolling
+    # window. Carlsbad had no lookback at all, so it silently inherited the
+    # global 1-year default, which is why same-day meetings older than that
+    # stayed missing after the ID-collision fix.
+    history_start: '2020-01-01'
     region: north_county_coastal
     platform: swagit
     base_url: https://carlsbadca.new.swagit.com
