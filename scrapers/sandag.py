@@ -134,7 +134,8 @@ def extract_document_urls(meeting_data, escribe_base):
     }
 
 
-def normalize_meeting(api_meeting, slug, agency_name, body_name, escribe_base):
+def normalize_meeting(api_meeting, slug, agency_name, body_name, escribe_base,
+                      force_cancelled=False):
     """Convert eScribe API meeting to standard meeting.json format."""
     dt = parse_escribe_date(api_meeting.get("Start", ""))
     if not dt:
@@ -144,7 +145,8 @@ def normalize_meeting(api_meeting, slug, agency_name, body_name, escribe_base):
     mid = make_meeting_id(slug, body_name, date_str)
     urls = extract_document_urls(api_meeting, escribe_base)
 
-    cancelled = bool(api_meeting.get("Cancelled")) or urls["cancelled_by_doc"]
+    cancelled = (bool(api_meeting.get("Cancelled")) or urls["cancelled_by_doc"]
+                 or force_cancelled)
 
     meeting = {
         "id": mid,
@@ -164,15 +166,21 @@ def normalize_meeting(api_meeting, slug, agency_name, body_name, escribe_base):
     return meeting
 
 
-def fetch_past_meetings(session, escribe_base, slug, agency_name, body_name, min_year):
-    """Paginate PastMeetings API, filter by year. Cancelled meetings are kept, flagged."""
+def fetch_past_meetings(session, escribe_base, slug, agency_name, body_name, min_year,
+                        meeting_type=None, force_cancelled=False):
+    """Paginate PastMeetings API, filter by year. Cancelled meetings are kept, flagged.
+
+    meeting_type is the eScribe listing filter to query; it defaults to body_name.
+    They differ for cancellation-notice types (see cancellation_types), where the
+    rows belong under the body's own name but live behind another filter.
+    """
     past_url = f"{escribe_base}/MeetingsCalendarView.aspx/PastMeetings"
     all_meetings = []
     page = 1
 
     while True:
         resp = session.post(past_url, json={
-            "type": body_name,
+            "type": meeting_type or body_name,
             "pageNumber": page,
         }, timeout=30)
         resp.raise_for_status()
@@ -189,7 +197,8 @@ def fetch_past_meetings(session, escribe_base, slug, agency_name, body_name, min
             if year and year < min_year:
                 oldest_year = year
                 continue
-            normalized = normalize_meeting(m, slug, agency_name, body_name, escribe_base)
+            normalized = normalize_meeting(m, slug, agency_name, body_name, escribe_base,
+                                           force_cancelled=force_cancelled)
             if normalized:
                 all_meetings.append(normalized)
             if year:
@@ -205,6 +214,37 @@ def fetch_past_meetings(session, escribe_base, slug, agency_name, body_name, min
         time.sleep(0.3)
 
     return all_meetings
+
+
+def cancellation_types(session, escribe_base, body_name, cache={}):
+    """eScribe listing filters that carry cancellations of `body_name`.
+
+    A cancelled meeting is often not the regular row with Cancelled=true: the
+    clerk files it under its own meeting type ("Cancellation Notice of a
+    Regular City Council Meeting"), which the body filter never returns. The
+    meeting then looks like a date the agency simply skipped, and the doctor
+    reports the scraper as blocked (National City, 2026-11-03).
+
+    The type list comes from the calendar page's filter dropdown, once per
+    base_url per run. A page that cannot be read yields no extra types — the
+    regular listing still runs — so discovery failing degrades to today's
+    behaviour rather than failing the scrape.
+    """
+    if escribe_base not in cache:
+        try:
+            resp = session.get(f"{escribe_base}/?Year={datetime.now().year}", timeout=30)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "lxml")
+            cache[escribe_base] = [o.get_text(strip=True)
+                                   for o in soup.select("select option")
+                                   if o.get_text(strip=True)]
+        except Exception as e:
+            print(f"  WARNING: could not read meeting-type list ({e}); "
+                  f"cancellation notices filed under their own type will be missed")
+            cache[escribe_base] = []
+    want = body_name.strip().lower()
+    return [t for t in cache[escribe_base]
+            if CANCEL_RE.search(t) and want in t.lower() and t.strip() != body_name.strip()]
 
 
 def fetch_meeting_items(session, escribe_base, escribe_id):
@@ -270,6 +310,24 @@ def cmd_fetch(args):
         print(f"    {len(meetings)} meetings since {min_year}")
         total += len(meetings)
         all_meetings.extend((body_name, m) for m in meetings)
+
+        for cancel_type in cancellation_types(session, escribe_base, body_name):
+            cancelled = fetch_past_meetings(session, escribe_base, slug, agency_name,
+                                            body_name, min_year,
+                                            meeting_type=cancel_type, force_cancelled=True)
+            if cancelled:
+                print(f"    {len(cancelled)} cancelled ({cancel_type})")
+            all_meetings.extend((body_name, m) for m in cancelled)
+
+    # One row per meeting id: a real meeting always beats a cancellation notice
+    # for the same body and date, whichever listing produced it first.
+    by_id = {}
+    for body_name, m in all_meetings:
+        prev = by_id.get(m["id"])
+        if prev is None or (prev[1].get("cancelled") and not m.get("cancelled")):
+            by_id[m["id"]] = (body_name, m)
+    all_meetings = list(by_id.values())
+    total = len(all_meetings)
 
     # Newest first across all bodies: eScribe downloads are intermittently
     # blocked, so an open window should go to the most recent documents.

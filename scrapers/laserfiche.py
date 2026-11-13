@@ -35,6 +35,7 @@ RECHECK_DAYS = getattr(civic_utils, "RECHECK_DAYS", 90)
 PORTAL_BASE = "https://portal.laserfiche.com/Portal"
 
 YEAR_RE = re.compile(r'(\d{4})')
+CANCEL_RE = re.compile(r"cancel", re.IGNORECASE)
 DECADE_RE = re.compile(r'(\d{4})-(\d{4})')
 
 
@@ -262,7 +263,18 @@ def cmd_fetch(args):
                 }
             meetings[mid]["docs"].append((entry_id, doc_name))
 
-        print(f"    {len(meetings)} meetings")
+        # Laserfiche has no cancelled flag: the clerk says so in the document name
+        # ("Agenda Packet 2026 06-02 Cancelled"). Record it rather than letting the
+        # row count as a held meeting with a packet.
+        cancelled_count = 0
+        for meeting in meetings.values():
+            names = [n for _, n in meeting["docs"]]
+            if names and all(CANCEL_RE.search(n) for n in names):
+                meeting["cancelled"] = True
+                cancelled_count += 1
+
+        print(f"    {len(meetings)} meetings" +
+              (f" ({cancelled_count} cancelled)" if cancelled_count else ""))
 
         for mid, meeting in sorted(meetings.items()):
             mdir = meetings_dir / mid

@@ -35,7 +35,8 @@ sys.path.insert(0, str(REPO_ROOT))
 import requests
 from bs4 import BeautifulSoup
 import civic_utils
-from civic_utils import agency_data_dir, rebuild_doc_index, log_discovery
+from civic_utils import (agency_data_dir, rebuild_doc_index, log_discovery,
+                         normalize_date)
 
 RECHECK_DAYS = getattr(civic_utils, "RECHECK_DAYS", 90)
 
@@ -333,6 +334,68 @@ def mark_superseded_hash_rows():
     return marked
 
 
+def mark_stale_orphans(listed):
+    """Mark stored rows the Legistar calendar no longer carries.
+
+    The calendar briefly advertises a meeting that is then moved or withdrawn
+    (City Council 11/5/2026 3:30 PM, replaced by 11/4). The row it left behind
+    has no detail, agenda or minutes link, so no later run can ever reach it,
+    and the hash id means the real meeting lands in a different row. It then
+    reads as a meeting whose packet was never posted.
+
+    `listed` is the listing parsed in this same run, and absence from it is the
+    only test: the row's body must appear in the listing (so a partial or failed
+    parse condemns nothing), its date must fall inside the listing's own range
+    (so an older row is outside the evidence rather than missing from it), and
+    the body+date pair must not be listed. Rows with any url, any document, or
+    a superseded_by marker are left alone.
+    """
+    live_pairs, live_bodies, live_dates = set(), set(), []
+    for r in listed or []:
+        body, date = _norm_body(r.get("body")), (r.get("date") or "").strip()
+        if body and date:
+            live_pairs.add((body, date))
+            live_bodies.add(body)
+            live_dates.append(normalize_date(date) or "")
+    live_dates = [d for d in live_dates if d]
+    if not live_dates:
+        return 0
+    oldest_listed = min(live_dates)
+
+    doc_names = sorted(f.name for f in DOCS_DIR.iterdir()) if DOCS_DIR.exists() else []
+    staled = 0
+    for mdir in MEETINGS_DIR.iterdir():
+        mf = mdir / "meeting.json"
+        if not mf.exists():
+            continue
+        try:
+            m = json.loads(mf.read_text())
+        except (ValueError, OSError):
+            continue
+        if not isinstance(m, dict) or m.get("stale") or m.get("superseded_by"):
+            continue
+        if m.get("detail_url") or m.get("agenda_url") or m.get("minutes_url"):
+            continue
+        date = (m.get("date") or "").strip()
+        norm = normalize_date(date) if date else None
+        if not norm or norm < oldest_listed:
+            continue
+        body = _norm_body(m.get("body"))
+        if body not in live_bodies or (body, date) in live_pairs:
+            continue
+        if any(n.startswith(f"{mdir.name}-") for n in doc_names):
+            continue
+        m["stale"] = True
+        m["stale_reason"] = ("legistar: no detail/agenda/minutes link, no documents, "
+                             "and no calendar entry for this body on this date")
+        mf.write_text(json.dumps(m, indent=2))
+        staled += 1
+        print(f"  Stale: {mdir.name} ({date} {m.get('body')}) is not in the calendar")
+    if staled:
+        print(f"  Stale: marked {staled} row(s) the calendar no longer carries")
+    return staled
+
+
 def cmd_fetch(args):
     """Fetch latest meetings and download documents."""
     ensure_dirs()
@@ -475,6 +538,7 @@ def cmd_fetch(args):
         print(f"\nSkipped {skipped} previously fetched meetings (unchanged)")
 
     mark_superseded_hash_rows()
+    mark_stale_orphans(meetings)
     state["last_fetch"] = datetime.now().isoformat()
     rebuild_doc_index("oceanside", state, DOCS_DIR)
     save_state(state)

@@ -186,7 +186,21 @@ class AuthError(Exception):
 
 _REFUSAL_PHRASES = ("can't help with this", "cannot help with this",
                     "i can't assist", "i cannot assist")
+# Classifier-level block, not a per-document refusal and not a limit:
+#   "API Error: Opus 5's safeguards flagged this message
+#    (https://www.anthropic.com/legal/aup)."
+# It arrives on stdout with exit code 1, so without this it reads as a generic
+# exit_code failure: retried twice per chunk, every chunk, every document, until
+# the circuit breaker halts the run. Retrying never helps — the same bytes get
+# flagged again — and the block is often session-wide rather than about the doc.
+_SAFEGUARD_PHRASES = ("safeguards flagged", "/legal/aup")
+# "You've hit your 5-hour limit · resets 5am (America/Los_Angeles)" is the
+# phrasing the CLI actually used on 2026-11-13, and none of the older phrases
+# matched it: it was read as a generic exit_code failure, retried twice per
+# chunk, and counted toward the circuit breaker instead of pausing the run.
 _RATE_LIMIT_PHRASES = ("session limit", "rate limit", "you've reached",
+                       "you've hit your", "-hour limit", "usage limit",
+                       "weekly limit", "limit · resets", "limit - resets",
                        "start a new session", "new session to continue")
 
 
@@ -262,6 +276,12 @@ def _call_claude(prompt, max_retries=2, schema=None):
                 # Confirmed only when stdout is not JSON at all.
                 if not stdout_is_json and any(p in combined_lower for p in _REFUSAL_PHRASES):
                     return None, "content_refused"
+
+                # Safeguard block: never retried (deterministic), never permanently
+                # skipped (may be session-wide). Caller stops the run if it repeats.
+                if not stdout_is_json and any(p in combined_lower for p in _SAFEGUARD_PHRASES):
+                    print(f"  Safeguards flagged the request: {(clean_out.strip() or clean_err.strip())[:200]}")
+                    return None, "safeguard_flagged"
 
                 # Real limit messages are short, non-JSON text (e.g. "You've hit your
                 # session limit · resets 6am"). With rc 0, require non-JSON and short output.
@@ -521,7 +541,7 @@ def extract_structured(text, meeting_meta, cache_path=None):
             results[ci] = {"error": err}
             print(f"  chunk {ci+1}/{len(chunks)} failed: {err}")
         _save_chunk_cache(cache_path, fingerprint, results)
-        if not record and err == "exit_code_empty":
+        if not record and err in ("exit_code_empty", "safeguard_flagged"):
             break
         time.sleep(1)
 
@@ -541,6 +561,10 @@ def extract_structured(text, meeting_meta, cache_path=None):
         if failed_chunks:
             merged["_partial"] = True
             merged["_failed_chunks"] = failed_chunks
+            if "safeguard_flagged" in errors:
+                # Saved as partial, but the caller still needs to know the run
+                # is being blocked so it can stop instead of flagging every doc.
+                return merged, "safeguard_flagged"
         else:
             merged.pop("_partial", None)
             merged.pop("_failed_chunks", None)
@@ -1217,9 +1241,15 @@ def save_failure_state(state):
     _failure_state_path().write_text(json.dumps(state, indent=2, default=str))
 
 
-def record_failure(state, filename, error_category, queue=None):
+def record_failure(state, filename, error_category, queue=None, count=True):
+    """Record a failure. count=False logs it without advancing the auto-skip
+    counter — for failures that are not the document's fault (a session-wide
+    safeguard block), where auto-skipping would bury good documents."""
     entry = state.get(filename, {})
-    entry["fail_count"] = entry.get("fail_count", 0) + 1
+    if count:
+        entry["fail_count"] = entry.get("fail_count", 0) + 1
+    else:
+        entry.setdefault("fail_count", 0)
     if "first_failed" not in entry:
         entry["first_failed"] = datetime.now().isoformat()
     entry["last_failed"] = datetime.now().isoformat()
@@ -1345,8 +1375,10 @@ def cmd_extract(args):
     failure_skipped = 0
     triage_skipped = 0
     consecutive_failures = 0
+    consecutive_safeguards = 0
     auth_failure_count = 0
     MAX_CONSECUTIVE_FAILURES = 5
+    MAX_CONSECUTIVE_SAFEGUARDS = 3
     MAX_AUTH_RETRIES = 2
 
     i = 0
@@ -1489,6 +1521,11 @@ def cmd_extract(args):
                     i += 1
                     continue
 
+                if error_cat == "safeguard_flagged":
+                    consecutive_safeguards += 1
+                else:
+                    consecutive_safeguards = 0
+
                 if record:
                     if not record.get("meeting_id"):
                         mid = resolve_meeting_id(sf.stem)
@@ -1515,6 +1552,15 @@ def cmd_extract(args):
                     else:
                         clear_failure(failure_state, sf.name)
                         print(f"  OK ({len(text)} chars, {len(record.get('votes',[]))}v {len(record.get('housing_items',[]))}h)")
+                elif error_cat == "safeguard_flagged":
+                    # Not the document's fault unless it is the only one flagged:
+                    # the first in a row counts toward auto-skip, a streak does not,
+                    # because a streak means the block is session-wide.
+                    failed += 1
+                    record_failure(failure_state, sf.name, error_cat, queue=queue,
+                                   count=(consecutive_safeguards == 1))
+                    fc = failure_state[sf.name]["fail_count"]
+                    print(f"  FAILED (safeguard_flagged, attempt {fc}/{MAX_FAIL_RETRIES})")
                 else:
                     failed += 1
                     consecutive_failures += 1
@@ -1535,6 +1581,15 @@ def cmd_extract(args):
                         print(f"  Stopping — something is broken (auth, network, CLI).")
                         print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
                         break
+
+                if consecutive_safeguards >= MAX_CONSECUTIVE_SAFEGUARDS:
+                    remaining = len(to_process) - i - 1
+                    print(f"\n  Safeguards flagged {consecutive_safeguards} documents in a row.")
+                    print(f"  Stopping — the block looks session-wide, not document-specific.")
+                    print(f"  Nothing was permanently skipped; rerun later or check "
+                          f"`claude -p \"test\"`.")
+                    print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
+                    break
 
                 auth_failure_count = 0  # reset on any successful claude call
                 time.sleep(1)

@@ -365,6 +365,34 @@ def _count_remaining():
     return remaining, triage_skipped
 
 
+def _newest_meeting_row(slug):
+    """Newest date across an agency's meeting rows, including cancelled rows and
+    meetings still in the future. Ghost rows (stale, superseded) do not count.
+
+    Documents alone cannot tell a blocked scraper from a quiet council: a cancelled
+    meeting files no packet, and a scheduled one is dated ahead of today, so both
+    read as silence. A fresh meeting row is proof the listing was reached.
+    """
+    meetings_dir = agency_meetings_dir(slug)
+    if not meetings_dir.exists():
+        return ""
+    newest = ""
+    for mdir in meetings_dir.iterdir():
+        mf = mdir / "meeting.json"
+        if not mf.exists():
+            continue
+        try:
+            m = json.loads(mf.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(m, dict) or m.get("stale") or m.get("superseded_by"):
+            continue
+        d = normalize_date(m.get("date", "")) if m.get("date") else None
+        if d and d > newest:
+            newest = d
+    return newest
+
+
 def find_stale_agencies(max_age_days=30):
     """Agencies that stopped producing dated meeting documents.
 
@@ -394,6 +422,11 @@ def find_stale_agencies(max_age_days=30):
             hist = [datetime.strptime(d, "%Y-%m-%d").date() for d in dates if d >= year_ago]
             gaps = sorted((b - a).days for a, b in zip(hist, hist[1:]))
             if len(gaps) >= 4 and gaps[len(gaps) // 2] <= CADENCE_QUIET_DAYS:
+                # A meeting row newer than the quiet cutoff — a cancellation, or a
+                # meeting already on the calendar — means the listing was read fine
+                # and the gap belongs to the council, not the scraper.
+                if _newest_meeting_row(slug) > quiet_cutoff:
+                    continue
                 stale.append((name, newest,
                               f"normally meets every ~{gaps[len(gaps) // 2]}d but silent >{CADENCE_QUIET_DAYS}d"))
     return stale
