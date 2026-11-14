@@ -65,6 +65,24 @@ def create_session():
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) yimby-watchdog/1.0",
         "Content-Type": "application/json",
     })
+    # eScribe drops a request every so often: Coronado's PastMeetings POST read
+    # timed out on 2026-11-14 and took the whole agency's fetch down with a
+    # traceback (rc=1), while the same URL answered fine minutes later. POST is
+    # in allowed_methods because every eScribe endpoint we call is a read-only
+    # query that happens to use POST, so a retry has no side effect.
+    retry = urllib3.util.retry.Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=2,  # 0s, 2s, 4s between attempts
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adapter = requests.adapters.HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
     return session
 
 
@@ -306,15 +324,29 @@ def cmd_fetch(args):
     all_meetings = []
     for body_name in bodies:
         print(f"  {body_name}...")
-        meetings = fetch_past_meetings(session, escribe_base, slug, agency_name, body_name, min_year)
+        try:
+            meetings = fetch_past_meetings(session, escribe_base, slug, agency_name, body_name, min_year)
+        except requests.RequestException as e:
+            # Retries already exhausted in create_session. One ERROR line beats a
+            # 30-line traceback, which the doctor counts as 7 separate errors.
+            print(f"ERROR: {agency_name}: listing fetch failed for {body_name}: "
+                  f"{type(e).__name__}: {str(e)[:200]}")
+            sys.exit(1)
         print(f"    {len(meetings)} meetings since {min_year}")
         total += len(meetings)
         all_meetings.extend((body_name, m) for m in meetings)
 
         for cancel_type in cancellation_types(session, escribe_base, body_name):
-            cancelled = fetch_past_meetings(session, escribe_base, slug, agency_name,
-                                            body_name, min_year,
-                                            meeting_type=cancel_type, force_cancelled=True)
+            try:
+                cancelled = fetch_past_meetings(session, escribe_base, slug, agency_name,
+                                                body_name, min_year,
+                                                meeting_type=cancel_type, force_cancelled=True)
+            except requests.RequestException as e:
+                # Not swallowed: dropping this listing silently would make a
+                # cancelled meeting look like a date the agency never met on.
+                print(f"ERROR: {agency_name}: cancellation listing failed for "
+                      f"{cancel_type}: {type(e).__name__}: {str(e)[:200]}")
+                sys.exit(1)
             if cancelled:
                 print(f"    {len(cancelled)} cancelled ({cancel_type})")
             all_meetings.extend((body_name, m) for m in cancelled)

@@ -1546,9 +1546,19 @@ def cmd_extract(args):
                     clear_skip_marker(sf)  # drop a stale marker that has_skip_marker ignored
                     if record.get("_partial"):
                         # Saved, but not done: needs_reextraction retries it next run.
-                        record_failure(failure_state, sf.name, "partial_chunks", queue=queue)
+                        # A partial caused by a safeguard block is not the document's
+                        # fault, and follows the same rule as a fully-flagged doc: the
+                        # first in a row counts toward auto-skip, a streak does not.
+                        # Counting a streak buried three good Carlsbad agenda parts at
+                        # fail_count 2/3 on 2026-11-13..14 for a session-wide block.
+                        counts = (error_cat != "safeguard_flagged"
+                                  or consecutive_safeguards == 1)
+                        record_failure(failure_state, sf.name, "partial_chunks",
+                                       queue=queue, count=counts)
+                        why = "" if counts else ", not counted (session-wide block)"
                         print(f"  PARTIAL ({record.get('_failed_chunks', '?')} chunk(s) failed, "
-                              f"{len(record.get('votes',[]))}v {len(record.get('housing_items',[]))}h)")
+                              f"{len(record.get('votes',[]))}v {len(record.get('housing_items',[]))}h"
+                              f"{why})")
                     else:
                         clear_failure(failure_state, sf.name)
                         print(f"  OK ({len(text)} chars, {len(record.get('votes',[]))}v {len(record.get('housing_items',[]))}h)")
