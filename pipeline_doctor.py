@@ -1139,7 +1139,29 @@ def diagnose(dry_run=False):
             recent_ext_start = i
 
     recent_ext = ext_lines[recent_ext_start:]
-    traceback_lines = [l.strip() for l in recent_ext if "Traceback" in l or "Error:" in l or "TypeError:" in l]
+    # "Error:" alone is too broad: the extractor *prints* upstream API errors it
+    # handled gracefully ("API Error: Opus 5's safeguards flagged this message"),
+    # and every one of those was being reported as a crash — and "crashed" is an
+    # AUTOFIX_TRIGGER, so each one also spent a claude -p autofix session on a
+    # run that had exited cleanly. Match Python-level failures only.
+    HANDLED_ERROR_MARKERS = (
+        "api error:",            # upstream CLI error the extractor classified
+        "safeguards flagged",
+        "error: save_failure_state",  # logged and survived
+        "error: rebuild_combined",
+    )
+    _PY_ERROR_RE = re.compile(r"^\s*(Traceback \(most recent call last\)|[A-Za-z_][A-Za-z0-9_.]*(Error|Exception):)")
+
+    def _is_crash_line(line):
+        if any(m in line.lower() for m in HANDLED_ERROR_MARKERS):
+            return False
+        # cmd_extract's per-document except block logs "ERROR: extract <file>: <e>"
+        # and keeps going; that is a real Python-level failure worth flagging.
+        return (bool(_PY_ERROR_RE.match(line))
+                or "Traceback" in line
+                or line.startswith("ERROR: extract "))
+
+    traceback_lines = [l.strip() for l in recent_ext if _is_crash_line(l.strip())]
     if traceback_lines:
         last_tb = traceback_lines[-1][:150]
         finding = f"Extraction script crashed: {last_tb}"

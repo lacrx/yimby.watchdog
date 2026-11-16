@@ -1241,13 +1241,19 @@ def save_failure_state(state):
     _failure_state_path().write_text(json.dumps(state, indent=2, default=str))
 
 
-def record_failure(state, filename, error_category, queue=None, count=True):
+def record_failure(state, filename, error_category, queue=None, count=True,
+                   safeguard=False):
     """Record a failure. count=False logs it without advancing the auto-skip
     counter — for failures that are not the document's fault (a session-wide
-    safeguard block), where auto-skipping would bury good documents."""
+    safeguard block), where auto-skipping would bury good documents.
+    safeguard=True tags a counted strike as safeguard-caused so the auto-skip
+    gate can refuse to permanently skip a document whose every strike came from
+    the classifier rather than from the document."""
     entry = state.get(filename, {})
     if count:
         entry["fail_count"] = entry.get("fail_count", 0) + 1
+        if safeguard:
+            entry["safeguard_fails"] = entry.get("safeguard_fails", 0) + 1
     else:
         entry.setdefault("fail_count", 0)
     if "first_failed" not in entry:
@@ -1261,6 +1267,31 @@ def record_failure(state, filename, error_category, queue=None, count=True):
 
 def clear_failure(state, filename):
     state.pop(filename, None)
+
+
+def uncount_failure(state, filename, reason=""):
+    """Give back one auto-skip strike taken for a failure now known not to be
+    the document's fault.
+
+    The streak rule in cmd_extract can only tell a session-wide safeguard block
+    from a document-specific one after the second document is flagged, so the
+    first document in a streak always takes a strike. Document order is stable
+    (size-sorted), so it is the *same* document every run, and three runs of a
+    session-wide block were enough to bury it under a `repeated_failure` skip
+    marker: cb-city-council-20210309-agenda-part03.txt reached 2/3 twice, with a
+    manual counter reset in between. Once the block is confirmed session-wide,
+    refund that strike."""
+    entry = state.get(filename)
+    if not entry:
+        return
+    if entry.get("fail_count", 0) > 0:
+        entry["fail_count"] -= 1
+    if entry.get("safeguard_fails", 0) > 0:
+        entry["safeguard_fails"] -= 1
+    if reason:
+        entry["last_uncounted"] = f"{datetime.now().isoformat()}: {reason}"
+    if entry.get("fail_count", 0) < 0:
+        entry["fail_count"] = 0
 
 
 def _source_size_key(item):
@@ -1376,6 +1407,7 @@ def cmd_extract(args):
     triage_skipped = 0
     consecutive_failures = 0
     consecutive_safeguards = 0
+    first_safeguard_file = None  # refunded if a second doc is flagged in a row
     auth_failure_count = 0
     MAX_CONSECUTIVE_FAILURES = 5
     MAX_CONSECUTIVE_SAFEGUARDS = 3
@@ -1396,6 +1428,21 @@ def cmd_extract(args):
                     break
 
                 prior = failure_state.get(sf.name, {})
+                if prior.get("fail_count", 0) >= MAX_FAIL_RETRIES and \
+                        prior.get("safeguard_fails", 0) >= prior.get("fail_count", 0):
+                    # Every strike came from a safeguard block. That is the
+                    # classifier's state at the time, not a property of this
+                    # document, and a permanent skip marker here silently drops
+                    # a good document. Reset and retry instead; the cost of
+                    # being wrong is one flagged chunk per run.
+                    print(f"  Counter reset for {sf.name}: all {prior['fail_count']} "
+                          f"strikes were safeguard blocks, not document failures")
+                    prior["fail_count"] = 0
+                    prior["safeguard_fails"] = 0
+                    prior["last_uncounted"] = (f"{datetime.now().isoformat()}: "
+                                               f"safeguard-only strike history")
+                    failure_state[sf.name] = prior
+
                 if prior.get("fail_count", 0) >= MAX_FAIL_RETRIES:
                     last_err = prior.get("last_error", "unknown")
                     write_skip_marker(sf, "repeated_failure")
@@ -1523,8 +1570,20 @@ def cmd_extract(args):
 
                 if error_cat == "safeguard_flagged":
                     consecutive_safeguards += 1
+                    if consecutive_safeguards == 1:
+                        first_safeguard_file = sf.name
+                    elif consecutive_safeguards == 2 and first_safeguard_file:
+                        # Second in a row: the block is session-wide, so the
+                        # first document was not at fault either. Refund the
+                        # strike it took a moment ago.
+                        uncount_failure(failure_state, first_safeguard_file,
+                                        "session-wide safeguard block")
+                        print(f"  (refunded strike against {first_safeguard_file}: "
+                              f"block is session-wide)")
+                        first_safeguard_file = None
                 else:
                     consecutive_safeguards = 0
+                    first_safeguard_file = None
 
                 if record:
                     if not record.get("meeting_id"):
@@ -1554,7 +1613,8 @@ def cmd_extract(args):
                         counts = (error_cat != "safeguard_flagged"
                                   or consecutive_safeguards == 1)
                         record_failure(failure_state, sf.name, "partial_chunks",
-                                       queue=queue, count=counts)
+                                       queue=queue, count=counts,
+                                       safeguard=(error_cat == "safeguard_flagged"))
                         why = "" if counts else ", not counted (session-wide block)"
                         print(f"  PARTIAL ({record.get('_failed_chunks', '?')} chunk(s) failed, "
                               f"{len(record.get('votes',[]))}v {len(record.get('housing_items',[]))}h"
@@ -1568,7 +1628,8 @@ def cmd_extract(args):
                     # because a streak means the block is session-wide.
                     failed += 1
                     record_failure(failure_state, sf.name, error_cat, queue=queue,
-                                   count=(consecutive_safeguards == 1))
+                                   count=(consecutive_safeguards == 1),
+                                   safeguard=True)
                     fc = failure_state[sf.name]["fail_count"]
                     print(f"  FAILED (safeguard_flagged, attempt {fc}/{MAX_FAIL_RETRIES})")
                 else:
