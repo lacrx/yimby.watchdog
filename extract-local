@@ -15,6 +15,13 @@ source .venv/bin/activate
 [ -f .env ] && set -a && source .env && set +a
 unset ANTHROPIC_API_KEY  # extraction uses claude -p, not paid API
 
+# Long-lived token for unattended runs; see civic-pipeline for why it exists.
+CLAUDE_AUTH_ENV="${CIVIC_CLAUDE_AUTH_ENV:-$HOME/.config/yimby-watchdog/claude-auth.env}"
+if [ -f "$CLAUDE_AUTH_ENV" ]; then
+    set -a && source "$CLAUDE_AUTH_ENV" && set +a
+fi
+[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && unset CLAUDE_CODE_OAUTH_TOKEN || true
+
 BUCKET="${WATCHDOG_S3_BUCKET:-yimby-watchdog-data}"
 PIDFILE="data/.extract.pid"
 FORCE=""

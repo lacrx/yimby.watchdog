@@ -341,6 +341,49 @@ def _call_claude(prompt, max_retries=2, schema=None):
     return None, "unknown"
 
 
+def probe_claude(timeout=60):
+    """Ask claude -p a trivial question. Returns (ok, detail).
+
+    This is the discriminator the streak counter in cmd_extract cannot be: a run
+    of safeguard blocks means either the session is blocked (stop) or these
+    particular documents are (keep going). Counting cannot tell those apart, and
+    guessed "session-wide" on 2026-11-13..16, which aborted four cold runs at
+    document 10 of 647 while `claude -p "test"` answered normally. The cold queue
+    is ordered oldest-first, so the same three Carlsbad 2021-03-09 agenda parts
+    sat at the head of it and the 609-document backlog never moved.
+
+    ok=True means the CLI answered, so the block belongs to the documents.
+    No retries: a probe that needs retrying is not a clean answer.
+    """
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--output-format", "text"],
+            input="Reply with the two characters OK and nothing else.",
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+    except FileNotFoundError:
+        return False, "claude CLI not found"
+    except subprocess.TimeoutExpired:
+        return False, f"probe timed out ({timeout}s)"
+    except Exception as e:  # noqa: BLE001 - a probe never raises into the run
+        return False, f"probe raised {type(e).__name__}: {e}"
+
+    clean_out = _ANSI_RE.sub('', result.stdout).strip()
+    clean_err = _ANSI_RE.sub('', result.stderr).strip()
+    combined_lower = (clean_err + " " + clean_out).lower().replace("’", "'")
+
+    if any(p in combined_lower for p in _SAFEGUARD_PHRASES):
+        return False, "probe itself was safeguard-flagged"
+    if any(p in combined_lower for p in _RATE_LIMIT_PHRASES):
+        return False, f"probe hit a limit: {(clean_err or clean_out)[:120]}"
+    if result.returncode != 0:
+        return False, f"probe exit {result.returncode}: {(clean_err or clean_out)[:120]}"
+    if not clean_out:
+        return False, "probe returned empty output"
+    return True, clean_out[:60]
+
+
 def _merge_records(records):
     """Merge multiple chunk records into one, deduplicating arrays."""
     if not records:
@@ -1409,8 +1452,13 @@ def cmd_extract(args):
     consecutive_safeguards = 0
     first_safeguard_file = None  # refunded if a second doc is flagged in a row
     auth_failure_count = 0
+    safeguard_probes = 0
     MAX_CONSECUTIVE_FAILURES = 5
     MAX_CONSECUTIVE_SAFEGUARDS = 3
+    # A streak only buys a probe, and a bounded number of them: each one costs a
+    # CLI call, and a session that is genuinely blocked should not be asked
+    # indefinitely. Three probes caps a run at ~12 flagged documents.
+    MAX_SAFEGUARD_PROBES = 3
     MAX_AUTH_RETRIES = 2
 
     i = 0
@@ -1656,11 +1704,29 @@ def cmd_extract(args):
                 if consecutive_safeguards >= MAX_CONSECUTIVE_SAFEGUARDS:
                     remaining = len(to_process) - i - 1
                     print(f"\n  Safeguards flagged {consecutive_safeguards} documents in a row.")
-                    print(f"  Stopping — the block looks session-wide, not document-specific.")
-                    print(f"  Nothing was permanently skipped; rerun later or check "
-                          f"`claude -p \"test\"`.")
-                    print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
-                    break
+                    if safeguard_probes >= MAX_SAFEGUARD_PROBES:
+                        print(f"  Stopping — {safeguard_probes} probes already passed and the "
+                              f"flagging continues; not spending the rest of the run on it.")
+                        print(f"  Nothing was permanently skipped; these documents retry next run.")
+                        print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
+                        break
+                    safeguard_probes += 1
+                    print(f"  Probing the session ({safeguard_probes}/{MAX_SAFEGUARD_PROBES}): claude -p ...")
+                    ok, detail = probe_claude()
+                    if ok:
+                        # The CLI answers, so the block is these documents, not the
+                        # session. Carry on down the queue; the flagged ones keep
+                        # their refunded strikes and come back next run.
+                        print(f"  Session is healthy (probe said: {detail}).")
+                        print(f"  Block is document-specific — continuing with {remaining} to go.")
+                        consecutive_safeguards = 0
+                        first_safeguard_file = None
+                    else:
+                        print(f"  Stopping — the block looks session-wide: {detail}")
+                        print(f"  Nothing was permanently skipped; rerun later or check "
+                              f"`claude -p \"test\"`.")
+                        print(f"  ({success} extracted, {failed} failed, {skipped} skipped, {remaining} remaining)")
+                        break
 
                 auth_failure_count = 0  # reset on any successful claude call
                 time.sleep(1)

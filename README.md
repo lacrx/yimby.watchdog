@@ -159,6 +159,28 @@ Local cron:
 17 4,8,11,14,21 * * * cd ~/repos/yimby.watchdog && ./escribe-sweep >> data/escribe-sweep.log 2>&1
 ```
 
+### Unattended auth for `claude -p`
+
+Extraction runs on the subscription CLI, never the paid API (`ANTHROPIC_API_KEY`
+is unset by both wrappers). An interactive sign-in expires, and the CLI warns
+about it on stderr where cron does not read it: on 2026-11-16 it said "this
+sign-in ends between 2026-11-23 and 2026-11-26", and renewing does not move
+those dates. When it lapses, both cron entries extract nothing and still log
+"Pipeline complete."
+
+A long-lived token avoids that:
+
+```bash
+claude setup-token | ./scripts/install-claude-token   # or paste it interactively
+```
+
+The installer strips the ANSI escape that `setup-token` prints in the middle of
+the token (a hand copy truncates there and the resulting 401 reads like a bad
+token), verifies it against `claude -p` before writing anything, and stores it
+mode 600 at `~/.config/yimby-watchdog/claude-auth.env`, outside the repo.
+`civic-pipeline` and `extract-local` source it when present;
+`CIVIC_CLAUDE_AUTH_ENV` overrides the path.
+
 ### Manual Pipeline Run
 
 ```bash

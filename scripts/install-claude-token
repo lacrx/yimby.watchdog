@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Install a long-lived claude -p token for the unattended pipeline runs.
+#
+#   claude setup-token            # interactive: prints the token
+#   ./scripts/install-claude-token  # paste it here, ^D to finish
+#
+# Why this exists rather than "edit the file by hand": `claude setup-token`
+# prints the token with an ANSI escape sequence in the MIDDLE of it, so a copy
+# out of the terminal, or any regex that stops at the escape, silently truncates
+# it. The resulting 401 reads like a bad token rather than a bad copy. This
+# strips escapes and whitespace, checks the shape, and verifies the token
+# against the real CLI before writing anything.
+#
+# The file is written outside the repo, mode 600:
+#   ~/.config/yimby-watchdog/claude-auth.env
+# civic-pipeline and extract-local source it if it exists.
+
+set -euo pipefail
+
+AUTH_ENV="${CIVIC_CLAUDE_AUTH_ENV:-$HOME/.config/yimby-watchdog/claude-auth.env}"
+
+if [ -t 0 ]; then
+    echo "Paste the token from \`claude setup-token\`, then Ctrl-D:" >&2
+fi
+
+raw=$(cat)
+# Strip CSI escapes (ESC [ ... final letter), then every control and whitespace
+# character left anywhere in the string, including a stray ESC or BEL.
+token=$(printf '%s' "$raw" \
+    | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' \
+    | tr -d '[:cntrl:][:space:]')
+
+if [ -z "$token" ]; then
+    echo "ERROR: nothing to install (empty input)" >&2
+    exit 1
+fi
+if [ "${#token}" -lt 40 ]; then
+    echo "ERROR: token is ${#token} characters, too short to be whole." >&2
+    echo "       An ANSI escape mid-token truncates a hand copy; re-copy it all." >&2
+    exit 1
+fi
+case "$token" in
+    sk-ant-*) ;;
+    *) echo "WARNING: token does not start with sk-ant-; installing anyway." >&2 ;;
+esac
+
+echo "Verifying the token against claude -p (the sign-in is not used)..." >&2
+# Unset the interactive sign-in's influence as far as the CLI allows: a token in
+# the environment takes precedence, so a pass here is the token's pass.
+if ! out=$(CLAUDE_CODE_OAUTH_TOKEN="$token" ANTHROPIC_API_KEY= \
+        timeout 90 claude -p --output-format text \
+        <<< "Reply with the two characters OK and nothing else." 2>&1); then
+    echo "ERROR: the token did not work. Nothing was written." >&2
+    printf '  %s\n' "${out:0:300}" >&2
+    exit 1
+fi
+echo "  CLI answered: $(printf '%s' "$out" | tr -d '\n' | cut -c1-60)" >&2
+
+mkdir -p "$(dirname "$AUTH_ENV")"
+umask 077
+cat > "$AUTH_ENV" <<EOF
+# Long-lived token for unattended claude -p runs (cron: civic-pipeline).
+# Created $(date -Iseconds) by scripts/install-claude-token.
+# Replace with: claude setup-token | ./scripts/install-claude-token
+CLAUDE_CODE_OAUTH_TOKEN=$token
+EOF
+chmod 600 "$AUTH_ENV"
+
+echo "Wrote $AUTH_ENV (mode $(stat -c %a "$AUTH_ENV"))" >&2
+echo "civic-pipeline and extract-local will use it on their next run." >&2

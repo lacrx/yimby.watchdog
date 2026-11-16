@@ -29,6 +29,19 @@ source .venv/bin/activate
 [ -f .env ] && set -a && source .env && set +a
 unset ANTHROPIC_API_KEY  # extraction uses claude -p via subscription, not paid API
 
+# ── Unattended claude -p auth ──
+# By default claude -p uses the interactive sign-in in ~/.claude, which expires:
+# on 2026-11-16 it warned "this sign-in ends between 2026-11-23 and 2026-11-26",
+# and renewing does not move those dates. A long-lived token from
+# `claude setup-token` lives in this file instead, mode 600, outside the repo so
+# it cannot be committed. Install it with scripts/install-claude-token.
+CLAUDE_AUTH_ENV="${CIVIC_CLAUDE_AUTH_ENV:-$HOME/.config/yimby-watchdog/claude-auth.env}"
+if [ -f "$CLAUDE_AUTH_ENV" ]; then
+    set -a && source "$CLAUDE_AUTH_ENV" && set +a
+fi
+# An empty token is worse than none: the CLI prefers it over the sign-in and 401s.
+[ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && unset CLAUDE_CODE_OAUTH_TOKEN || true
+
 # ── Own process group ──
 # Re-exec under setsid so the whole run (bash + python/claude children) is one
 # session led by this PID. The next run can then kill the session (timeout puts its
