@@ -20,10 +20,15 @@ set -euo pipefail
 AUTH_ENV="${CIVIC_CLAUDE_AUTH_ENV:-$HOME/.config/yimby-watchdog/claude-auth.env}"
 
 if [ -t 0 ]; then
-    echo "Paste the token from \`claude setup-token\`, then Ctrl-D:" >&2
+    # One line, ending at Enter. Reading to EOF instead (cat) is what the first
+    # run of this script did on 2026-11-16, and a paste followed by Enter then
+    # sits there looking like a hang: the token is in, the input is just not
+    # closed. A token is a single line, so Enter is the right terminator.
+    printf 'Paste the token from `claude setup-token` and press Enter:\n' >&2
+    IFS= read -r raw
+else
+    raw=$(cat)
 fi
-
-raw=$(cat)
 # Strip CSI escapes (ESC [ ... final letter), then every control and whitespace
 # character left anywhere in the string, including a stray ESC or BEL.
 token=$(printf '%s' "$raw" \
@@ -34,15 +39,29 @@ if [ -z "$token" ]; then
     echo "ERROR: nothing to install (empty input)" >&2
     exit 1
 fi
+
+# Pull the token out of whatever came in. A copy that caught the label prints as
+# "token:sk-ant-oat01-..." once whitespace is stripped, which read as a bad token
+# and cost a 401 round trip on 2026-11-16. Quotes and surrounding prose go the
+# same way.
+if printf '%s' "$token" | grep -q 'sk-ant-'; then
+    token=$(printf '%s' "$token" | grep -oE 'sk-ant-[A-Za-z0-9_-]+' | head -1)
+else
+    echo "ERROR: no sk-ant- token in that input (${#token} characters)." >&2
+    echo "       What \`claude setup-token\` prints last is the token itself and it" >&2
+    echo "       starts with sk-ant-. The code you paste into the browser prompt is" >&2
+    echo "       not it, and neither is the URL." >&2
+    echo "       Override for a format this check does not know:" >&2
+    echo "         CIVIC_TOKEN_ALLOW_ANY_PREFIX=1 $0" >&2
+    [ "${CIVIC_TOKEN_ALLOW_ANY_PREFIX:-}" = "1" ] || exit 1
+    echo "       CIVIC_TOKEN_ALLOW_ANY_PREFIX=1 set, continuing." >&2
+fi
+
 if [ "${#token}" -lt 40 ]; then
     echo "ERROR: token is ${#token} characters, too short to be whole." >&2
     echo "       An ANSI escape mid-token truncates a hand copy; re-copy it all." >&2
     exit 1
 fi
-case "$token" in
-    sk-ant-*) ;;
-    *) echo "WARNING: token does not start with sk-ant-; installing anyway." >&2 ;;
-esac
 
 echo "Verifying the token against claude -p (the sign-in is not used)..." >&2
 # Unset the interactive sign-in's influence as far as the CLI allows: a token in
