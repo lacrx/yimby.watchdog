@@ -484,6 +484,67 @@ def chunk_cache_path(out_path):
     return out_path.with_name(out_path.stem + ".chunks")
 
 
+# A cached chunk failure is a claim that re-running might help. For two kinds of
+# failure that claim is false, and acting on it costs the nightly budget and the
+# rest of the document:
+#   - A safeguard block is deterministic: the same bytes get flagged every run.
+#     The loop used to stop the whole document at the first one, so part05 of
+#     cb-city-council-20210309-agenda sat at 10 of 33 chunks extracted from
+#     2026-11-13 to 11-17, re-flagging chunk 0 every night and never reaching
+#     the other 32. Probing the session is what tells a document-specific block
+#     from a session-wide one, so a healthy probe retires the chunk and the run
+#     carries on through the document.
+#   - A chunk that fails the same way run after run is not going to stop. Each
+#     exit_code failure already costs three CLI calls inside _call_claude, so
+#     22 of them in one document is 66 calls a night for nothing.
+# Retired chunks leave a recorded hole (_retired_chunks) rather than a silent one.
+MAX_CHUNK_ATTEMPTS = 3
+# Probes inside one document, on top of the doc-level budget in cmd_extract.
+# Every flagged chunk is probed rather than inheriting an earlier verdict: a
+# session that dies mid-document flags everything, and retiring those chunks on
+# a stale "healthy" would throw away good content permanently. One trivial CLI
+# call is cheap insurance against that. The bound caps a document at 4 retired
+# chunks and ~8 calls a night; retirement is permanent, so a document with more
+# flagged chunks than that converges over a few runs instead of eating one.
+MAX_CHUNK_PROBES = 4
+
+
+def _chunk_is_final(entry):
+    """True when re-running this chunk cannot improve on what is cached."""
+    if not entry:
+        return False
+    if "record" in entry or entry.get("retired"):
+        return True
+    return entry.get("error") == "content_refused"
+
+
+def _chunks_all_final(results, n_chunks):
+    """True when no chunk of the document is still worth another run."""
+    return all(_chunk_is_final(results.get(ci)) for ci in range(n_chunks))
+
+
+def _retire_exhausted_chunks(results, n_chunks):
+    """Retire chunks that have now failed MAX_CHUNK_ATTEMPTS separate runs.
+
+    Returns the number newly retired. Caches written before attempt counting
+    have no "attempts" key; they start from zero rather than being retired on
+    sight, so a chunk is never dropped on the strength of a count never kept.
+    """
+    newly = 0
+    for ci in range(n_chunks):
+        entry = results.get(ci)
+        if not entry or _chunk_is_final(entry):
+            continue
+        if entry.get("attempts", 0) >= MAX_CHUNK_ATTEMPTS:
+            entry["retired"] = True
+            entry["retired_at"] = datetime.now().isoformat()
+            entry["retired_why"] = (f"{entry.get('error', 'unknown')} on "
+                                    f"{entry['attempts']} separate runs")
+            results[ci] = entry
+            newly += 1
+    return newly
+
+
 def _chunk_fingerprint(text, chunks):
     return {
         "version": 1,
@@ -545,19 +606,31 @@ def extract_structured(text, meeting_meta, cache_path=None):
 
     fingerprint = _chunk_fingerprint(text, chunks)
     results = _load_chunk_cache(cache_path, fingerprint)
+    chunk_probes = 0
     if results:
-        redo = [i for i in range(len(chunks))
-                if "record" not in results.get(i, {}) and results.get(i, {}).get("error") != "content_refused"]
+        newly_retired = _retire_exhausted_chunks(results, len(chunks))
+        if newly_retired:
+            print(f"  Retiring {newly_retired} chunk(s) that failed "
+                  f"{MAX_CHUNK_ATTEMPTS} runs in a row; not retried again")
+            _save_chunk_cache(cache_path, fingerprint, results)
+        redo = [i for i in range(len(chunks)) if not _chunk_is_final(results.get(i))]
         print(f"  Resuming from chunk cache: re-running {len(redo)}/{len(chunks)} chunk(s)", flush=True)
 
     def _collect():
         recs = [results[i]["record"] for i in sorted(results) if "record" in results[i]]
-        errs = [results[i]["error"] for i in sorted(results) if "error" in results[i]]
+        # A retired chunk keeps its "error" for the record, but it is a settled
+        # hole, not an outstanding failure: counting it would re-queue the
+        # document for ever and report a handled block as still blocking.
+        errs = [results[i]["error"] for i in sorted(results)
+                if "error" in results[i] and not results[i].get("retired")]
         return recs, errs
+
+    def _retired_count():
+        return sum(1 for i in results if results[i].get("retired"))
 
     for ci, chunk in enumerate(chunks):
         prev = results.get(ci)
-        if prev and ("record" in prev or prev.get("error") == "content_refused"):
+        if _chunk_is_final(prev):
             continue
         prompt = EXTRACTION_PROMPT + meta_context + "\n" + chunk
         try:
@@ -571,21 +644,50 @@ def extract_structured(text, meeting_meta, cache_path=None):
                     merged["_partial"] = True
                     merged["_chunks_completed"] = len(records)
                     merged["_chunks_total"] = len(chunks)
-                    merged["_failed_chunks"] = len(chunks) - len(records) - errors.count("content_refused")
                     refused = errors.count("content_refused")
+                    merged["_failed_chunks"] = (len(chunks) - len(records)
+                                                - refused - _retired_count())
                     if refused:
                         merged["_refused_chunks"] = refused
+                    if _retired_count():
+                        merged["_retired_chunks"] = _retired_count()
                     rl.partial_result = merged
                     print(f"  Rate limit at chunk {ci+1}/{len(chunks)}, {len(records)} partial chunks salvaged")
             raise
         if record:
             results[ci] = {"record": record}
         elif err:
-            results[ci] = {"error": err}
-            print(f"  chunk {ci+1}/{len(chunks)} failed: {err}")
+            attempts = (prev or {}).get("attempts", 0) + 1
+            results[ci] = {"error": err, "attempts": attempts}
+            print(f"  chunk {ci+1}/{len(chunks)} failed: {err} "
+                  f"(attempt {attempts}/{MAX_CHUNK_ATTEMPTS})")
         _save_chunk_cache(cache_path, fingerprint, results)
-        if not record and err in ("exit_code_empty", "safeguard_flagged"):
+
+        if not record and err == "exit_code_empty":
+            # Empty output with a nonzero code is the shape a dead session has.
+            # Not a claim about this chunk, so nothing is retired here.
             break
+
+        if not record and err == "safeguard_flagged":
+            # Same question as the doc-level streak, one level down: is this
+            # block about these bytes, or about the session? Only a probe knows.
+            if chunk_probes >= MAX_CHUNK_PROBES:
+                print(f"  Stopping this document — {chunk_probes} probes already "
+                      f"passed and chunks keep flagging")
+                break
+            chunk_probes += 1
+            print(f"  Probing the session ({chunk_probes}/{MAX_CHUNK_PROBES}): claude -p ...", flush=True)
+            ok, detail = probe_claude()
+            if not ok:
+                print(f"  Stopping this document — the block looks session-wide: {detail}")
+                break
+            results[ci] = {"error": err, "attempts": attempts, "retired": True,
+                           "retired_at": datetime.now().isoformat(),
+                           "retired_why": "safeguard block, session probed healthy"}
+            _save_chunk_cache(cache_path, fingerprint, results)
+            print(f"  Session is healthy (probe said: {detail}).")
+            print(f"  Chunk {ci+1} is flagged on its own content — retired, "
+                  f"continuing with the rest of the document.")
         time.sleep(1)
 
     records, errors = _collect()
@@ -593,14 +695,18 @@ def extract_structured(text, meeting_meta, cache_path=None):
     if merged:
         # Chunks that failed, timed out, or were never attempted must not vanish silently.
         # Refused chunks are permanent (retrying cannot help): recorded, but not "partial".
+        # Retired chunks are permanent for the same reason and counted the same way.
         refused = errors.count("content_refused")
-        failed_chunks = len(chunks) - len(records) - refused
-        if refused or failed_chunks:
+        retired = _retired_count()
+        failed_chunks = len(chunks) - len(records) - refused - retired
+        if refused or retired or failed_chunks:
             merged = dict(merged)
             merged["_chunks_total"] = len(chunks)
             merged["_chunks_completed"] = len(records)
         if refused:
             merged["_refused_chunks"] = refused
+        if retired:
+            merged["_retired_chunks"] = retired
         if failed_chunks:
             merged["_partial"] = True
             merged["_failed_chunks"] = failed_chunks
@@ -611,12 +717,19 @@ def extract_structured(text, meeting_meta, cache_path=None):
         else:
             merged.pop("_partial", None)
             merged.pop("_failed_chunks", None)
-            if cache_path is not None:
+            # Keep the sidecar when a chunk is retired: deleting it forgets the
+            # retirement, and the next run re-runs exactly the chunks this run
+            # established will never pass.
+            if cache_path is not None and not retired:
                 try:
                     cache_path.unlink()
                 except OSError:
                     pass
         return merged, None
+    # Nothing merged. If every chunk reached a final state and none produced a
+    # record, the document is finished and empty, not waiting on a retry.
+    if _chunks_all_final(results, len(chunks)):
+        return None, "chunks_exhausted"
     # Every chunk failed: return the error (content_refused only if all were refusals).
     non_refused = [e for e in errors if e != "content_refused"]
     if non_refused:
@@ -1616,6 +1729,17 @@ def cmd_extract(args):
                     i += 1
                     continue
 
+                if error_cat == "chunks_exhausted":
+                    # Every chunk is refused or retired and none yielded a
+                    # record. Re-queueing it would re-ask a settled question.
+                    write_skip_marker(sf, "chunks_exhausted")
+                    skipped += 1
+                    consecutive_safeguards = 0
+                    first_safeguard_file = None
+                    print(f"  Every chunk is refused or retired — permanently skipped")
+                    i += 1
+                    continue
+
                 if error_cat == "safeguard_flagged":
                     consecutive_safeguards += 1
                     if consecutive_safeguards == 1:
@@ -1669,7 +1793,14 @@ def cmd_extract(args):
                               f"{why})")
                     else:
                         clear_failure(failure_state, sf.name)
-                        print(f"  OK ({len(text)} chars, {len(record.get('votes',[]))}v {len(record.get('housing_items',[]))}h)")
+                        # A retired chunk is a permanent hole. The document is
+                        # done, but say so rather than printing a bare OK.
+                        gap = ""
+                        if record.get("_retired_chunks"):
+                            gap = (f", {record['_retired_chunks']} chunk(s) retired "
+                                   f"of {record.get('_chunks_total', '?')}")
+                        print(f"  OK ({len(text)} chars, {len(record.get('votes',[]))}v "
+                              f"{len(record.get('housing_items',[]))}h{gap})")
                 elif error_cat == "safeguard_flagged":
                     # Not the document's fault unless it is the only one flagged:
                     # the first in a row counts toward auto-skip, a streak does not,

@@ -121,16 +121,153 @@ def _():
     return err is None and rec is not None
 
 
-@case("chunked extraction stops at the first blocked chunk instead of burning the rest")
+PROBE_PREFIX = "Reply with the two characters OK"
+BIG_TEXT = ("line of document text\n" * 200 + "\n") * 40
+
+
+def scripted_run(outcomes, probe_ok=None):
+    """Replace subprocess.run; answer extraction calls from `outcomes` in order.
+
+    `outcomes` is a list of FakeCompleted, the last one repeating. A probe is
+    told apart by its prompt and answered from `probe_ok`, so a document's
+    chunks and the probes between them can be scripted independently. That
+    separation is the whole point: before the probe existed, a test could not
+    say "this chunk is blocked but the session is fine".
+    """
+    seq = list(outcomes)
+    state = {"i": 0}
+
+    def run(cmd, **kwargs):
+        prompt = kwargs.get("input", "")
+        CALLS.append(prompt)
+        if prompt.startswith(PROBE_PREFIX):
+            if probe_ok is None:
+                raise AssertionError("probe called but no probe outcome scripted")
+            return FakeCompleted(0, stdout="OK\n") if probe_ok else FakeCompleted(1, stdout=AUP)
+        out = seq[min(state["i"], len(seq) - 1)]
+        state["i"] += 1
+        return out
+
+    ex.subprocess = types.SimpleNamespace(
+        run=run, TimeoutExpired=TimeoutError, CalledProcessError=Exception)
+    ex.time = types.SimpleNamespace(sleep=lambda *_: None)
+    CALLS.clear()
+
+
+def chunk_calls():
+    return [c for c in CALLS if not c.startswith(PROBE_PREFIX)]
+
+
+def probe_calls():
+    return [c for c in CALLS if c.startswith(PROBE_PREFIX)]
+
+
+@case("a blocked chunk stops the document when the probe says session-wide")
 def _():
-    # 3 chunks' worth of text; first call succeeds, every later call is blocked.
-    fake_run([FakeCompleted(0, stdout=RECORD),
-              FakeCompleted(1, stdout=AUP)])
-    text = ("line of document text\n" * 200 + "\n") * 40
-    assert len(text) > 2 * ex.CHUNK_SIZE
-    rec, err = ex.extract_structured(text, None)
-    # one good chunk + one blocked chunk, then stop: not one call per chunk
-    return err == "safeguard_flagged" and rec is not None and rec["_partial"] and len(CALLS) == 2
+    # The pre-2026-11-17 behaviour, now conditional on evidence: one good chunk,
+    # one blocked chunk, one probe that is itself blocked, then stop. Still not
+    # one call per chunk.
+    assert len(BIG_TEXT) > 2 * ex.CHUNK_SIZE
+    scripted_run([FakeCompleted(0, stdout=RECORD), FakeCompleted(1, stdout=AUP)],
+                 probe_ok=False)
+    rec, err = ex.extract_structured(BIG_TEXT, None)
+    return (err == "safeguard_flagged" and rec is not None and rec["_partial"]
+            and len(chunk_calls()) == 2 and len(probe_calls()) == 1)
+
+
+@case("a healthy probe retires the blocked chunk and reads the rest of the document")
+def _():
+    # part05 of cb-city-council-20210309-agenda sat at 10 of 33 chunks from
+    # 2026-11-13 to 11-17 because chunk 0 was flagged and stopped the document
+    # every night. One flagged chunk must cost one chunk, not the document.
+    chunks = ex._split_chunks(BIG_TEXT)
+    assert len(chunks) >= 3
+    scripted_run([FakeCompleted(1, stdout=AUP), FakeCompleted(0, stdout=RECORD)],
+                 probe_ok=True)
+    rec, err = ex.extract_structured(BIG_TEXT, None)
+    return (err is None and rec is not None and not rec.get("_partial")
+            and rec.get("_retired_chunks") == 1
+            and len(chunk_calls()) == len(chunks)
+            and len(probe_calls()) == 1)
+
+
+@case("a retired chunk is not re-run on the next pass")
+def _():
+    import tempfile
+    chunks = ex._split_chunks(BIG_TEXT)
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "doc.chunks"
+        scripted_run([FakeCompleted(1, stdout=AUP), FakeCompleted(0, stdout=RECORD)],
+                     probe_ok=True)
+        ex.extract_structured(BIG_TEXT, None, cache_path=cache)
+        if not cache.exists():
+            return False  # deleting the sidecar would forget the retirement
+        # Second pass: every chunk is cached, the retired one must not be asked
+        # again, and no probe is needed because nothing flags.
+        scripted_run([FakeCompleted(0, stdout=RECORD)])
+        rec, err = ex.extract_structured(BIG_TEXT, None, cache_path=cache)
+        return (err is None and rec is not None and len(chunk_calls()) == 0
+                and len(probe_calls()) == 0 and rec.get("_retired_chunks") == 1)
+
+
+@case("a chunk that has failed three runs is retired instead of re-run for ever")
+def _():
+    import tempfile
+    chunks = ex._split_chunks(BIG_TEXT)
+    fp = ex._chunk_fingerprint(BIG_TEXT, chunks)
+    # The real cache this was built for: part05 held 22 chunks marked exit_code
+    # from the 2026-11-13 rate limit that was misread as a chunk failure. Each
+    # one costs three CLI calls inside _call_claude every time it is retried.
+    results = {0: {"record": json.loads(RECORD)}}
+    for ci in range(1, len(chunks)):
+        results[ci] = {"error": "exit_code", "attempts": 3}
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "doc.chunks"
+        ex._save_chunk_cache(cache, fp, results)
+        scripted_run([FakeCompleted(0, stdout=RECORD)])
+        rec, err = ex.extract_structured(BIG_TEXT, None, cache_path=cache)
+    return (err is None and rec is not None and len(chunk_calls()) == 0
+            and rec.get("_retired_chunks") == len(chunks) - 1)
+
+
+@case("a cache with no attempt count gets a fresh budget, not instant retirement")
+def _():
+    # Sidecars written before attempt counting have no "attempts" key. Reading
+    # a missing count as "already exhausted" would drop good chunks on sight.
+    import tempfile
+    chunks = ex._split_chunks(BIG_TEXT)
+    fp = ex._chunk_fingerprint(BIG_TEXT, chunks)
+    results = {ci: {"error": "exit_code"} for ci in range(len(chunks))}
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "doc.chunks"
+        ex._save_chunk_cache(cache, fp, results)
+        scripted_run([FakeCompleted(0, stdout=RECORD)])
+        rec, err = ex.extract_structured(BIG_TEXT, None, cache_path=cache)
+    return (err is None and rec is not None and not rec.get("_retired_chunks")
+            and len(chunk_calls()) == len(chunks))
+
+
+@case("a document whose every chunk is retired reports chunks_exhausted")
+def _():
+    import tempfile
+    chunks = ex._split_chunks(BIG_TEXT)
+    fp = ex._chunk_fingerprint(BIG_TEXT, chunks)
+    results = {ci: {"error": "exit_code", "attempts": 3} for ci in range(len(chunks))}
+    with tempfile.TemporaryDirectory() as td:
+        cache = Path(td) / "doc.chunks"
+        ex._save_chunk_cache(cache, fp, results)
+        scripted_run([FakeCompleted(0, stdout=RECORD)])
+        rec, err = ex.extract_structured(BIG_TEXT, None, cache_path=cache)
+    return rec is None and err == "chunks_exhausted" and len(chunk_calls()) == 0
+
+
+@case("chunk probes are bounded, so a session-wide block cannot be probed per chunk")
+def _():
+    # Every chunk flags and every probe passes: a liar of a probe must not buy
+    # one call per chunk on a long document.
+    scripted_run([FakeCompleted(1, stdout=AUP)], probe_ok=True)
+    rec, err = ex.extract_structured(BIG_TEXT, None)
+    return len(probe_calls()) == ex.MAX_CHUNK_PROBES
 
 
 @case("probe_claude calls the CLI once and reports a healthy session")
