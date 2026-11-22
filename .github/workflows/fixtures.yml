@@ -1,0 +1,43 @@
+name: Fixture corpus
+
+# This repository had no workflows at all until 2026-11-22. Everything built
+# for it ran only when a person typed it, and `scripts/fixtures.py check` was
+# written as a regression gate, which is a comment until something runs it.
+#
+# The pipeline itself is NOT run here. It is local-by-design (it uses the
+# `claude -p` subscription token on workhorse, not API credits) and it needs
+# credentials and the network. What runs here is the part that is offline by
+# construction: the committed fixtures, replayed against the parsers.
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  corpus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install the parsers' dependencies
+        # Deliberately not requirements.txt. That carries playwright, yt-dlp
+        # and boto3 for the live pipeline; replaying a committed fixture needs
+        # none of them, and installing them would make a two-second gate a
+        # two-minute one. Verified 2026-11-22 against a clean venv: these five
+        # are enough for `fixtures.py check` to pass.
+        run: pip install beautifulsoup4 lxml pyyaml requests feedparser
+
+      - name: Every committed fixture still parses what it parsed before
+        run: python3 scripts/fixtures.py check -v
+
+      - name: Every source file still compiles
+        # Cheap, and it catches the failure mode this repository actually has:
+        # a scraper edited in a hurry and never imported, because nothing here
+        # imports every scraper on a normal run.
+        run: python3 -m compileall -q . -x '\.venv|node_modules'

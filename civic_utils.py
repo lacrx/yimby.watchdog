@@ -363,7 +363,7 @@ def download_pdf(url, dest_path, headers=None, verify=True):
               f"{resp.headers.get('Content-Type', '?')}) for {url}", flush=True)
         agency = _agency_from_path(dest_path)
         fixture = save_failure_fixture(agency, url, response=resp,
-                                       request_headers=hdrs)
+                                       request_headers=hdrs, phase="download")
         log_failure(agency, "download", url=url, status=resp.status_code,
                     msg="non-PDF response", fixture=fixture)
         return False
@@ -384,7 +384,7 @@ def download_pdf(url, dest_path, headers=None, verify=True):
             agency = _agency_from_path(dest_path)
             fixture = save_failure_fixture(
                 agency, url, response=getattr(e, "response", None), exc=e,
-                request_headers=hdrs,
+                request_headers=hdrs, phase="download",
             )
             log_failure(agency, "download", url=url, status=status,
                         exc_type=type(e).__name__, msg=str(e)[:300],
@@ -804,8 +804,16 @@ def _redact_headers(headers):
 
 
 def save_failure_fixture(agency, url, response=None, exc=None,
-                         platform=None, method="GET", request_headers=None):
+                         platform=None, method="GET", request_headers=None,
+                         phase=None):
     """Save a failing HTTP exchange so it can be replayed offline.
+
+    `phase` says what the request was FOR: "download" for a document fetch,
+    "listing" for an agenda index page. Without it a replay cannot tell the two
+    apart and will run a listing parser at a document, which on 2026-11-22
+    reported `REPLAY FAIL: listing parsed 0 items` for a perfectly healthy Del
+    Mar meeting-cancellation .docx. A false regression is worse than no replay,
+    because it sends whoever reads it to fix a parser that is not broken.
 
     Returns the fixture path as a string, or None if nothing could be written.
     Never raises, for the same reason _append_jsonl does not.
@@ -823,6 +831,7 @@ def save_failure_fixture(agency, url, response=None, exc=None,
             "run_id": run,
             "agency": agency,
             "platform": platform,
+            "phase": phase,
             "url": url,
             "method": method,
             "request_headers": _redact_headers(request_headers),

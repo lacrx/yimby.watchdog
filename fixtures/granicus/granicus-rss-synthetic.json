@@ -3,6 +3,7 @@
   "run_id": "corpus-seed",
   "agency": "vista",
   "platform": "granicus",
+  "phase": "listing",
   "url": "https://example.invalid/ViewPublisherRSS.php",
   "method": "GET",
   "status": 200,

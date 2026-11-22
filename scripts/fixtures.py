@@ -41,7 +41,10 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # scripts/ is not a package
 
 import civic_utils  # noqa: E402
-from replay_failure import PARSERS, fixture_body, platform_for  # noqa: E402
+from replay_failure import (  # noqa: E402
+    PARSERS, classify_document, fixture_body, fixture_bytes, fixture_kind,
+    platform_for,
+)
 
 CORPUS = REPO_ROOT / "fixtures"
 # Bodies are committed, so the corpus is part of every clone and every
@@ -79,6 +82,59 @@ def _parse_count(fixture):
     return len(list(items or [])), ""
 
 
+# A corpus of two kinds. A listing fixture's expectation is a number of parsed
+# items; a document fixture's is what the bytes are and whether the pipeline
+# can use them. Before 2026-11-22 only the first existed, so a document fixture
+# could not be promoted at all: it would be handed to a listing parser, parse
+# zero and be recorded as a permanent failure. See replay_failure.py's header
+# for the Del Mar case that found this.
+
+
+def _document_expectation(fixture):
+    label, _detail, verdict = classify_document(fixture_bytes(fixture))
+    return {"label": label, "verdict": verdict}
+
+
+def _check_one(fixture):
+    """(ok, detail) for one corpus fixture, whichever kind it is.
+
+    Inside the corpus the recorded expectation names the kind outright, and
+    that beats re-deriving it: `expect_document` was only ever written by a
+    promotion that had already decided this is a document. Falling back to
+    fixture_kind() covers a fixture hand-written into fixtures/ without either.
+    """
+    if fixture.get("expect_document"):
+        kind = "document"
+    elif fixture.get("expect_items") is not None:
+        kind = "listing"
+    else:
+        kind, _how = fixture_kind(fixture)
+
+    if kind == "document":
+        expect = fixture.get("expect_document")
+        if not expect:
+            return False, "no expect_document recorded"
+        got = _document_expectation(fixture)
+        if got != expect:
+            return False, (f"classifies as {got['label']}/{got['verdict']}, "
+                           f"expected {expect['label']}/{expect['verdict']}")
+        return True, f"{got['label']}/{got['verdict']}"
+
+    if kind == "unknown":
+        return False, ("neither a document nor a listing: no `phase` and no "
+                       "usable Content-Type")
+
+    expect = fixture.get("expect_items")
+    count, err = _parse_count(fixture)
+    if count is None:
+        return False, err
+    if expect is None:
+        return False, "no expect_items recorded"
+    if count != expect:
+        return False, f"parsed {count}, expected {expect}"
+    return True, f"{count} items"
+
+
 def cmd_add(args):
     path = Path(args.fixture)
     try:
@@ -103,24 +159,45 @@ def cmd_add(args):
         print("ERROR: fixture has no platform and its agency is not in agencies.yaml")
         return 2
 
-    count, err = _parse_count(fixture)
-    expect = args.expect if args.expect is not None else count
-    if expect is None:
-        print(f"ERROR: cannot determine an expected count ({err}). "
-              f"Pass --expect explicitly to add it anyway.")
+    kind, how = fixture_kind(fixture)
+    if kind == "unknown":
+        print("ERROR: cannot tell whether this is a document or a listing "
+              f"({how}). A fixture whose kind is a guess is worse than no "
+              "fixture: the corpus would enforce the guess forever.")
         return 2
 
-    fixture["expect_items"] = expect
-    fixture["note"] = args.note or fixture.get("note", "")
     name = args.name or _slugify(fixture.get("agency") or path.stem)
     dest = CORPUS / platform / f"{name}.json"
+
+    if kind == "document":
+        if args.expect is not None:
+            print("ERROR: --expect is an item count and this is a document "
+                  "fixture. Its expectation is what the bytes are, and that is "
+                  "recorded from the file itself.")
+            return 2
+        expectation = _document_expectation(fixture)
+        fixture["expect_document"] = expectation
+        fixture.pop("expect_items", None)
+        detail = f"{expectation['label']}/{expectation['verdict']}"
+    else:
+        count, err = _parse_count(fixture)
+        expect = args.expect if args.expect is not None else count
+        if expect is None:
+            print(f"ERROR: cannot determine an expected count ({err}). "
+                  f"Pass --expect explicitly to add it anyway.")
+            return 2
+        fixture["expect_items"] = expect
+        fixture.pop("expect_document", None)
+        observed = "unparseable" if count is None else count
+        detail = f"parses {observed}, expect {expect}"
+
+    fixture["note"] = args.note or fixture.get("note", "")
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(fixture, indent=2, default=str))
 
-    observed = "unparseable" if count is None else count
     print(f"added {dest.relative_to(REPO_ROOT)}")
-    print(f"  platform {platform}, parses {observed}, expect {expect}")
-    if count is not None and count != expect:
+    print(f"  platform {platform}, kind {kind} (from {how}), {detail}")
+    if kind == "listing" and count is not None and count != fixture["expect_items"]:
         print(f"  NOTE: recorded expectation differs from what it parses now. "
               f"check will fail until the parser is fixed, which is the point.")
     return 0
@@ -140,6 +217,9 @@ def cmd_capture(args):
         "run_id": "corpus-capture",
         "agency": args.agency,
         "platform": args.platform,
+        # capture fetches an agenda index page by hand, so the kind is known
+        # here and never has to be inferred from a Content-Type later.
+        "phase": "listing",
         "url": args.url,
         "method": "GET",
         "status": resp.status_code,
@@ -181,19 +261,12 @@ def cmd_check(args):
             print(f"FAIL {rel}: unreadable ({exc})")
             failures += 1
             continue
-        expect = fixture.get("expect_items")
-        count, err = _parse_count(fixture)
-        if count is None:
-            print(f"FAIL {rel}: {err}")
-            failures += 1
-        elif expect is None:
-            print(f"FAIL {rel}: no expect_items recorded")
-            failures += 1
-        elif count != expect:
-            print(f"FAIL {rel}: parsed {count}, expected {expect}")
+        ok, detail = _check_one(fixture)
+        if not ok:
+            print(f"FAIL {rel}: {detail}")
             failures += 1
         elif args.verbose:
-            print(f"ok   {rel}: {count}")
+            print(f"ok   {rel}: {detail}")
 
     total = len(paths)
     if failures:
