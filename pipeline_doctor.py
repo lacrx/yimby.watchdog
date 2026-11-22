@@ -42,6 +42,12 @@ try:
     from transforms.extract_structured import has_skip_marker as _has_skip_marker
 except ImportError:
     _has_skip_marker = None
+# scripts/ is not a package, so it goes on the path the same way its own modules do it.
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+try:
+    import alert_triage
+except ImportError:  # triage not landed yet; the doctor still diagnoses
+    alert_triage = None
 
 DATA_DIR = REPO_ROOT / "data"
 STRUCTURED_DIR = DATA_DIR / "structured"
@@ -1542,7 +1548,102 @@ def diagnose(dry_run=False):
         with open(DIAGNOSIS_LOG, "a") as f:
             f.write(json.dumps(diagnosis, default=str) + "\n")
         print(f"\n  Diagnosis saved to {DIAGNOSIS_LOG}")
+
+    # ─── Deliver ───
+    # Last, and after the persist, so a diagnosis is recorded even if delivery fails.
+    deliver_alert(diagnosis, dry_run=dry_run)
     return diagnosis
+
+
+ALERT_NAME = "civic-pipeline"
+# Cron runs with PATH=/usr/bin:/bin, so ~/.local/bin is not on it and a bare name would
+# silently not be found. Look for the symlink and the real file by absolute path.
+_JOB_ALERT_PATHS = (
+    Path.home() / ".local/bin/job-alert",
+    Path.home() / "vault/claude-brain/tools/job-alert",
+)
+
+
+def _job_alert() -> str | None:
+    from shutil import which
+
+    found = which("job-alert")
+    if found:
+        return found
+    for candidate in _JOB_ALERT_PATHS:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def deliver_alert(diagnosis, dry_run=False):
+    """Put the findings worth a person's attention where a person will see them.
+
+    Until this existed the doctor's whole output went to `pipeline-doctor.jsonl` and
+    `pipeline-cron.log`, and nothing read either. On 2026-11-22 it correctly diagnosed a
+    stale North County Transit District scraper and the only reason anybody knew is that
+    the file was opened by hand. A diagnosis nobody reads is a diagnosis that did not
+    happen.
+
+    `job-alert` writes `~/.claude/state/civic-pipeline-alert.md`, which `claude-state-hook`
+    injects at the start of every Claude Code session on this machine. So the alert is not
+    delivered and does not push; it waits in the one place that is opened many times a day.
+
+    Only `alert_triage.ALERTABLE` findings raise. Alerting on "the doctor found something"
+    would fire on 96% of the 260 recorded runs, which is how an alert gets ignored. A clean
+    run clears the file, so its presence always means the current state and never a stale
+    event.
+
+    Never raises. Failing to deliver an alert must not fail the diagnosis that produced it.
+    """
+    if dry_run:
+        print("  Dry run: alert not raised or cleared.")
+        return None
+    if alert_triage is None:
+        print("  WARN: scripts/alert_triage.py not importable; no alert delivered")
+        return None
+
+    tool = _job_alert()
+    if not tool:
+        print("  WARN: job-alert not found; findings stay in pipeline-doctor.jsonl only")
+        return None
+
+    try:
+        urgent = alert_triage.alertable(diagnosis)
+    except Exception as exc:  # a triage bug must not cost the diagnosis
+        print(f"  WARN: triage failed ({exc}); no alert delivered")
+        return None
+
+    try:
+        if not urgent:
+            subprocess.run([tool, "ok", ALERT_NAME], capture_output=True, text=True,
+                           timeout=30)
+            return False
+
+        lines = []
+        for item in urgent:
+            lines.append(f"- {item}")
+            lines.append(f"  _{alert_triage.why(item)}_")
+        lines.append("")
+        lines.append(
+            f"Full diagnosis: `{DIAGNOSIS_LOG}` (last line). Run log: `{PIPELINE_LOG}`."
+        )
+        lines.append(
+            "Re-diagnose without changing anything: "
+            "`cd ~/repos/yimby.watchdog && python3 pipeline_doctor.py --dry-run`."
+        )
+        title = (
+            f"civic-pipeline: {len(urgent)} finding(s) that mean content is being missed"
+            if len(urgent) > 1
+            else "civic-pipeline: content is being missed"
+        )
+        subprocess.run([tool, "fail", ALERT_NAME, "--title", title, "--body", "-"],
+                       input="\n".join(lines), capture_output=True, text=True, timeout=30)
+        print(f"  ALERT raised: {len(urgent)} finding(s) via job-alert {ALERT_NAME}")
+        return True
+    except Exception as exc:
+        print(f"  WARN: could not deliver alert ({exc})")
+        return None
 
 
 def show_history():

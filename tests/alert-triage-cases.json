@@ -1,0 +1,397 @@
+{
+ "_comment": "See tests/test_alert_triage.py. Real finding strings taken from data/pipeline-doctor.jsonl (260 runs, 2026-06-24 to 2026-11-22), at most three per shape. Severities were reviewed by hand when recorded.",
+ "cases": [
+  {
+   "finding": "1 structured record(s) have null date",
+   "severity": "backlog"
+  },
+  {
+   "finding": "City of Encinitas: 1/60 past meetings (2%) have no documents (7-90d window, excl. 9 closed session(s))",
+   "severity": "backlog"
+  },
+  {
+   "finding": "City of Oceanside: 2/7 past meetings (29%) have no documents (7-90d window)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "City of San Marcos: 356 meeting row(s) have no parseable date (excluded from coverage check)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Extraction failing: 'bf75cf713de0-Minutes.txt' \u2014 2 attempts, last error: exit_code",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Extraction failing: 'cb-city-council-20210309-agenda-part03.txt' \u2014 2 attempts, last error: partial_chunks",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Extraction failing: 'clip-1017-agenda.txt' \u2014 2 attempts, last error: exit_code",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Extraction failing: 'fake-test-doc.txt' \u2014 2 attempts, last error: timeout",
+   "severity": "backlog"
+  },
+  {
+   "finding": "File 'f4e563dcf038-agenda-packet.txt' blocked extraction 2 times via auth/chunk errors",
+   "severity": "backlog"
+  },
+  {
+   "finding": "File 'sdcounty-1964-minutes.txt' blocked extraction 3 times via auth/chunk errors",
+   "severity": "backlog"
+  },
+  {
+   "finding": "No obvious blocker found \u2014 check structured-extraction.log manually",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 01f893ae869a-agenda-packet.txt (2,560,904 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 1673620eb50b-3878-City_Council_Agenda_Packet.txt (6,287,544 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 1f3173cd0949-agenda-packet.txt (2,273,752 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 227e704d8abb-agenda-packet.txt (2,849,980 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 299e19cdf433-agenda-packet.txt (2,506,620 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 4929af9e328c-agenda-packet.txt (2,335,784 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 541a9394c92f-agenda-packet.txt (2,664,307 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 54372a2fe1c2-agenda-packet.txt (2,314,872 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 6829338781b7-agenda-packet.txt (2,096,663 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 6a02b74c0012-agenda-packet.txt (3,623,671 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 798a2b5eceee-agenda-packet.txt (3,328,105 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: 809e390377a4-agenda-packet.txt (4,072,860 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: be092edd7207-agenda-packet.txt (2,395,698 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: c3eb62a7f3c5-agenda-packet.txt (2,222,082 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: cb-traffic-and-mobility-commissio-20220705-agenda.txt (2,003,243 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: cb-traffic-safety-mobility-commis-20220705-agenda.txt (2,003,243 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: cf9cf7972e9c-agenda-packet.txt (3,652,219 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: clip-3831-206804-Young_Tentative_parcel_Map_-_Attachment_PC-9.txt (2,427,768 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: d4b508f4b52e-agenda-packet.txt (2,221,628 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: ec-city-council-20251209-packet-12-9-25_agenda_full_-_3PM.txt (2,063,702 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: ec-planning-commission-20260721-packet-7-21-26_Planning_Commission_Agenda_Packet.txt (2,162,281 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Oversized meeting doc needs split: santee-city-council-20260812-agenda-Item_8_-_PEIR_Attachment.txt (4,055,900 bytes)",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Record 'clip-3849-208401-4A._Empowering_our_Community_Against_Scams_and_Fraud_-_PowerPoint_Presentation.json' has null date and no date in filename \u2014 needs manual fix",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Record 'clip-3849-208898-2026.06.16_Item_4A._-_1_-_Special_Presentations_Flyer.json' has null date and no date in filename \u2014 needs manual fix",
+   "severity": "backlog"
+  },
+  {
+   "finding": "Record 'clip-3869-209907-Item_6A-_2050_Coast_Planting.json' has null date and no date in filename \u2014 needs manual fix",
+   "severity": "backlog"
+  },
+  {
+   "finding": "California Coastal Commission fetch had 4 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of Chula Vista fetch had 2 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of Coronado fetch had 2 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of Del Mar fetch had 8 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of El Cajon fetch had 1 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of Encinitas fetch had 3 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of Escondido fetch had 8 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of Imperial Beach fetch had 2 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of La Mesa fetch had 2 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of Lemon Grove fetch had 8 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of National City fetch had 2 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of Oceanside fetch had 3 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of Oceanside permits fetch had 12 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of San Diego fetch had 68 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of San Marcos fetch had 3 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "City of Solana Beach fetch had 1 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "County of San Diego fetch had 4 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "High JSON parse error rate suggests --json-schema flag may not be working. Run: claude -p --json-schema '{\"type\":\"object\"}' <<< 'test' to verify.",
+   "severity": "degraded"
+  },
+  {
+   "finding": "JSON parse errors: 7 in recent extraction log \u2014 check --json-schema support",
+   "severity": "degraded"
+  },
+  {
+   "finding": "North County Transit District fetch had 3 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "SANDAG fetch had 5 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "SD County fetch had 12 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "Session limit hit 2 time(s) on 'bf75cf713de0-Agenda_Packet.txt' \u2014 wasted cold extraction window",
+   "severity": "degraded"
+  },
+  {
+   "finding": "Session limit hit 2 time(s) on 'bf75cf713de0-Minutes.txt' \u2014 wasted cold extraction window",
+   "severity": "degraded"
+  },
+  {
+   "finding": "Session limit hit 2 time(s) on 'fc084fd20d6d-Agenda.txt' \u2014 wasted cold extraction window",
+   "severity": "degraded"
+  },
+  {
+   "finding": "Slow phase: City of El Cajon meetings (0.17y lookback) took 30min on 2026-09-12",
+   "severity": "degraded"
+  },
+  {
+   "finding": "Slow phase: City of El Cajon meetings (1y lookback) took 30min on 2026-07-16",
+   "severity": "degraded"
+  },
+  {
+   "finding": "Slow phase: City of Oceanside permits (2026, etrakit, incremental) took 22min on 2026-10-19",
+   "severity": "degraded"
+  },
+  {
+   "finding": "Slow phase: City of Oceanside permits (2026, incremental) took 899min on 2026-07-06",
+   "severity": "degraded"
+  },
+  {
+   "finding": "Slow phase: City of San Marcos meetings (1y lookback) took 30min on 2026-09-03",
+   "severity": "degraded"
+  },
+  {
+   "finding": "Slow phase: Oceanside meetings took 63min on 2026-06-27",
+   "severity": "degraded"
+  },
+  {
+   "finding": "Slow phase: building permits (2026, incremental) took 22min on 2026-06-27",
+   "severity": "degraded"
+  },
+  {
+   "finding": "cf_bypass failed 1x in latest scrape/sweep runs; last: cf_bypass: FAIL pub-sandag.escribemeetings.com: no PDF obtained via cookies or browser download",
+   "severity": "degraded"
+  },
+  {
+   "finding": "claude -p is rate-limited \u2014 extraction will stall until reset",
+   "severity": "degraded"
+  },
+  {
+   "finding": "del_mar failed 1x in run 20261122T090001Z-4006352: download",
+   "severity": "degraded"
+  },
+  {
+   "finding": "eScribe downloads paused (Cloudflare challenge) until 23:25; escribe-sweep retries later",
+   "severity": "degraded"
+  },
+  {
+   "finding": "eTRAKiT permits fetch had 12 error(s) in recent log",
+   "severity": "degraded"
+  },
+  {
+   "finding": "firecrawl CLI not installed: Cloudflare fallback for eScribe documents is inactive",
+   "severity": "degraded"
+  },
+  {
+   "finding": "Auto-fix already attempted for these findings \u2014 needs manual investigation",
+   "severity": "loss"
+  },
+  {
+   "finding": "City of Coronado: no dated meeting document since never (scraper may be blocked or broken)",
+   "severity": "loss"
+  },
+  {
+   "finding": "City of El Cajon: latest scrape parsed 0 meetings (listing broken or site changed)",
+   "severity": "loss"
+  },
+  {
+   "finding": "City of Encinitas: 67/133 past meetings (50%) have no documents (7-90d window)",
+   "severity": "loss"
+  },
+  {
+   "finding": "City of Imperial Beach: no dated meeting document since 2026-10-07 (scraper may be blocked or broken)",
+   "severity": "loss"
+  },
+  {
+   "finding": "City of La Mesa: no dated meeting document since 2026-09-16 (scraper may be blocked or broken)",
+   "severity": "loss"
+  },
+  {
+   "finding": "City of National City: normally meets every ~14d but silent >21d; newest meeting 2026-10-20 (scraper may be blocked or broken)",
+   "severity": "loss"
+  },
+  {
+   "finding": "City of Poway: normally meets every ~14d but silent >21d; newest meeting 2026-10-20 (scraper may be blocked or broken)",
+   "severity": "loss"
+  },
+  {
+   "finding": "City of San Diego: no dated meeting document since never (scraper may be blocked or broken)",
+   "severity": "loss"
+  },
+  {
+   "finding": "City of Solana Beach: 16/17 past meetings (94%) have no documents (7-90d window)",
+   "severity": "loss"
+  },
+  {
+   "finding": "City of Solana Beach: no dated meeting document since 2026-09-09 (scraper may be blocked or broken)",
+   "severity": "loss"
+  },
+  {
+   "finding": "Extraction script crashed: ModuleNotFoundError: No module named 'requests'",
+   "severity": "loss"
+  },
+  {
+   "finding": "Extraction script crashed: Safeguards flagged the request: API Error: Opus 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with",
+   "severity": "loss"
+  },
+  {
+   "finding": "Extraction script crashed: TypeError: '<' not supported between instances of 'NoneType' and 'str'",
+   "severity": "loss"
+  },
+  {
+   "finding": "Extraction script crashed: stdout: API Error: Opus 4.6 can't help with this. Start a new session to continue.",
+   "severity": "loss"
+  },
+  {
+   "finding": "Extraction script crashed: stdout: API Error: Opus 5's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversati",
+   "severity": "loss"
+  },
+  {
+   "finding": "Latest pipeline run: [2026-11-11 01:03:05] [local] ERROR: City of El Cajon fetch failed (rc=3)",
+   "severity": "loss"
+  },
+  {
+   "finding": "Latest pipeline run: [2026-11-12 01:04:09] [local] ERROR: North County Transit District fetch failed (rc=1)",
+   "severity": "loss"
+  },
+  {
+   "finding": "Latest pipeline run: [2026-11-14 01:07:54] [local] ERROR: City of Coronado fetch failed (rc=1)",
+   "severity": "loss"
+  },
+  {
+   "finding": "North County Transit District: no dated meeting document; newest meeting 2026-10-22 (scraper may be blocked or broken)",
+   "severity": "loss"
+  },
+  {
+   "finding": "Overlapping run: Run started 2026-06-27 01:00:01 while previous run (started 2026-06-26 18:00) never completed",
+   "severity": "loss"
+  },
+  {
+   "finding": "Pipeline produced zero extractions 3 recent runs",
+   "severity": "loss"
+  },
+  {
+   "finding": "Pipeline was terminated/killed on: 2026-06-20",
+   "severity": "loss"
+  },
+  {
+   "finding": "Previous automatic fixes did not help \u2014 needs manual investigation",
+   "severity": "loss"
+  }
+ ]
+}

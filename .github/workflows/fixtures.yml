@@ -36,6 +36,12 @@ jobs:
       - name: Every committed fixture still parses what it parsed before
         run: python3 scripts/fixtures.py check -v
 
+      - name: Alert triage still classifies the recorded findings the same way
+        # Needs none of the five packages above and no data/ directory: it reads
+        # tests/alert-triage-cases.json, which is the committed stand-in for the
+        # 260 runs of pipeline-doctor.jsonl that are gitignored. Runs in 0.01s.
+        run: python3 -m unittest discover -s tests -v
+
       - name: Every source file still compiles
         # Cheap, and it catches the failure mode this repository actually has:
         # a scraper edited in a hurry and never imported, because nothing here
