@@ -89,13 +89,23 @@ run_with_timeout() {
 }
 
 # Contract: "ERROR: <desc> failed (rc=N)" or "ERROR: <desc> timed out".
+# Also appends one JSON record to data/pipeline/errors.jsonl, which is what
+# pipeline_doctor.py and any failure-triage loop read. The text line stays
+# because humans and old runs depend on it; the JSON exists so nothing has to
+# re-parse that text to learn what failed.
+# Args: desc, rc, and optionally slug and platform when the phase is per-agency.
 log_phase_error() {
-    local desc="$1" rc="$2"
+    local desc="$1" rc="$2" slug="${3:-}" platform="${4:-}"
     if [ "$rc" -eq 124 ]; then
         log "ERROR: $desc timed out"
     else
         log "ERROR: $desc failed (rc=$rc)"
     fi
+    local timeout_flag=()
+    [ "$rc" -eq 124 ] && timeout_flag=(--timeout)
+    python3 -m civic_log fail \
+        --agency "$slug" --platform "$platform" \
+        --phase "$desc" --rc "$rc" "${timeout_flag[@]}" 2>/dev/null || true
 }
 
 # Emit a "slug|..." list from agencies.yaml on stdout. Returns 1 (and logs ERROR
@@ -192,7 +202,12 @@ case "$MODE" in
     hybrid|local)  ;; # faster-whisper
 esac
 
-log "Starting civic pipeline (mode=$MODE)"
+# Every record this run writes carries this id, so a night's failures can be
+# read as one run rather than reassembled from timestamps. Exported, so the
+# scrapers and civic_log inherit it; a scraper run by hand makes its own.
+export WATCHDOG_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+
+log "Starting civic pipeline (mode=$MODE run=$WATCHDOG_RUN_ID)"
 
 # ═══════════════════════════════════════════
 # PHASE 0: PREFLIGHT — verify endpoints before fetching
@@ -316,7 +331,7 @@ while IFS='|' read -r SLUG PLATFORM NAME AGENCY_YEARS AGENCY_YEARS_F; do
         FETCH_RC=0
         run_with_timeout "${FETCH_CMD[@]}" >> "$LOG_FILE" 2>&1 || FETCH_RC=$?
         if [ "$FETCH_RC" -ne 0 ]; then
-            log_phase_error "$NAME fetch" "$FETCH_RC"
+            log_phase_error "$NAME fetch" "$FETCH_RC" "$SLUG" "$PLATFORM"
         else
             log "$NAME fetch done."
         fi
@@ -364,7 +379,7 @@ while IFS='|' read -r SLUG NAME PLATFORM; do
         PERMIT_RC=0
         run_with_timeout "${CMD[@]}" >> "data/${SLUG}/permits/fetch.log" 2>&1 || PERMIT_RC=$?
         if [ "$PERMIT_RC" -ne 0 ]; then
-            log_phase_error "$NAME permits ($YEAR)" "$PERMIT_RC"
+            log_phase_error "$NAME permits ($YEAR)" "$PERMIT_RC" "$SLUG" "$PLATFORM"
         else
             log "$NAME permits done."
         fi
@@ -388,7 +403,7 @@ while IFS='|' read -r SLUG NAME; do
         PROJ_RC=0
         run_with_timeout python3 scrapers/etrakit.py projects --agency "$SLUG" --year "$YEAR" --delay 0.5 >> "data/${SLUG}/permits/projects.log" 2>&1 || PROJ_RC=$?
         if [ "$PROJ_RC" -ne 0 ]; then
-            log_phase_error "$NAME projects ($YEAR)" "$PROJ_RC"
+            log_phase_error "$NAME projects ($YEAR)" "$PROJ_RC" "$SLUG" etrakit
         else
             log "$NAME projects done."
         fi
@@ -403,7 +418,7 @@ while IFS='|' read -r SLUG NAME; do
     ENRICH_RC=0
     run_with_timeout python3 scrapers/etrakit.py enrich --agency "$SLUG" --year "$CURRENT_YEAR" --infill --delay 1.5 >> "data/${SLUG}/permits/enrich.log" 2>&1 || ENRICH_RC=$?
     if [ "$ENRICH_RC" -ne 0 ]; then
-        log_phase_error "$NAME permit enrichment" "$ENRICH_RC"
+        log_phase_error "$NAME permit enrichment" "$ENRICH_RC" "$SLUG" etrakit
     else
         log "$NAME permit enrichment done."
     fi
@@ -420,7 +435,7 @@ while IFS='|' read -r SLUG NAME; do
     # 0.5s delay: ~600 requests per agency, so ~5 min instead of ~15
     run_with_timeout python3 scrapers/etrakit.py refresh --agency "$SLUG" --batch 300 --delay 0.5 >> "data/${SLUG}/permits/refresh.log" 2>&1 || REFRESH_RC=$?
     if [ "$REFRESH_RC" -ne 0 ]; then
-        log_phase_error "$NAME status refresh" "$REFRESH_RC"
+        log_phase_error "$NAME status refresh" "$REFRESH_RC" "$SLUG" etrakit
     else
         log "$NAME status refresh done."
     fi
@@ -515,6 +530,10 @@ for slug, a in cfg['agencies'].items():
     sync_to_s3 "archive/audio" "data/audio" "STANDARD"
     sync_to_s3 "operational/intel" "data/intel" "STANDARD"
     sync_to_s3 "raw/transcripts" "data/transcripts" "STANDARD_IA"
+    # Failure records and the fixtures they point at. Off-box so a failed run
+    # is diagnosable from somewhere other than the machine that failed.
+    sync_to_s3 "operational/errors" "data/pipeline/failures" "STANDARD"
+    s3_cp data/pipeline/errors.jsonl "operational/errors/errors.jsonl"
     log "S3 sync (raw) done."
 fi
 

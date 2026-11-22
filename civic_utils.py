@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Shared utilities for civic monitoring scrapers."""
 
+import base64
 import hashlib
 import json
 import os
@@ -8,6 +9,7 @@ import re
 import shutil
 import subprocess
 import time
+import traceback
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -359,6 +361,11 @@ def download_pdf(url, dest_path, headers=None, verify=True):
             return True
         print(f"  download: non-PDF response ({resp.status_code}, "
               f"{resp.headers.get('Content-Type', '?')}) for {url}", flush=True)
+        agency = _agency_from_path(dest_path)
+        fixture = save_failure_fixture(agency, url, response=resp,
+                                       request_headers=hdrs)
+        log_failure(agency, "download", url=url, status=resp.status_code,
+                    msg="non-PDF response", fixture=fixture)
         return False
     except Exception as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
@@ -370,7 +377,18 @@ def download_pdf(url, dest_path, headers=None, verify=True):
             print(f"  eScribe Cloudflare challenge (403); browser bypass failed; "
                   f"pausing until {datetime.fromtimestamp(until):%H:%M}", flush=True)
         else:
+            # Not the eScribe 403 path, which has its own cooldown and sweep.
+            # Capturing those too would fill the fixture directory with a
+            # condition that is already handled.
             print(f"  download failed: {e}")
+            agency = _agency_from_path(dest_path)
+            fixture = save_failure_fixture(
+                agency, url, response=getattr(e, "response", None), exc=e,
+                request_headers=hdrs,
+            )
+            log_failure(agency, "download", url=url, status=status,
+                        exc_type=type(e).__name__, msg=str(e)[:300],
+                        fixture=fixture)
         return False
 
 
@@ -695,3 +713,146 @@ def log_discovery(agency, meetings_found=0, meetings_new=0, docs_new=0, docs_unc
     DISCOVERY_LOG.parent.mkdir(parents=True, exist_ok=True)
     with open(DISCOVERY_LOG, "a") as f:
         f.write(json.dumps(entry) + "\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Failure records and fixtures
+#
+# discovery.jsonl records what a successful agency found. errors.jsonl is its
+# sibling for what a failed one hit, so a run's outcome is readable without
+# re-parsing pipeline-cron.log text. A fixture is the failing HTTP exchange
+# saved to disk, which is what makes a failure replayable instead of merely
+# reported.
+# ─────────────────────────────────────────────────────────────────────────
+
+ERRORS_LOG = DATA_DIR / "pipeline" / "errors.jsonl"
+FAILURES_DIR = DATA_DIR / "pipeline" / "failures"
+FIXTURE_BODY_LIMIT = 512 * 1024
+
+# Both directions: a request header carries our credential, a response header
+# carries the session the site just handed us. Fixtures sync to S3, and the
+# bucket has versioning on, so a leaked cookie cannot be removed by overwriting
+# the object.
+REDACT_HEADERS = {
+    "authorization", "proxy-authorization", "cookie", "set-cookie",
+    "x-api-key", "x-auth-token", "x-csrf-token",
+}
+
+
+def _agency_from_path(path):
+    """The agency slug from a data path, since download_pdf is handed a path, not a slug.
+
+    data/<slug>/documents/x.pdf -> "<slug>". Returns "" when the path is not
+    under DATA_DIR, which is the ad-hoc and test case.
+    """
+    try:
+        rel = Path(path).resolve().relative_to(DATA_DIR.resolve())
+    except Exception:
+        return ""
+    return rel.parts[0] if rel.parts else ""
+
+
+def run_id():
+    """This run's id. civic-pipeline exports it; an ad-hoc scraper run gets its own."""
+    return os.environ.get("WATCHDOG_RUN_ID") or (
+        "adhoc-" + datetime.now().strftime("%Y%m%dT%H%M%S")
+    )
+
+
+def _append_jsonl(path, entry):
+    """Append one record as a single write().
+
+    Agencies run as parallel subprocesses, and an O_APPEND write under PIPE_BUF
+    is atomic on Linux while an interleaved one is not, so the record is built
+    first and written once. Never raises: a logging bug must not be the thing
+    that breaks a scrape.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(entry, separators=(",", ":"), default=str) + "\n")
+    except Exception:
+        pass
+
+
+def log_failure(agency, phase, **fields):
+    """Record one failure in errors.jsonl. Returns the entry written."""
+    entry = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "run_id": run_id(),
+        "event": "agency_failed",
+        "agency": agency or "",
+        "phase": phase or "",
+    }
+    entry.update({k: v for k, v in fields.items() if v not in (None, "")})
+    _append_jsonl(ERRORS_LOG, entry)
+    return entry
+
+
+def _redact_headers(headers):
+    """Header mapping with credentials replaced. Unknown header names pass through."""
+    out = {}
+    try:
+        items = dict(headers or {}).items()
+    except Exception:
+        return out
+    for key, value in items:
+        out[str(key)] = (
+            "[redacted]" if str(key).lower() in REDACT_HEADERS else str(value)
+        )
+    return out
+
+
+def save_failure_fixture(agency, url, response=None, exc=None,
+                         platform=None, method="GET", request_headers=None):
+    """Save a failing HTTP exchange so it can be replayed offline.
+
+    Returns the fixture path as a string, or None if nothing could be written.
+    Never raises, for the same reason _append_jsonl does not.
+    """
+    try:
+        run = run_id()
+        out_dir = FAILURES_DIR / run
+        out_dir.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^A-Za-z0-9_.-]", "-", str(agency or "unknown"))[:40]
+        seq = len(list(out_dir.glob(f"{slug}-*.json"))) + 1
+        path = out_dir / f"{slug}-{seq}.json"
+
+        fixture = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "run_id": run,
+            "agency": agency,
+            "platform": platform,
+            "url": url,
+            "method": method,
+            "request_headers": _redact_headers(request_headers),
+        }
+
+        if response is not None:
+            body = getattr(response, "content", b"") or b""
+            fixture["status"] = getattr(response, "status_code", None)
+            fixture["response_headers"] = _redact_headers(
+                getattr(response, "headers", {})
+            )
+            fixture["body_bytes"] = len(body)
+            fixture["body_truncated"] = len(body) > FIXTURE_BODY_LIMIT
+            body = body[:FIXTURE_BODY_LIMIT]
+            try:
+                fixture["body"] = body.decode("utf-8")
+                fixture["body_encoding"] = "utf-8"
+            except UnicodeDecodeError:
+                fixture["body"] = base64.b64encode(body).decode("ascii")
+                fixture["body_encoding"] = "base64"
+
+        if exc is not None:
+            fixture["exc_type"] = type(exc).__name__
+            fixture["exc_msg"] = str(exc)[:2000]
+            fixture["traceback"] = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )[-4000:]
+
+        with open(path, "w") as f:
+            json.dump(fixture, f, indent=2, default=str)
+        return str(path)
+    except Exception:
+        return None

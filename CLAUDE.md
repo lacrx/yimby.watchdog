@@ -85,6 +85,8 @@ Follow these when adding or changing a scraper or pipeline phase. README.md "Rel
 - Record cancelled meetings with `cancelled: true` instead of skipping them; mark duplicate rows with `superseded_by`.
 - Use `civic_utils.RECHECK_DAYS` for any "keep rechecking for docs" window. Don't hard-code day counts.
 - Validate downloads (`%PDF` magic) before writing to `data/`; `download_pdf` already does this.
+- Every failure is recorded twice: the `ERROR: ...` text line as before, and a JSON record in `data/pipeline/errors.jsonl` carrying the run id. Write one with `civic_utils.log_failure()`, or `python3 -m civic_log fail --agency <slug> --phase <desc> --rc <n>` from shell. Never add a third place that records failures; `pipeline_doctor.py` and `preflight-health.json` read these two.
+- A failed HTTP exchange also saves a fixture under `data/pipeline/failures/<run_id>/`, and `python3 scripts/replay_failure.py <fixture>` replays it offline against the listing parser. Exit 3 means it parsed nothing, which is the same convention as a live run. Credentials are redacted at capture time by `civic_utils.REDACT_HEADERS`: add to that set before adding a header to a fixture, because fixtures sync to a versioned S3 bucket where an overwrite does not remove the old object.
 - The venv lives at `.venv`. If the repo is moved or renamed, fix it or console scripts like `yt-dlp` break on stale shebangs. Rewrite the old path in `.venv/bin/*` and `.venv/pyvenv.cfg`, or rebuild from `pip freeze` output (requirements.txt omits optional transcription packages like faster-whisper).
 
 ## Data Layout

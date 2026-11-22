@@ -48,6 +48,8 @@ STRUCTURED_DIR = DATA_DIR / "structured"
 DIAGNOSIS_LOG = DATA_DIR / "pipeline-doctor.jsonl"
 EXTRACTION_LOG = DATA_DIR / "structured-extraction.log"
 PIPELINE_LOG = DATA_DIR / "pipeline-cron.log"
+ERRORS_LOG = DATA_DIR / "pipeline" / "errors.jsonl"
+PREFLIGHT_HEALTH = DATA_DIR / "preflight-health.json"
 
 SAFE_SKIP_REASONS = {
     "repeated_auth_blocker": "File blocks extraction repeatedly via auth errors on chunking",
@@ -137,6 +139,59 @@ def get_extraction_errors(log_lines):
         i += 1
 
     return errors
+
+
+def get_structured_failures():
+    """The latest run's failures, read from errors.jsonl rather than parsed out of text.
+
+    This is the structured sibling of get_pipeline_errors, which reconstructs
+    the same facts with a regex over pipeline-cron.log. The text parse stays:
+    it covers runs older than errors.jsonl, and it computes things the records
+    do not carry (phase durations, overlapping runs, zero-extraction streaks).
+
+    Each returned agency carries its fixture paths, which is what makes a
+    failure replayable instead of merely counted.
+    """
+    out = {"run_id": None, "agencies": {}, "fixtures": [], "total": 0,
+           "quarantined": []}
+    records = []
+    try:
+        with open(ERRORS_LOG) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except ValueError:
+                    continue  # a half-written line is not a reason to fail
+    except OSError:
+        return out
+    if not records:
+        return out
+
+    run = records[-1].get("run_id")
+    out["run_id"] = run
+    for rec in records:
+        if rec.get("run_id") != run:
+            continue
+        slug = rec.get("agency") or "(pipeline)"
+        out["agencies"].setdefault(slug, []).append(rec)
+        out["total"] += 1
+        if rec.get("fixture"):
+            out["fixtures"].append(rec["fixture"])
+
+    # preflight-health.json already owns consecutive_failures and quarantine.
+    # Join against it rather than counting failures a second way here.
+    try:
+        health = json.loads(PREFLIGHT_HEALTH.read_text())
+    except (OSError, json.JSONDecodeError):
+        health = {}
+    out["quarantined"] = sorted(
+        slug for slug in out["agencies"]
+        if (health.get(slug) or {}).get("quarantined")
+    )
+    return out
 
 
 def get_pipeline_errors(log_lines, now=None):
@@ -744,6 +799,10 @@ def diagnose(dry_run=False):
     pipe_errors["zero_extraction_runs"] = run_stats["zero_extraction_runs"]
     pipe_errors["last_productive_run"] = run_stats["last_productive_run"]
 
+    # 2b. Structured failure records. Authoritative for "what failed" when
+    # present; the text parse above still owns timing and run shape.
+    struct_failures = get_structured_failures()
+
     # 3. Find blocking files
     blockers = find_blocking_files()
 
@@ -780,6 +839,10 @@ def diagnose(dry_run=False):
         "timed_out_phases": len(pipe_errors["timed_out_phases"]),
         "overlapping_runs": len(pipe_errors["overlapping_runs"]),
         "command_not_found": len(pipe_errors["command_not_found"]),
+        "structured_run_id": struct_failures["run_id"],
+        "structured_failures": struct_failures["total"],
+        "failed_agencies": len(struct_failures["agencies"]),
+        "failure_fixtures": len(struct_failures["fixtures"]),
     }
 
     if triage_skipped:
@@ -791,7 +854,25 @@ def diagnose(dry_run=False):
     print(f"  Failing extractions: {len(failing_files)}")
     print(f"  Last productive run: {pipe_errors['last_productive_run'] or 'unknown'}")
     print(f"  Zero-extraction runs: {pipe_errors['zero_extraction_runs']} in a row")
+    if struct_failures["run_id"]:
+        print(f"  Last run id:         {struct_failures['run_id']}")
+        print(f"  Failed agencies:     {len(struct_failures['agencies'])} "
+              f"({struct_failures['total']} records, "
+              f"{len(struct_failures['fixtures'])} replayable)")
     print()
+
+    # ─── Finding: agencies that failed in the last run ───
+
+    for slug, recs in sorted(struct_failures["agencies"].items()):
+        phases = sorted({r.get("phase", "?") for r in recs})
+        quarantined = " [quarantined]" if slug in struct_failures["quarantined"] else ""
+        finding = (f"{slug} failed {len(recs)}x in run "
+                   f"{struct_failures['run_id']}: {', '.join(phases)}{quarantined}")
+        diagnosis["findings"].append(finding)
+        print(f"  FINDING: {finding}")
+        for rec in recs:
+            if rec.get("fixture"):
+                print(f"    replay: {rec['fixture']}")
 
     # ─── Finding: Blocking files ───
 
