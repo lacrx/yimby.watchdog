@@ -112,11 +112,27 @@ permanently holds the case that found this.
 ## Rejected
 
 - **Supporting .docx now.** Text extracts cleanly with `zipfile` and a regex,
-  no new dependency, and it is tempting. But how often Del Mar does this is
-  unknown: the corpus is one day old and holds one example, and that example is
-  a cancellation notice rather than an agenda. Counting .docx across the
-  existing document store comes first. Exit 4 exists precisely so this stays a
-  decision with evidence rather than a reflex.
+  no new dependency, and it is tempting. The counting this section originally
+  said should come first has now been done, against every pipeline log back to
+  2026-06-09:
+
+  | non-PDF responses in 5.5 months | 26 |
+  |---|---|
+  | of those, Word documents | 24 |
+  | distinct Word URLs behind those 24 | **2** |
+  | distinct hosts | `www.delmar.ca.us`, `events.lemongrove.ca.gov` |
+  | the other 2 | `text/plain` from `encinitas.granicus.com` MetaViewer |
+
+  So 23 of the 24 are one Del Mar URL retried across the recheck window, and
+  the whole estate has produced **two** Word documents since June, one of them
+  a meeting cancellation notice. That is not enough missed content to justify a
+  second document path through the pipeline, and `del_mar` has 166 PDFs on disk
+  that download normally.
+
+  Exit 4 is therefore the outcome, not a staging post: these are recorded,
+  classified and visible in the doctor without being treated as a bug. Revisit
+  if the distinct-URL count grows. The two Encinitas `text/plain` MetaViewer
+  responses are a separate shape and are not covered by this reasoning.
 - **Treating an unsupported type as success.** It would silence the doctor,
   and Del Mar's agendas would go on being missed with nothing recording it.
   Exit 4 is a third outcome, not a pass.
