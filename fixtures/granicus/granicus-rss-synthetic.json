@@ -1,0 +1,17 @@
+{
+  "ts": "2026-11-21T18:00:00",
+  "run_id": "corpus-seed",
+  "agency": "vista",
+  "platform": "granicus",
+  "url": "https://example.invalid/ViewPublisherRSS.php",
+  "method": "GET",
+  "status": 200,
+  "request_headers": {},
+  "response_headers": {},
+  "body": "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>\n<item><title>City Council - November 12, 2026</title><link>https://example.invalid/a</link><guid>1</guid></item>\n<item><title>Planning Commission - November 5, 2026</title><link>https://example.invalid/b</link><guid>2</guid></item>\n</channel></rss>",
+  "body_encoding": "utf-8",
+  "body_bytes": 298,
+  "body_truncated": false,
+  "expect_items": 2,
+  "note": "Hand-written two-item RSS, not a captured page. Exists so an empty corpus cannot make check pass vacuously. Replace with real captures as failures arrive."
+}
