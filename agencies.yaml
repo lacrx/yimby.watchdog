@@ -380,9 +380,21 @@ agencies:
     platform: custom_html
     base_url: https://gonctd.com/boardagenda/
     lookback_months: 2
+    # The meeting-type names gonctd.com actually prints, each stored prefixed
+    # with "NCTD" ("NCTD Regular Board Meeting"). The previous list said
+    # "Board of Directors" and "FAST Planning Committee", which appear on no row
+    # the scraper has ever stored, so the doctor's coverage check matched zero
+    # NCTD meetings and reported nothing for this agency.
     bodies:
-      - Board of Directors
-      - FAST Planning Committee
+      - Regular Board Meeting
+      - Executive Committee
+      - PAF Committee
+      - MSPBD Committee
+      - Board Workshop
+    # Monthly-ish board cycle: largest healthy gap between dated documents over
+    # the prior year is 56 days, median 28, so the 30-day default flagged a
+    # working scraper.
+    doc_stale_days: 75
     deep_fetch: false
     enabled: true
 
@@ -427,5 +439,9 @@ agencies:
       - LCP Amendment
       - North County
       - San Luis Rey
+    # This scraper stores only the CCC items relevant to this jurisdiction: 6 in
+    # all of 2026. Largest healthy gap between dated documents over the prior
+    # year is 133 days, median 48.
+    doc_stale_days: 180
     deep_fetch: false
     enabled: true

@@ -454,6 +454,52 @@ def _newest_meeting_row(slug):
     return newest
 
 
+_CANCELLED_PREFIX_RE = re.compile(r"^\s*cancell?ed\s*[-–:]\s*", re.I)
+
+
+def _normalize_body(name):
+    """A meeting body name reduced for comparison: lowercased, outer space gone,
+    and a listing's own "Canceled - " prefix stripped (Coronado writes one)."""
+    return _CANCELLED_PREFIX_RE.sub("", (name or "").strip().lower())
+
+
+def _body_matches(bodies, row_body):
+    """Does a stored row's body name match one of an agency's configured bodies?
+
+    Containment, not equality, because nine of the twenty-two agencies store the
+    city's name inside the body ("City of La Mesa Planning Commission" against a
+    configured "Planning Commission") and six platforms prefix it. Measured on
+    2026-11-23: equality matched zero rows for chula_vista, national_city,
+    imperial_beach, la_mesa, coronado, lemon_grove, nctd, sandag and sdcounty, so
+    the empty-meetings finding below had been dead for all nine. Containment
+    matches 233 in-window meetings across every agency, and NCTD's configured
+    names were wrong in a different way and are corrected in agencies.yaml.
+    """
+    body = _normalize_body(row_body)
+    if not body:
+        return False
+    return any(b == body or b in body for b in bodies)
+
+
+def _advertises_document(m):
+    """Does a meeting row point at a document the pipeline could have downloaded?
+
+    A row with no document URL at all is the source publishing nothing, which is
+    not a scraper failure and not actionable: NCTD's 2026-11-19 board meeting is
+    listed on gonctd.com with no agenda packet and no video (verified against the
+    live page on 2026-11-23), and two La Mesa Planning Commission rows carry a
+    null `agenda_url`. A meeting-page link is not a document, so `detail_url`,
+    `folder_url` and `escribe_meeting_url` deliberately do not count here.
+
+    Cost: a scraper that breaks by dropping document URLs from rows it still
+    parses becomes invisible to this check. `find_empty_listings` and the
+    document-age rule in `find_stale_agencies` are what cover that shape.
+    """
+    if m.get("pdf_url") or m.get("agenda_url") or m.get("minutes_url"):
+        return True
+    return bool([d for d in (m.get("documents") or []) if d])
+
+
 def find_stale_agencies(max_age_days=30):
     """Agencies that stopped producing dated meeting documents.
 
@@ -464,10 +510,21 @@ def find_stale_agencies(max_age_days=30):
         gap between distinct meeting dates over the prior year <= 21 days)
         yet its newest meeting is older than CADENCE_QUIET_DAYS. This covers
         agencies whose data model cannot show per-meeting gaps.
+
+    `doc_stale_days` in agencies.yaml overrides max_age_days for one agency,
+    because the 30-day default assumes a body that files documents monthly or
+    oftener, and two agencies here do not. Measured over the prior year on
+    2026-11-23: NCTD's largest healthy gap between dated documents is 56 days
+    (median 28) and the Coastal Commission's is 133 (median 48), since the CCC
+    scraper stores only the items relevant to this jurisdiction, 6 in all of
+    2026. Both tripped this rule on 2026-11-22 while scraping correctly, and the
+    finding reads "scraper may be blocked or broken", so the alert said the
+    opposite of the truth. The per-meeting check in the empty-meetings finding
+    is what covers these two inside the window.
+
     Returns [(name, newest_date_or_never, reason)].
     """
     today_d = datetime.now().date()
-    cutoff = (today_d - timedelta(days=max_age_days)).isoformat()
     quiet_cutoff = (today_d - timedelta(days=CADENCE_QUIET_DAYS)).isoformat()
     today = today_d.isoformat()
     stale = []
@@ -475,6 +532,11 @@ def find_stale_agencies(max_age_days=30):
         dates = sorted({d for d in _load_doc_dates(slug).values() if d and d <= today})
         newest = dates[-1] if dates else ""
         name = cfg.get("name", slug)
+        try:
+            agency_max_age = int(cfg.get("doc_stale_days") or max_age_days)
+        except (TypeError, ValueError):
+            agency_max_age = max_age_days
+        cutoff = (today_d - timedelta(days=agency_max_age)).isoformat()
         if newest < cutoff:
             stale.append((name, newest or "never", "no dated meeting document"))
             continue
@@ -1051,7 +1113,13 @@ def diagnose(dry_run=False):
         docs_dir_path = agency_docs_dir(slug)
         if not meetings_dir.exists():
             continue
-        bodies = {b.strip().lower() for b in (cfg.get("bodies") or []) if isinstance(b, str)}
+        # sdcounty keys its bodies by Legistar body id, so a dict means the names
+        # are the values; iterating the dict itself yields "181" and matches nothing.
+        configured = cfg.get("bodies") or []
+        if isinstance(configured, dict):
+            configured = list(configured.values())
+        bodies = {_normalize_body(b) for b in configured if isinstance(b, str)}
+        bodies.discard("")
         # List the docs dir once; sorted names allow prefix lookups by bisect.
         doc_names = []
         if docs_dir_path.exists():
@@ -1074,11 +1142,12 @@ def diagnose(dry_run=False):
         total_past = 0
         undated = 0
         closed_skipped = 0
+        unadvertised = 0
         for mid, m in rows:
             if (m.get("cancelled") or m.get("superseded_by")
                     or m.get("stale") or m.get("no_assets")):
                 continue
-            if bodies and (m.get("body") or "").strip().lower() not in bodies:
+            if bodies and not _body_matches(bodies, m.get("body")):
                 continue
             if skip_closed and _is_closed_session(m):
                 closed_skipped += 1
@@ -1113,12 +1182,19 @@ def diagnose(dry_run=False):
             # found. Zero relevant items means nothing to file, not a gap.
             if m.get("city_items") == 0:
                 continue
+            # The row itself points at no document, so there was nothing to
+            # download and nobody to chase. See _advertises_document.
+            if not mine and not _advertises_document(m):
+                unadvertised += 1
+                continue
             total_past += 1
             if not mine:
                 empty_count += 1
         if empty_count > 0 and total_past > 0:
             pct = empty_count / total_past * 100
             note = f", excl. {closed_skipped} closed session(s)" if closed_skipped else ""
+            if unadvertised:
+                note += f", excl. {unadvertised} row(s) advertising no document"
             finding = (f"{cfg.get('name', slug)}: {empty_count}/{total_past} past meetings "
                        f"({pct:.0f}%) have no documents (7-{RECHECK_DAYS}d window{note})")
             diagnosis["findings"].append(finding)
