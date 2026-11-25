@@ -446,7 +446,7 @@ CLAUDE_P_SYSTEM = ("You are a careful assistant processing civic documents. "
                    "Answer only from the text you are given.")
 
 
-def claude_p_command(system=CLAUDE_P_SYSTEM):
+def claude_p_command():
     """Return (argv, env) for a minimal `claude -p` billed to the subscription.
 
     No tools, MCP servers, skills, hooks, CLAUDE.md or memory; text output.
@@ -454,7 +454,7 @@ def claude_p_command(system=CLAUDE_P_SYSTEM):
     per-token API spend.
     """
     cmd = ["claude", "-p", "--output-format", "text",
-           "--system-prompt", system,
+           "--system-prompt", CLAUDE_P_SYSTEM,
            "--tools", "",
            "--strict-mcp-config",
            "--disable-slash-commands",
@@ -469,13 +469,20 @@ def claude_local_call(prompt, system=None, timeout=300):
     """Call Claude via claude -p (subscription, no API cost).
 
     Returns the response text, or None on failure.
-    Mirrors claude_api_call() but for local/subscription use.
+    Mirrors claude_api_call() but for local/subscription use. `system` travels
+    on stdin, not as --system-prompt: Linux caps one argv string at 128KB, and
+    the analysis context this mirrors is about 260KB.
     """
-    cmd, env = claude_p_command(system or CLAUDE_P_SYSTEM)
+    full_prompt = ""
+    if system:
+        full_prompt = f"SYSTEM CONTEXT:\n{system}\n\n---\n\n"
+    full_prompt += prompt
+
+    cmd, env = claude_p_command()
     try:
         result = subprocess.run(
             cmd,
-            input=prompt,
+            input=full_prompt,
             capture_output=True, text=True, timeout=timeout,
             env=env,
         )
