@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).parent
 sys.path.insert(0, str(REPO_ROOT))
 from civic_utils import (load_agencies, all_docs_dirs, agency_data_dir,
                          agency_docs_dir, agency_meetings_dir, normalize_date,
-                         escribe_blocked_until)
+                         escribe_blocked_until, claude_p_command)
 try:
     from civic_utils import RECHECK_DAYS
 except ImportError:  # civic_utils builder not landed yet
@@ -346,10 +346,10 @@ def find_oversized_files():
 
 def check_auth_health():
     """Check if claude -p is currently authenticated."""
-    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    cmd, env = claude_p_command()
     try:
         result = subprocess.run(
-            ["claude", "-p", "--output-format", "text"],
+            cmd,
             input="Reply with exactly: OK",
             capture_output=True, text=True, timeout=30,
             env=env,

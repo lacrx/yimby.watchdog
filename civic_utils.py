@@ -436,22 +436,46 @@ def claude_api_call(client, max_retries=20, **kwargs):
     raise Exception(f"API call failed after {max_retries} retries")
 
 
+# Measured 2026-11-25: a bare `claude -p` loads the whole interactive Claude Code
+# setup (system prompt, built-in and MCP tools, skills, user and project CLAUDE.md,
+# auto memory, SessionStart hooks), about 44k tokens before the document arrives.
+# These flags and variables cut a trivial call to about 600 tokens while keeping
+# subscription auth. `--bare` would cut the same but never reads OAuth, so it
+# would silently need ANTHROPIC_API_KEY and bill per token.
+CLAUDE_P_SYSTEM = ("You are a careful assistant processing civic documents. "
+                   "Answer only from the text you are given.")
+
+
+def claude_p_command(system=CLAUDE_P_SYSTEM):
+    """Return (argv, env) for a minimal `claude -p` billed to the subscription.
+
+    No tools, MCP servers, skills, hooks, CLAUDE.md or memory; text output.
+    ANTHROPIC_API_KEY is stripped so a stray key never turns batch work into
+    per-token API spend.
+    """
+    cmd = ["claude", "-p", "--output-format", "text",
+           "--system-prompt", system,
+           "--tools", "",
+           "--strict-mcp-config",
+           "--disable-slash-commands",
+           "--settings", '{"disableAllHooks": true}']
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    env["CLAUDE_CODE_DISABLE_CLAUDE_MDS"] = "1"
+    env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
+    return cmd, env
+
+
 def claude_local_call(prompt, system=None, timeout=300):
     """Call Claude via claude -p (subscription, no API cost).
 
     Returns the response text, or None on failure.
     Mirrors claude_api_call() but for local/subscription use.
     """
-    full_prompt = ""
-    if system:
-        full_prompt = f"SYSTEM CONTEXT:\n{system}\n\n---\n\n"
-    full_prompt += prompt
-
-    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    cmd, env = claude_p_command(system or CLAUDE_P_SYSTEM)
     try:
         result = subprocess.run(
-            ["claude", "-p", "--output-format", "text"],
-            input=full_prompt,
+            cmd,
+            input=prompt,
             capture_output=True, text=True, timeout=timeout,
             env=env,
         )
