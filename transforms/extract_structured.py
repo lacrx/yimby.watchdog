@@ -31,7 +31,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
-from civic_utils import all_docs_dirs, all_meetings_dirs, load_json, agency_data_dir, agency_docs_dir, load_agencies
+from civic_utils import (all_docs_dirs, all_meetings_dirs, load_json, agency_data_dir,
+                         agency_docs_dir, load_agencies, claude_p_command)
 from transforms.triage import predict_relevance
 import config
 
@@ -244,8 +245,7 @@ def _call_claude(prompt, max_retries=2, schema=None):
     Uses subscription auth only — ANTHROPIC_API_KEY is stripped to avoid
     burning API credits on batch extraction.
     """
-    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
-    cmd = ["claude", "-p", "--output-format", "text"]
+    cmd, env = claude_p_command()
     if schema:
         cmd += ["--json-schema", json.dumps(schema)]
     for attempt in range(max_retries + 1):
@@ -355,10 +355,10 @@ def probe_claude(timeout=60):
     ok=True means the CLI answered, so the block belongs to the documents.
     No retries: a probe that needs retrying is not a clean answer.
     """
-    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    cmd, env = claude_p_command()
     try:
         result = subprocess.run(
-            ["claude", "-p", "--output-format", "text"],
+            cmd,
             input="Reply with the two characters OK and nothing else.",
             capture_output=True, text=True, timeout=timeout, env=env,
         )

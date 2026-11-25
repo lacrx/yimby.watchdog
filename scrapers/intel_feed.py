@@ -32,7 +32,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import feedparser
 import requests
-from civic_utils import DATA_DIR
+from civic_utils import DATA_DIR, claude_p_command
 import config
 
 INTEL_DIR = DATA_DIR / "intel"
@@ -115,10 +115,10 @@ def check_relevance_claude(title, summary, source):
     text = f"Source: {source}\nTitle: {title}\nContent: {summary[:3000]}"
     prompt = RELEVANCE_PROMPT + text
 
-    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+    cmd, env = claude_p_command()
     try:
         result = subprocess.run(
-            ["claude", "-p", "--output-format", "text"],
+            cmd,
             input=prompt,
             capture_output=True, text=True, timeout=120,
             env=env,
