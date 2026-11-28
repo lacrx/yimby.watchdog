@@ -44,6 +44,11 @@ agencies:
     permits:
       platform: etrakit
       base_url: https://etrakit.cityofoceanside.com/etrakit3
+      # Since 2026-11-24 the server presents a Let's Encrypt cert issued to
+      # crw.cityofoceanside.com (valid to 2027-02-22), so name checks fail.
+      # Normal verification is tried first and this exact cert is accepted
+      # only when that fails. Delete once the city restores a cert covering etrakit.
+      tls_sha256: bfeb4e786bbbed9a306fba900bc51420f271d4080b40bea9c88dd5a16679e361
     enabled: true
 
   carlsbad:

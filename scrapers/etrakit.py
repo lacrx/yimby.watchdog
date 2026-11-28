@@ -262,24 +262,84 @@ def search_project_numbers(session, base_url, prefix):
 MAX_GAP_RECHECK = 200
 
 
-def _make_session(retry_500=True):
+class _PinnedAdapter(requests.adapters.HTTPAdapter):
+    """Accept exactly one certificate, by SHA-256 fingerprint, whatever name it carries."""
+
+    def __init__(self, pin, **kw):
+        self._pin = pin
+        super().__init__(**kw)
+
+    def init_poolmanager(self, *args, **kw):
+        kw["assert_fingerprint"] = self._pin
+        super().init_poolmanager(*args, **kw)
+
+
+class _PinFallbackAdapter(requests.adapters.HTTPAdapter):
+    """Verify normally; after a certificate failure, use the pinned fingerprint instead.
+
+    The fallback sticks for the rest of the session so each request does not pay
+    the failing handshake and its retries again. A certificate that matches
+    neither the CA chain nor the pin still raises, so a changed certificate is
+    an outage rather than a silent accept.
+    """
+
+    def __init__(self, pin, **kw):
+        self._pinned = _PinnedAdapter(pin, **kw)
+        self._use_pin = False
+        super().__init__(**kw)
+
+    def send(self, request, **kw):
+        if not self._use_pin:
+            try:
+                return super().send(request, **kw)
+            except requests.exceptions.SSLError:
+                self._use_pin = True
+                print("  TLS: certificate does not verify by name; using the pinned "
+                      "fingerprint from agencies.yaml", flush=True)
+        return self._pinned.send(request, **kw)
+
+    def close(self):
+        self._pinned.close()
+        super().close()
+
+
+def _make_session(retry_500=True, pin=None):
     """HTTP session with retries.
 
     eTRAKiT answers HTTP 500 for permit numbers that do not exist yet, so the
     sequential scanner passes retry_500=False: retrying every miss past the
     frontier with backoff cost ~20 minutes per run. The page then parses to
     None and counts as a miss.
+
+    `pin` is the `permits.tls_sha256` fingerprint from agencies.yaml, for a
+    server presenting a certificate issued to another name. Normal verification
+    is still tried first, so the pin goes unused once the server is fixed.
     """
     session = requests.Session()
     session.headers["User-Agent"] = UA
     statuses = [429, 500, 502, 503] if retry_500 else [429, 502, 503]
-    retry_adapter = requests.adapters.HTTPAdapter(
-        max_retries=requests.packages.urllib3.util.retry.Retry(
-            total=3, backoff_factor=2, status_forcelist=statuses
-        )
+    retry = requests.packages.urllib3.util.retry.Retry(
+        total=3, backoff_factor=2, status_forcelist=statuses
     )
-    session.mount("https://", retry_adapter)
+    if pin:
+        adapter = _PinFallbackAdapter(pin, max_retries=retry)
+    else:
+        adapter = requests.adapters.HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
     return session
+
+
+# A scrape that stopped on request errors did not reach the frontier, so this
+# run is missing whatever is past it. Exit nonzero so civic-pipeline records
+# the phase as failed (errors.jsonl, an ERROR line, and a loss-class doctor
+# finding) instead of logging "done" over an outage, as it did for a week from
+# 2026-11-24 when Oceanside's server began presenting another host's certificate.
+EXIT_REQUEST_ERRORS = 1
+
+
+def _exit_on_request_errors(what):
+    print(f"ERROR: {what}", flush=True)
+    sys.exit(EXIT_REQUEST_ERRORS)
 
 
 def cmd_fetch(args):
@@ -320,9 +380,10 @@ def cmd_fetch(args):
             start_seq = max_existing + 1
             print(f"Resuming from {prefix}{start_seq:04d} ({len(existing)} existing permits)", flush=True)
 
-    session = _make_session(retry_500=False)
+    session = _make_session(retry_500=False, pin=permit_config.get("tls_sha256"))
 
     new_results = []
+    stopped_on_errors = False
     misses = 0
 
     # Re-check numbering gaps below the frontier. eTRAKiT sometimes returns a
@@ -376,6 +437,7 @@ def cmd_fetch(args):
                 print(f"  Error on {permit_no}: {e}", flush=True)
             if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 print(f"  Stopping at {permit_no} after {consecutive_errors} consecutive request errors", flush=True)
+                stopped_on_errors = True
                 break
             time.sleep(delay)
             continue
@@ -409,6 +471,10 @@ def cmd_fetch(args):
     print("\nBy type:")
     for t, c in type_counts.most_common(15):
         print(f"  {t}: {c}")
+
+    if stopped_on_errors:
+        _exit_on_request_errors(f"{agency_slug} permits {year}: scan stopped on request "
+                                f"errors before reaching the frontier")
 
 
 def cmd_enrich(args):
@@ -461,15 +527,17 @@ def cmd_enrich(args):
         needs_enrichment = needs_enrichment[:batch_size]
         print(f"Batch limited to {batch_size} permits")
 
-    session = _make_session()
+    session = _make_session(pin=permit_config.get("tls_sha256"))
     permit_index = {p["permit_no"]: p for p in permits}
     enriched_count = 0
+    request_errors = 0
 
     for i, p in enumerate(needs_enrichment):
         permit_no = p["permit_no"]
         try:
             result = fetch_permit(session, base_url, permit_no, enrich=True)
         except Exception as e:
+            request_errors += 1
             print(f"  Error on {permit_no}: {e}", flush=True)
             time.sleep(5)
             continue
@@ -502,6 +570,10 @@ def cmd_enrich(args):
 
     print(f"\nEnriched {enriched_count} permits, wrote {len(all_results)} to {in_file}")
 
+    if request_errors and request_errors == len(needs_enrichment):
+        _exit_on_request_errors(f"{agency_slug} enrich {year}: all {request_errors} "
+                                f"requests failed")
+
 
 def cmd_backfill_apn(args):
     """Re-fetch permits missing APNs. Faster than full enrich — skips already-enriched."""
@@ -519,7 +591,7 @@ def cmd_backfill_apn(args):
 
     years = list(range(args.start_year, args.end_year + 1)) if not args.year else [args.year]
 
-    session = _make_session()
+    session = _make_session(pin=permit_config.get("tls_sha256"))
     total_backfilled = 0
 
     for year in years:
@@ -614,15 +686,17 @@ def cmd_projects(args):
         if existing:
             print(f"Loaded {len(existing)} existing projects for {year}")
 
-    session = _make_session()
+    session = _make_session(pin=permit_config.get("tls_sha256"))
     prefixes = args.prefixes.split(",") if args.prefixes else PROJECT_PREFIXES
 
     all_project_nos = []
+    search_errors = 0
     for pfx in prefixes:
         search_prefix = f"{pfx}{yy:02d}-"
         try:
             proj_nos = search_project_numbers(session, base_url, search_prefix)
         except Exception as e:
+            search_errors += 1
             print(f"  Error searching {search_prefix}: {e}", flush=True)
             proj_nos = []
         if proj_nos:
@@ -662,6 +736,10 @@ def cmd_projects(args):
     for t, c in type_counts.most_common():
         print(f"  {t}: {c}")
 
+    if search_errors == len(prefixes):
+        _exit_on_request_errors(f"{agency_slug} projects {year}: every prefix search "
+                                f"failed ({search_errors})")
+
 
 def _refresh_candidates(records, key, terminal, housing_first):
     """Open records ordered so the least recently checked go first."""
@@ -700,7 +778,8 @@ def cmd_refresh(args):
         kinds.append(("project", "project_no", "etrakit-projects-{}.jsonl", fetch_project,
                       TERMINAL_PROJECT_STATUSES, False))
 
-    session = _make_session()
+    session = _make_session(pin=config["permits"].get("tls_sha256"))
+    stopped = []
     for kind, key, pattern, fetcher, terminal, housing_first in kinds:
         files = {y: permits_dir / pattern.format(y) for y in years}
         data = {y: read_jsonl(f) for y, f in files.items()}
@@ -727,6 +806,7 @@ def cmd_refresh(args):
                     print(f"  Error on {num}: {e}", flush=True)
                 if consecutive_errors >= 10:
                     print(f"  Stopping: {consecutive_errors} consecutive errors (site may be down)", flush=True)
+                    stopped.append(kind)
                     break
                 time.sleep(5)
                 continue
@@ -754,6 +834,10 @@ def cmd_refresh(args):
         print(f"  {kind}s: {changed} status changes, {errors} errors", flush=True)
         for t, n in transitions.most_common():
             print(f"    {t}: {n}", flush=True)
+
+    if stopped:
+        _exit_on_request_errors(f"{args.agency} refresh: stopped on request errors "
+                                f"({', '.join(stopped)})")
 
 
 def main():
