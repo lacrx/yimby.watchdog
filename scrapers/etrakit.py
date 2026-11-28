@@ -82,10 +82,30 @@ def read_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
+# What eTRAKiT answers for a permit number that does not exist: HTTP 500 with an
+# ASP.NET NullReferenceException page from this method. Checked 2026-11-27 on
+# numbers past the frontier, BLDG26-0000 and a bogus prefix; voided, withdrawn,
+# expired and denied permits all still return 200 with a full page.
+NOT_FOUND_MARKER = "Search_Permit.PermitDetails"
+
+
+class PermitPageError(Exception):
+    """The server answered, but not with a permit page or its not-found page."""
+
+
 def fetch_permit(session, base_url, permit_no, enrich=False):
-    """Fetch a single permit by direct URL. Returns dict or None."""
+    """Fetch a single permit by direct URL.
+
+    Returns a dict, or None when eTRAKiT says the number does not exist. Any
+    other answer without a permit (a different 500, a 200 with no permit type,
+    a maintenance page) raises PermitPageError, so callers count it as a
+    request error and not as a miss: a miss is quiet by design, and a run of
+    them is how the scan decides it has passed the newest permit.
+    """
     url = f"{base_url}/Search/permit.aspx?activityNo={permit_no}"
     resp = session.get(url, timeout=30)
+    if resp.status_code == 500 and NOT_FOUND_MARKER in resp.text:
+        return None
     soup = BeautifulSoup(resp.text, "html.parser")
 
     def label(suffix):
@@ -94,7 +114,8 @@ def fetch_permit(session, base_url, permit_no, enrich=False):
 
     ptype = label("lblPermitType")
     if not ptype:
-        return None
+        raise PermitPageError(f"HTTP {resp.status_code}, {len(resp.text)} bytes, "
+                              f"no permit type and not the not-found page")
 
     addr = ""
     addr_link = soup.find("a", id=lambda x: x and "hlSiteAddress" in str(x))
@@ -477,13 +498,15 @@ def cmd_fetch(args):
     print(f"Scanning eTRAKiT permits {prefix}{start_seq:04d} through {prefix}{max_seq:04d} (delay={delay}s)...", flush=True)
 
     # Two different stop conditions:
-    #  - misses: the page loaded but has no permit (eTRAKiT answers 500 or an
-    #    empty page for numbers that do not exist). Permit numbers have gaps
-    #    (voided/withdrawn), so tolerate max_misses in a row before concluding
-    #    we are past the frontier.
-    #  - errors: the request itself failed (timeout, connection reset, or 502/503
-    #    after retries). That is an outage, not a gap; bail after a few in a row
-    #    at the normal delay rather than sleeping through 50 of them.
+    #  - misses: eTRAKiT's own not-found page (see NOT_FOUND_MARKER). Numbers
+    #    can have gaps, so tolerate max_misses in a row before concluding we
+    #    are past the frontier.
+    #  - errors: the request failed (timeout, connection reset, 502/503 after
+    #    retries, a bad certificate) or the answer was neither a permit nor the
+    #    not-found page. Errors are recorded per item, so a permit that keeps
+    #    failing at the frontier alerts through _finish instead of hiding in
+    #    the miss count. Bail after a few in a row rather than sleeping
+    #    through 50 of them.
     MAX_CONSECUTIVE_ERRORS = 5
     consecutive_errors = 0
     for i in range(start_seq, max_seq + 1):

@@ -157,5 +157,85 @@ class TestPersistentFailures(unittest.TestCase):
             etrakit._finish("oceanside", "permits", [], outage="scan stopped")
 
 
+@unittest.skipIf(etrakit is None, "requests/bs4 not installed")
+class TestMissOrError(unittest.TestCase):
+    """Only eTRAKiT's own not-found page is a miss; any other empty answer is an error."""
+
+    # Recorded from Oceanside on 2026-11-27 for BLDG26-1855. Kept beside this file:
+    # .gitignore's `data/` would hide a tests/data/ directory.
+    NOT_FOUND = (Path(__file__).parent / "etrakit-permit-not-found.html").read_text()
+    PERMIT = ('<span id="ctl00_cplMain_lblPermitType">BLD ACCESSORY DWELLING</span>'
+              '<span id="ctl00_cplMain_lblPermitStatus">RECEIVED</span>')
+
+    def _fetch(self, status, body):
+        session = mock.Mock()
+        session.get.return_value = mock.Mock(status_code=status, text=body)
+        return etrakit.fetch_permit(session, "https://x/etrakit3", "BLDG26-1849")
+
+    def test_recorded_not_found_page_is_a_miss(self):
+        self.assertIsNone(self._fetch(500, self.NOT_FOUND))
+
+    def test_a_permit_page_parses(self):
+        p = self._fetch(200, self.PERMIT)
+        self.assertEqual((p["type"], p["status"]), ("BLD ACCESSORY DWELLING", "RECEIVED"))
+
+    def test_a_different_500_is_an_error(self):
+        with self.assertRaises(etrakit.PermitPageError):
+            self._fetch(500, "<h1>Service Unavailable</h1>")
+
+    def test_a_200_with_no_permit_is_an_error(self):
+        # A maintenance or login page answering 200 used to count as a miss, and
+        # fifty of those in a row read as "no new permits".
+        with self.assertRaises(etrakit.PermitPageError):
+            self._fetch(200, "<html><title>Scheduled maintenance</title></html>")
+
+    def test_the_marker_on_a_200_is_not_a_miss(self):
+        with self.assertRaises(etrakit.PermitPageError):
+            self._fetch(200, "<p>Search_Permit.PermitDetails</p>")
+
+
+class TestDoctorSeparatesRequestErrors(unittest.TestCase):
+    """Per-request eTRAKiT records must not read as an agency failure."""
+
+    def test_request_records_are_counted_apart(self):
+        import json
+        import tempfile
+        import pipeline_doctor
+        recs = [
+            {"ts": "2026-11-28T01:05:00", "run_id": "r1", "agency": "oceanside",
+             "phase": "etrakit enrich", "item": "BLDG26-0302", "error": "ReadTimeout"},
+            {"ts": "2026-11-28T01:06:00", "run_id": "r1", "agency": "oceanside",
+             "phase": "City of Oceanside permit enrichment", "rc": 1},
+            {"ts": "2026-11-28T01:07:00", "run_id": "r1", "agency": "del_mar",
+             "phase": "download", "msg": "non-PDF response"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "errors.jsonl"
+            log.write_text("".join(json.dumps(r) + "\n" for r in recs))
+            with mock.patch.object(pipeline_doctor, "ERRORS_LOG", log), \
+                    mock.patch.object(pipeline_doctor, "PREFLIGHT_HEALTH", Path(tmp) / "none"):
+                out = pipeline_doctor.get_structured_failures()
+        # The phase failure still counts against the agency; the request does not.
+        self.assertEqual([r["phase"] for r in out["agencies"]["oceanside"]],
+                         ["City of Oceanside permit enrichment"])
+        self.assertEqual(out["agencies"]["del_mar"][0]["phase"], "download")
+        self.assertEqual([r["item"] for r in out["requests"]["oceanside"]], ["BLDG26-0302"])
+        self.assertEqual(out["total"], 2)
+
+    def test_a_run_with_only_request_errors_has_no_failed_agency(self):
+        import json
+        import tempfile
+        import pipeline_doctor
+        rec = {"ts": "2026-11-28T01:05:00", "run_id": "r1", "agency": "oceanside",
+               "phase": "etrakit permits", "item": "BLDG26-1849", "error": "ReadTimeout"}
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "errors.jsonl"
+            log.write_text(json.dumps(rec) + "\n")
+            with mock.patch.object(pipeline_doctor, "ERRORS_LOG", log), \
+                    mock.patch.object(pipeline_doctor, "PREFLIGHT_HEALTH", Path(tmp) / "none"):
+                out = pipeline_doctor.get_structured_failures()
+        self.assertEqual(out["agencies"], {})
+
+
 if __name__ == "__main__":
     unittest.main()
