@@ -26,7 +26,7 @@ import re
 import sys
 import time
 from collections import Counter
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -35,7 +35,8 @@ sys.path.insert(0, str(REPO_ROOT))
 import requests
 from bs4 import BeautifulSoup
 
-from civic_utils import load_agencies, agency_data_dir
+import civic_utils
+from civic_utils import load_agencies, agency_data_dir, log_failure
 
 UA = "Mozilla/5.0 (X11; Linux x86_64) yimby-watchdog/1.0"
 
@@ -342,6 +343,62 @@ def _exit_on_request_errors(what):
     sys.exit(EXIT_REQUEST_ERRORS)
 
 
+# A partial failure is quiet by design: one timeout on one permit is routine and
+# the next run retries it, because every command re-attempts what it failed on
+# (fetch re-checks gaps, enrich and projects re-select unfinished records, refresh
+# goes least-recently-checked first). The loss is an item that keeps failing.
+# Replayed on 2026-11-27 over every Oceanside run in the logs (265 fetch, 470
+# projects, 217 enrich, 44 refresh), with the wrong-cert week excluded: 3 runs
+# in an ~11-run window would have fired once each for fetch, projects and enrich,
+# every time for an item stuck across 3+ runs, and never for a one-off timeout.
+PERSIST_RUNS = 3
+PERSIST_DAYS = 7
+
+
+def _request_error(agency, phase, item, exc, failed):
+    """Record one failed request in errors.jsonl and remember it for this run."""
+    log_failure(agency, f"etrakit {phase}", platform="etrakit", item=item,
+                error=f"{type(exc).__name__}: {exc}"[:300])
+    failed.append(item)
+
+
+def persistent_failures(agency, phase, items, now=None):
+    """Items from this run that also failed in enough recent runs to be a loss."""
+    if not items:
+        return []
+    now = now or datetime.now()
+    wanted = set(items)
+    runs = {}
+    try:
+        with open(civic_utils.ERRORS_LOG) as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                    ts = datetime.fromisoformat(rec["ts"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if (rec.get("agency") == agency
+                        and rec.get("phase") == f"etrakit {phase}"
+                        and rec.get("item") in wanted
+                        and now - ts < timedelta(days=PERSIST_DAYS)):
+                    runs.setdefault(rec["item"], set()).add(rec.get("run_id"))
+    except OSError:
+        return []
+    return sorted(i for i, r in runs.items() if len(r) >= PERSIST_RUNS)
+
+
+def _finish(agency, phase, failed, outage=None):
+    """Exit nonzero for an outage or for items failing run after run; else return."""
+    stuck = persistent_failures(agency, phase, failed)
+    problems = [outage] if outage else []
+    if stuck:
+        shown = ", ".join(stuck[:5]) + (f" and {len(stuck) - 5} more" if len(stuck) > 5 else "")
+        problems.append(f"{len(stuck)} item(s) failed in {PERSIST_RUNS}+ runs in "
+                        f"{PERSIST_DAYS} days: {shown}")
+    if problems:
+        _exit_on_request_errors(f"{agency} {phase}: " + "; ".join(problems))
+
+
 def cmd_fetch(args):
     """Fetch building permits by enumerating permit numbers."""
     agencies = load_agencies(enabled_only=False)
@@ -384,6 +441,7 @@ def cmd_fetch(args):
 
     new_results = []
     stopped_on_errors = False
+    failed = []
     misses = 0
 
     # Re-check numbering gaps below the frontier. eTRAKiT sometimes returns a
@@ -402,6 +460,7 @@ def cmd_fetch(args):
                     p = fetch_permit(session, base_url, permit_no)
                 except Exception as e:
                     print(f"  Gap {permit_no}: {e}", flush=True)
+                    _request_error(agency_slug, "permits", permit_no, e, failed)
                     p = None
                 if p:
                     new_results.append(p)
@@ -432,6 +491,7 @@ def cmd_fetch(args):
         try:
             p = fetch_permit(session, base_url, permit_no)
         except Exception as e:
+            _request_error(agency_slug, "permits", permit_no, e, failed)
             consecutive_errors += 1
             if consecutive_errors <= 3:
                 print(f"  Error on {permit_no}: {e}", flush=True)
@@ -472,9 +532,9 @@ def cmd_fetch(args):
     for t, c in type_counts.most_common(15):
         print(f"  {t}: {c}")
 
-    if stopped_on_errors:
-        _exit_on_request_errors(f"{agency_slug} permits {year}: scan stopped on request "
-                                f"errors before reaching the frontier")
+    _finish(agency_slug, "permits", failed,
+            f"{year} scan stopped on request errors before reaching the frontier"
+            if stopped_on_errors else None)
 
 
 def cmd_enrich(args):
@@ -530,14 +590,14 @@ def cmd_enrich(args):
     session = _make_session(pin=permit_config.get("tls_sha256"))
     permit_index = {p["permit_no"]: p for p in permits}
     enriched_count = 0
-    request_errors = 0
+    failed = []
 
     for i, p in enumerate(needs_enrichment):
         permit_no = p["permit_no"]
         try:
             result = fetch_permit(session, base_url, permit_no, enrich=True)
         except Exception as e:
-            request_errors += 1
+            _request_error(agency_slug, "enrich", permit_no, e, failed)
             print(f"  Error on {permit_no}: {e}", flush=True)
             time.sleep(5)
             continue
@@ -570,9 +630,9 @@ def cmd_enrich(args):
 
     print(f"\nEnriched {enriched_count} permits, wrote {len(all_results)} to {in_file}")
 
-    if request_errors and request_errors == len(needs_enrichment):
-        _exit_on_request_errors(f"{agency_slug} enrich {year}: all {request_errors} "
-                                f"requests failed")
+    _finish(agency_slug, "enrich", failed,
+            f"{year}: all {len(failed)} requests failed"
+            if failed and len(failed) == len(needs_enrichment) else None)
 
 
 def cmd_backfill_apn(args):
@@ -691,11 +751,13 @@ def cmd_projects(args):
 
     all_project_nos = []
     search_errors = 0
+    failed = []
     for pfx in prefixes:
         search_prefix = f"{pfx}{yy:02d}-"
         try:
             proj_nos = search_project_numbers(session, base_url, search_prefix)
         except Exception as e:
+            _request_error(agency_slug, "projects", search_prefix, e, failed)
             search_errors += 1
             print(f"  Error searching {search_prefix}: {e}", flush=True)
             proj_nos = []
@@ -712,6 +774,7 @@ def cmd_projects(args):
         try:
             detail = fetch_project(session, base_url, pno)
         except Exception as e:
+            _request_error(agency_slug, "projects", pno, e, failed)
             print(f"  Error on {pno}: {e}", flush=True)
             time.sleep(5)
             continue
@@ -736,9 +799,9 @@ def cmd_projects(args):
     for t, c in type_counts.most_common():
         print(f"  {t}: {c}")
 
-    if search_errors == len(prefixes):
-        _exit_on_request_errors(f"{agency_slug} projects {year}: every prefix search "
-                                f"failed ({search_errors})")
+    _finish(agency_slug, "projects", failed,
+            f"{year}: every prefix search failed ({search_errors})"
+            if search_errors == len(prefixes) else None)
 
 
 def _refresh_candidates(records, key, terminal, housing_first):
@@ -780,6 +843,7 @@ def cmd_refresh(args):
 
     session = _make_session(pin=config["permits"].get("tls_sha256"))
     stopped = []
+    failed = []
     for kind, key, pattern, fetcher, terminal, housing_first in kinds:
         files = {y: permits_dir / pattern.format(y) for y in years}
         data = {y: read_jsonl(f) for y, f in files.items()}
@@ -800,6 +864,7 @@ def cmd_refresh(args):
                 fresh = fetcher(session, base_url, num)
                 consecutive_errors = 0
             except Exception as e:
+                _request_error(args.agency, "refresh", num, e, failed)
                 errors += 1
                 consecutive_errors += 1
                 if errors <= 3:
@@ -835,9 +900,8 @@ def cmd_refresh(args):
         for t, n in transitions.most_common():
             print(f"    {t}: {n}", flush=True)
 
-    if stopped:
-        _exit_on_request_errors(f"{args.agency} refresh: stopped on request errors "
-                                f"({', '.join(stopped)})")
+    _finish(args.agency, "refresh", failed,
+            f"stopped on request errors ({', '.join(stopped)})" if stopped else None)
 
 
 def main():
@@ -885,6 +949,11 @@ def main():
     ref_p.add_argument("--projects-only", action="store_true")
 
     args = parser.parse_args()
+
+    # One id for this whole process. civic-pipeline exports it; outside the
+    # pipeline run_id() mints a new one per call, which would count one ad-hoc
+    # run as many in persistent_failures.
+    os.environ.setdefault("WATCHDOG_RUN_ID", civic_utils.run_id())
 
     if args.command == "refresh":
         cmd_refresh(args)

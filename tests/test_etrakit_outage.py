@@ -97,5 +97,65 @@ class TestPinFallback(unittest.TestCase):
         self.assertFalse(adapter._use_pin)
 
 
+@unittest.skipIf(etrakit is None, "requests/bs4 not installed")
+class TestPersistentFailures(unittest.TestCase):
+    """A partial failure exits nonzero only when the same item keeps failing."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        log = Path(self.tmp.name) / "errors.jsonl"
+        patcher = mock.patch.object(etrakit.civic_utils, "ERRORS_LOG", log)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def _fail_in_runs(self, n, item="BLDG26-0302", phase="enrich"):
+        failed = []
+        for i in range(n):
+            with mock.patch.dict(etrakit.os.environ, {"WATCHDOG_RUN_ID": f"run-{i}"}):
+                failed = []
+                etrakit._request_error("oceanside", phase, item, TimeoutError("read"), failed)
+        return failed
+
+    def test_two_runs_is_routine(self):
+        failed = self._fail_in_runs(2)
+        self.assertEqual(etrakit.persistent_failures("oceanside", "enrich", failed), [])
+        etrakit._finish("oceanside", "enrich", failed)  # returns, no exit
+
+    def test_three_runs_exits_nonzero(self):
+        failed = self._fail_in_runs(3)
+        self.assertEqual(etrakit.persistent_failures("oceanside", "enrich", failed),
+                         ["BLDG26-0302"])
+        with self.assertRaises(SystemExit) as cm:
+            etrakit._finish("oceanside", "enrich", failed)
+        self.assertEqual(cm.exception.code, etrakit.EXIT_REQUEST_ERRORS)
+
+    def test_same_run_counts_once(self):
+        with mock.patch.dict(etrakit.os.environ, {"WATCHDOG_RUN_ID": "one"}):
+            failed = []
+            for _ in range(5):
+                etrakit._request_error("oceanside", "enrich", "BLDG26-0302",
+                                       TimeoutError("read"), failed)
+        self.assertEqual(etrakit.persistent_failures("oceanside", "enrich", failed), [])
+
+    def test_other_phase_and_old_records_do_not_count(self):
+        self._fail_in_runs(3, phase="refresh")
+        self.assertEqual(etrakit.persistent_failures(
+            "oceanside", "enrich", ["BLDG26-0302"]), [])
+        later = etrakit.datetime.now() + etrakit.timedelta(days=etrakit.PERSIST_DAYS)
+        self.assertEqual(etrakit.persistent_failures(
+            "oceanside", "refresh", ["BLDG26-0302"], now=later), [])
+
+    def test_an_item_that_recovered_is_not_reported(self):
+        self._fail_in_runs(3)
+        # This run it succeeded, so it is not in this run's failed list.
+        self.assertEqual(etrakit.persistent_failures("oceanside", "enrich", []), [])
+
+    def test_outage_still_exits_with_no_history(self):
+        with self.assertRaises(SystemExit):
+            etrakit._finish("oceanside", "permits", [], outage="scan stopped")
+
+
 if __name__ == "__main__":
     unittest.main()
