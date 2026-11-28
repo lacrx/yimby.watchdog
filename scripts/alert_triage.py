@@ -70,6 +70,17 @@ _RULES: list[tuple[str, re.Pattern, str]] = [
     ),
     (
         "loss",
+        re.compile(
+            r"^Latest pipeline run:.*\bERROR\b.*\b(permits|projects|permit enrichment"
+            r"|status refresh)\b.*\b(failed|timed out)\b",
+            re.I,
+        ),
+        "An eTRAKiT phase now exits nonzero only when request errors stopped it "
+        "before the frontier, so the run added no permits or projects. Before "
+        "2026-11-27 this exited 0 and a week of Oceanside permits went unnoticed.",
+    ),
+    (
+        "loss",
         re.compile(r"produced zero extractions", re.I),
         "Documents are arriving and nothing is being extracted from them.",
     ),
