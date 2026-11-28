@@ -159,7 +159,7 @@ def get_structured_failures():
     failure replayable instead of merely counted.
     """
     out = {"run_id": None, "agencies": {}, "fixtures": [], "total": 0,
-           "quarantined": []}
+           "quarantined": [], "requests": {}}
     records = []
     try:
         with open(ERRORS_LOG) as fh:
@@ -182,6 +182,14 @@ def get_structured_failures():
         if rec.get("run_id") != run:
             continue
         slug = rec.get("agency") or "(pipeline)"
+        # One eTRAKiT request that failed (an `item` record from
+        # scrapers/etrakit.py). The scraper itself decides whether those add
+        # up to a loss and exits nonzero if so, which arrives here as a
+        # separate phase-failure record. Counted apart so a single timeout
+        # does not read as "<agency> failed".
+        if rec.get("item") and str(rec.get("phase", "")).startswith("etrakit "):
+            out["requests"].setdefault(slug, []).append(rec)
+            continue
         out["agencies"].setdefault(slug, []).append(rec)
         out["total"] += 1
         if rec.get("fixture"):
@@ -941,6 +949,13 @@ def diagnose(dry_run=False):
         for rec in recs:
             if rec.get("fixture"):
                 print(f"    replay: {rec['fixture']}")
+
+    # Informational only: etrakit.py turns these into a phase failure itself
+    # when an item keeps failing, and that is the finding that alerts.
+    for slug, recs in sorted(struct_failures["requests"].items()):
+        items = sorted({r["item"] for r in recs})
+        print(f"  eTRAKiT request errors ({slug}): {len(recs)} across "
+              f"{len(items)} item(s), retried next run: {', '.join(items[:5])}")
 
     # ─── Finding: Blocking files ───
 
